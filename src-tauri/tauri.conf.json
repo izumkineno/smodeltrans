@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "smodeltrans",
+  "version": "0.1.0",
+  "identifier": "com.tauri-app.smodeltrans",
+  "build": {
+    "beforeDevCommand": "bun run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "bun run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "smodeltrans - 图片翻译",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 720,
+        "minHeight": 560,
+        "decorations": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../models/ppocrv5/detector/model.safetensors": "models/ppocrv5/detector/model.safetensors",
+      "../models/ppocrv5/detector/config.json": "models/ppocrv5/detector/config.json",
+      "../models/ppocrv5/detector/preprocessor_config.json": "models/ppocrv5/detector/preprocessor_config.json",
+      "../models/ppocrv5/detector/inference.yml": "models/ppocrv5/detector/inference.yml",
+      "../models/ppocrv5/recognizer/model.safetensors": "models/ppocrv5/recognizer/model.safetensors",
+      "../models/ppocrv5/recognizer/config.json": "models/ppocrv5/recognizer/config.json",
+      "../models/ppocrv5/recognizer/preprocessor_config.json": "models/ppocrv5/recognizer/preprocessor_config.json",
+      "../models/ppocrv5/recognizer/inference.yml": "models/ppocrv5/recognizer/inference.yml",
+      "../models/hy/Hy-MT2-1.8B-Q4_K_M.gguf": "models/hy/Hy-MT2-1.8B-Q4_K_M.gguf"
+    }
+  }
+}
