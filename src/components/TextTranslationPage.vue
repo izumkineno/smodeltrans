@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onActivated, onBeforeUnmount, onDeactivated, ref } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -38,6 +38,7 @@ const errorMessage = ref("");
 const statusMessage = ref("输入文本后开始翻译。");
 const progress = ref(0);
 const workflowState = ref<TextWorkflowState>("idle");
+const pageRoot = ref<HTMLElement | null>(null);
 const activeController = ref<AbortController | null>(null);
 let progressUnlisten: UnlistenFn | undefined;
 
@@ -275,7 +276,40 @@ function handleSourceInput() {
   }
 }
 
+function handleTranslationShortcut(event: KeyboardEvent) {
+  const isShortcut =
+    event.key === "Enter" &&
+    (event.ctrlKey || event.metaKey) &&
+    !event.altKey &&
+    !event.shiftKey;
+  if (
+    !isShortcut ||
+    event.defaultPrevented ||
+    event.repeat ||
+    !pageRoot.value ||
+    !document.body.contains(pageRoot.value) ||
+    event.isComposing ||
+    !canStart.value
+  ) {
+    return;
+  }
+  event.preventDefault();
+  void startTranslation();
+}
+
+function bindTranslationShortcut() {
+  window.addEventListener("keydown", handleTranslationShortcut, true);
+}
+
+function unbindTranslationShortcut() {
+  window.removeEventListener("keydown", handleTranslationShortcut, true);
+}
+
+onActivated(bindTranslationShortcut);
+onDeactivated(unbindTranslationShortcut);
+
 onBeforeUnmount(() => {
+  unbindTranslationShortcut();
   activeController.value?.abort();
   activeController.value = null;
   clearProgressListener();
@@ -283,7 +317,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="text-translation-page" aria-label="文本翻译工作区">
+  <section ref="pageRoot" class="text-translation-page" aria-label="文本翻译工作区">
     <div class="text-page-grid">
       <n-card class="text-page-card text-input-card" :bordered="false">
         <div class="text-card-heading">
@@ -329,11 +363,20 @@ onBeforeUnmount(() => {
         </n-alert>
 
         <div class="text-card-actions">
+          <span class="text-shortcut-hint" aria-label="快捷键：Control 或 Command 加 Enter">
+            <span>快捷键</span>
+            <kbd>Ctrl</kbd>
+            <span>/</span>
+            <kbd>⌘</kbd>
+            <span>+</span>
+            <kbd>Enter</kbd>
+          </span>
           <n-button secondary @click="clearText">清空</n-button>
           <n-button
             v-if="workflowState !== 'processing'"
             type="primary"
             :disabled="!canStart"
+            aria-keyshortcuts="Control+Enter Meta+Enter"
             @click="startTranslation"
           >
             {{ workflowState === 'cancelled' || workflowState === 'error' ? '再次翻译' : '开始翻译' }}
@@ -548,6 +591,30 @@ onBeforeUnmount(() => {
   padding-top: 18px;
 }
 
+.text-shortcut-hint {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-right: auto;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.text-shortcut-hint kbd {
+  min-width: 24px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-bottom-color: var(--border-strong);
+  border-radius: 4px;
+  color: var(--text-soft);
+  background: var(--surface-soft);
+  box-shadow: 0 1px 0 rgba(48, 49, 51, 0.06);
+  font: inherit;
+  line-height: 1.4;
+  text-align: center;
+}
+
 .text-processing-state,
 .text-output-message,
 .text-empty-output {
@@ -675,6 +742,15 @@ onBeforeUnmount(() => {
   .text-card-heading {
     flex-direction: column;
     gap: 10px;
+  }
+
+  .text-card-actions {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .text-shortcut-hint {
+    width: 100%;
   }
 
   .text-result-actions,
