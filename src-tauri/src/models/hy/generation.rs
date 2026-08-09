@@ -6,7 +6,9 @@
 
 use super::model::{HyGenerationState, HySession};
 use crate::{model_config::GenerationConfig, model_support::CancellationToken};
-use anyhow::{Result, anyhow, bail};
+#[cfg(test)]
+use anyhow::bail;
+use anyhow::{Result, anyhow};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::{
@@ -190,28 +192,7 @@ fn make_result(
 }
 
 fn validate_config(config: &GenerationConfig) -> Result<()> {
-    if config.max_new_tokens == 0 {
-        bail!("invalid generation config: max_new_tokens must be at least 1");
-    }
-    if !config.temperature.is_finite() || config.temperature <= 0.0 {
-        bail!("invalid generation config: temperature must be finite and greater than zero");
-    }
-    if !config.top_p.is_finite() || config.top_p <= 0.0 || config.top_p > 1.0 {
-        bail!("invalid generation config: top_p must be finite and in (0, 1]");
-    }
-    if config.sampling && config.top_k == 0 {
-        bail!("Hy CUDA sampling requires top_k > 0; top_k=0 is unsupported");
-    }
-    if !config.repetition_penalty.is_finite() || config.repetition_penalty <= 0.0 {
-        bail!("invalid generation config: repetition_penalty must be finite and greater than zero");
-    }
-    if !config.frequency_penalty.is_finite() || config.frequency_penalty < 0.0 {
-        bail!("invalid generation config: frequency_penalty must be finite and non-negative");
-    }
-    if config.stop_strings.iter().any(String::is_empty) {
-        bail!("invalid generation config: stop_strings cannot contain an empty string");
-    }
-    Ok(())
+    config.validate()
 }
 
 #[cfg(test)]

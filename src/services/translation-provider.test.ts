@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createTauriTranslationProvider, isTranslationCancellation } from "./translation-provider";
+import {
+  createTauriTranslationProvider,
+  getBackendStatus,
+  isTranslationCancellation,
+  updateBackendSettings,
+  type BackendSettingsUpdate,
+  type BackendStatus,
+} from "./translation-provider";
 
 const originalWindow = globalThis.window;
 
@@ -113,5 +120,112 @@ describe("TauriTranslationProvider", () => {
       .catch((value: unknown) => value);
 
     expect(isTranslationCancellation(error)).toBe(true);
+  });
+});
+
+describe("backend settings commands", () => {
+  test("getBackendStatus invokes the backend without args and preserves nested settings", async () => {
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const status: BackendStatus = {
+      ready: true,
+      device: "cuda",
+      detectorModelDir: "D:\\models\\detector",
+      recognizerModelDir: "D:\\models\\recognizer",
+      hyModel: "D:\\models\\hy.gguf",
+      fontPath: null,
+      targetLanguage: "Japanese",
+      regionParallelism: 8,
+      translationBatchSize: 2,
+      translatorLoaded: false,
+      idleUnloadMinutes: 0,
+      generation: {
+        maxNewTokens: 64,
+        sampling: true,
+        temperature: 0.7,
+        topK: 32,
+        topP: 0.9,
+        seed: "42",
+        repetitionPenalty: 1.1,
+        frequencyPenalty: 0.2,
+        stopTokens: [120020],
+        stopStrings: ["</s>"],
+      },
+      memory: {
+        enabled: true,
+        maxTokens: 1024,
+        maxTurns: 4,
+      },
+      prompt: {
+        system: "Return concise JSON.",
+        user: "Preserve product names.",
+      },
+      message: "ready",
+    };
+
+    const result = await getBackendStatus(async <T>(command, args): Promise<T> => {
+      calls.push({ command, args });
+      return status as T;
+    });
+
+    expect(result.generation.seed).toBe("42");
+    expect(result.memory.enabled).toBe(true);
+    expect(result.prompt.system).toBe("Return concise JSON.");
+    expect(result.prompt.user).toBe("Preserve product names.");
+    expect(calls).toEqual([{ command: "get_backend_status", args: undefined }]);
+  });
+
+  test("updateBackendSettings sends exact nested model settings payload", async () => {
+    const settings: BackendSettingsUpdate = {
+      detectorModelDir: "D:\\models\\detector",
+      recognizerModelDir: "D:\\models\\recognizer",
+      hyModel: "D:\\models\\hy.gguf",
+      fontPath: null,
+      targetLanguage: "Japanese",
+      device: "cuda",
+      regionParallelism: 8,
+      translationBatchSize: 2,
+      idleUnloadMinutes: 0,
+      generation: {
+        maxNewTokens: 64,
+        sampling: true,
+        temperature: 0.7,
+        topK: 32,
+        topP: 0.9,
+        seed: "42",
+        repetitionPenalty: 1.1,
+        frequencyPenalty: 0.2,
+        stopTokens: [120020],
+        stopStrings: ["</s>"],
+      },
+      memory: {
+        enabled: true,
+        maxTokens: 1024,
+        maxTurns: 4,
+      },
+      prompt: {
+        system: "Return concise JSON.",
+        user: "Preserve product names.",
+      },
+    };
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+
+    await updateBackendSettings(settings, async <T>(command, args): Promise<T> => {
+      calls.push({ command, args });
+      return {
+        ...settings,
+        ready: true,
+        device: "cuda",
+        fontPath: null,
+        translatorLoaded: false,
+        message: "ready",
+      } as T;
+    });
+
+    expect(calls).toEqual([
+      {
+        command: "update_backend_settings",
+        args: { request: settings },
+      },
+    ]);
   });
 });

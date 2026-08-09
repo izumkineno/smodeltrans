@@ -2,7 +2,7 @@ use super::{
     engine::BackendEngine,
     failure::BackendFailure,
     input::{DecodedImage, decode_image},
-    settings::{BackendSettings, BackendStatus},
+    settings::{BackendSettings, BackendSettingsUpdate, BackendStatus},
 };
 use crate::model_support::{RunId, RunRegistry, lock_with_cancellation};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -114,15 +114,6 @@ pub(crate) struct CancelTranslationRequest {
     pub(crate) request_id: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UpdateBackendSettingsRequest {
-    pub(crate) detector_model_dir: String,
-    pub(crate) recognizer_model_dir: String,
-    pub(crate) hy_model: String,
-    pub(crate) idle_unload_minutes: u32,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TranslationResponse {
@@ -200,7 +191,7 @@ pub(crate) fn get_backend_status(
 
 #[tauri::command]
 pub(crate) fn update_backend_settings(
-    request: UpdateBackendSettingsRequest,
+    request: BackendSettingsUpdate,
     state: State<'_, BackendState>,
 ) -> Result<BackendStatus, BackendError> {
     let current = state
@@ -210,12 +201,7 @@ pub(crate) fn update_backend_settings(
         .clone()
         .map_err(BackendFailure::arguments)?;
     let updated = current
-        .update_model_paths(
-            &request.detector_model_dir,
-            &request.recognizer_model_dir,
-            &request.hy_model,
-            request.idle_unload_minutes,
-        )
+        .update_from_request(request)
         .map_err(BackendFailure::arguments)?;
     if let Some(config_path) = state.config_path.as_deref() {
         persist_backend_settings(config_path, &updated)?;
@@ -341,7 +327,8 @@ fn translate_image_blocking(
 
 #[cfg(test)]
 mod tests {
-    use super::TranslateImageRequest;
+    use super::{BackendSettingsUpdate, TranslateImageRequest};
+    use std::path::PathBuf;
 
     #[test]
     fn old_translate_request_without_request_id_still_deserializes() {
@@ -352,5 +339,53 @@ mod tests {
         }))
         .expect("old request shape");
         assert!(request.request_id.is_none());
+    }
+
+    #[test]
+    fn update_backend_settings_request_deserializes_full_model_parameters() {
+        let request: BackendSettingsUpdate = serde_json::from_value(serde_json::json!({
+            "detectorModelDir": "D:\\models\\detector",
+            "recognizerModelDir": "D:\\models\\recognizer",
+            "hyModel": "D:\\models\\hy.gguf",
+            "fontPath": null,
+            "targetLanguage": "Japanese",
+            "device": "cuda",
+            "regionParallelism": 8,
+            "translationBatchSize": 2,
+            "idleUnloadMinutes": 0,
+            "generation": {
+                "maxNewTokens": 64,
+                "sampling": true,
+                "temperature": 0.7,
+                "topK": 32,
+                "topP": 0.9,
+                "seed": "42",
+                "repetitionPenalty": 1.1,
+                "frequencyPenalty": 0.2,
+                "stopTokens": [120020],
+                "stopStrings": ["</s>"]
+            },
+            "memory": {
+                "enabled": true,
+                "maxTokens": 1024,
+                "maxTurns": 4
+            },
+            "prompt": {
+                "system": "Return concise JSON.",
+                "user": "Preserve product names."
+            }
+        }))
+        .expect("full settings request");
+
+        assert_eq!(
+            request.detector_model_dir,
+            PathBuf::from("D:\\models\\detector").display().to_string()
+        );
+        assert_eq!(request.font_path, None);
+        assert_eq!(request.generation.seed, Some("42".to_owned()));
+        assert_eq!(request.generation.stop_tokens, vec![120020]);
+        assert!(request.memory.enabled);
+        assert_eq!(request.prompt.system, "Return concise JSON.");
+        assert_eq!(request.prompt.user, "Preserve product names.");
     }
 }

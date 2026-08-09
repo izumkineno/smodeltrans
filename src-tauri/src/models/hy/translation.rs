@@ -14,7 +14,7 @@ use crate::{
         contracts::{HyPort, TranslatedRegion, TranslationRegion},
         failure::BackendFailure,
     },
-    model_config::{GenerationConfig, MemoryConfig},
+    model_config::{GenerationConfig, MemoryConfig, PromptConfig},
     model_support::CancellationToken,
 };
 use anyhow::{Context, Result, ensure};
@@ -27,7 +27,7 @@ use std::path::Path;
 pub(crate) struct HyTranslator {
     session: HySessionDriver,
     generation: GenerationConfig,
-    system_prompt: Option<String>,
+    prompt: PromptConfig,
 }
 pub(crate) fn load(
     model_path: &Path,
@@ -39,7 +39,7 @@ pub(crate) fn load(
         device,
         memory,
         GenerationConfig::default(),
-        None,
+        PromptConfig::default(),
     )
 }
 
@@ -48,7 +48,7 @@ pub(crate) fn load_with_config(
     device: &Device,
     memory: MemoryConfig,
     generation: GenerationConfig,
-    system_prompt: Option<String>,
+    prompt: PromptConfig,
 ) -> Result<HyTranslator> {
     let assets =
         HyAssets::preflight(model_path).map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -56,7 +56,7 @@ pub(crate) fn load_with_config(
     Ok(HyTranslator {
         session: HySessionDriver::new(&assets.model, device, memory)?,
         generation,
-        system_prompt,
+        prompt,
     })
 }
 
@@ -65,7 +65,7 @@ pub(crate) fn load_port(
     device: &Device,
     memory: MemoryConfig,
     generation: GenerationConfig,
-    system_prompt: Option<String>,
+    prompt: PromptConfig,
 ) -> std::result::Result<HyTranslator, BackendFailure> {
     if !device.is_cuda() {
         return Err(BackendFailure::device("Hy requires a CUDA device"));
@@ -75,7 +75,7 @@ pub(crate) fn load_port(
         .map(|session| HyTranslator {
             session,
             generation,
-            system_prompt,
+            prompt,
         })
         .map_err(|error| {
             let message = error.to_string();
@@ -93,18 +93,12 @@ impl HyTranslator {
         &mut self,
         text: &str,
         target_language: &str,
-        system_prompt: Option<&str>,
+        prompt: &PromptConfig,
         generation: &GenerationConfig,
         cancellation: &CancellationToken,
         on_chunk: impl FnMut(&str) -> Result<()>,
     ) -> Result<HyGenerationResult> {
-        let mut prompt = build_translation_prompt(text, target_language);
-        if let Some(system_prompt) = system_prompt {
-            let system_prompt = system_prompt.trim();
-            if !system_prompt.is_empty() {
-                prompt = format!("{system_prompt}\n\n{prompt}");
-            }
-        }
+        let prompt = apply_prompt_presets(build_translation_prompt(text, target_language), prompt);
         self.session
             .respond(&prompt, generation, on_chunk, cancellation)
     }
@@ -114,18 +108,15 @@ impl HyTranslator {
         &mut self,
         jobs: &[TranslationRegion],
         target_language: &str,
-        system_prompt: Option<&str>,
+        prompt: &PromptConfig,
         generation: &GenerationConfig,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<String>, usize)> {
         ensure!(!jobs.is_empty(), "translation batch must not be empty");
-        let mut prompt = build_translation_batch_prompt(jobs, target_language)?;
-        if let Some(system_prompt) = system_prompt {
-            let system_prompt = system_prompt.trim();
-            if !system_prompt.is_empty() {
-                prompt = format!("{system_prompt}\n\n{prompt}");
-            }
-        }
+        let prompt = apply_prompt_presets(
+            build_translation_batch_prompt(jobs, target_language)?,
+            prompt,
+        );
         let mut output = String::new();
         let result = self.session.respond(
             &prompt,
@@ -146,7 +137,7 @@ impl HyTranslator {
         &mut self,
         region: &TranslationRegion,
         target_language: &str,
-        system_prompt: Option<&str>,
+        prompt: &PromptConfig,
         generation: &GenerationConfig,
         cancellation: &CancellationToken,
     ) -> std::result::Result<String, BackendFailure> {
@@ -154,7 +145,7 @@ impl HyTranslator {
             .translate_text(
                 &region.source_text,
                 target_language,
-                system_prompt,
+                prompt,
                 generation,
                 cancellation,
                 |_| Ok(()),
@@ -199,11 +190,11 @@ impl HyPort for HyTranslator {
             ));
         }
         let generation = self.generation.clone();
-        let system_prompt = self.system_prompt.clone();
+        let prompt = self.prompt.clone();
         let batch_result = self.translate_structured_batch(
             regions,
             target_language,
-            system_prompt.as_deref(),
+            &prompt,
             &generation,
             cancellation,
         );
@@ -218,7 +209,7 @@ impl HyPort for HyTranslator {
                     translated.push(self.translate_single_region(
                         region,
                         target_language,
-                        system_prompt.as_deref(),
+                        &prompt,
                         &generation,
                         cancellation,
                     )?);
@@ -246,7 +237,7 @@ impl HyPort for HyTranslator {
                 *translated_text = self.translate_single_region(
                     region,
                     target_language,
-                    system_prompt.as_deref(),
+                    &prompt,
                     &generation,
                     cancellation,
                 )?;
@@ -279,6 +270,32 @@ pub(crate) fn build_translation_prompt(text: &str, target_language: &str) -> Str
     prompt.push_str(middle);
     prompt.push_str(text);
     prompt
+}
+
+fn apply_prompt_presets(base_prompt: String, prompt: &PromptConfig) -> String {
+    let user = prompt.user.trim();
+    let system = prompt.system.trim();
+    if user.is_empty() && system.is_empty() {
+        return base_prompt;
+    }
+
+    let mut output = String::with_capacity(
+        base_prompt.len()
+            + user.len()
+            + system.len()
+            + if user.is_empty() { 0 } else { 2 }
+            + if system.is_empty() { 0 } else { 2 },
+    );
+    if !system.is_empty() {
+        output.push_str(system);
+        output.push_str("\n\n");
+    }
+    if !user.is_empty() {
+        output.push_str(user);
+        output.push_str("\n\n");
+    }
+    output.push_str(&base_prompt);
+    output
 }
 
 #[derive(Debug, Deserialize)]
@@ -477,15 +494,29 @@ fn parse_translation_output(output: &str, jobs: &[TranslationRegion]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        TranslationRegion, build_translation_batch_prompt, build_translation_prompt,
-        parse_translation_output,
+        TranslationRegion, apply_prompt_presets, build_translation_batch_prompt,
+        build_translation_prompt, parse_translation_output,
     };
+    use crate::model_config::PromptConfig;
 
     #[test]
     fn builds_trimmed_translation_prompt() {
         assert_eq!(
             build_translation_prompt(" 你好，世界。\n", " English "),
             "Translate the following text into English. Output only the translation: 你好，世界。"
+        );
+    }
+
+    #[test]
+    fn prompt_presets_prepend_system_and_user_context() {
+        let prompt = PromptConfig {
+            system: "Return concise JSON.".to_owned(),
+            user: "Preserve product names.".to_owned(),
+        };
+
+        assert_eq!(
+            apply_prompt_presets(build_translation_prompt("alpha", "English"), &prompt),
+            "Return concise JSON.\n\nPreserve product names.\n\nTranslate the following text into English. Output only the translation: alpha"
         );
     }
 

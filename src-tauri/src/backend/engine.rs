@@ -82,15 +82,21 @@ impl BackendEngine {
 
         report_progress(60, "正在准备 Hy-MT2");
         if self.hy.is_none() {
-            let config = ModelConfig::for_target(image.target_language()).map_err(|error| {
-                BackendFailure::arguments(format!("invalid target language: {error:#}"))
+            let config = ModelConfig::from_parts(
+                image.target_language(),
+                self.settings.prompt.clone(),
+                self.settings.generation.clone(),
+                self.settings.memory.clone(),
+            )
+            .map_err(|error| {
+                BackendFailure::arguments(format!("invalid model config: {error:#}"))
             })?;
             let translator = hy::load_with_config(
                 &self.settings.hy_model,
                 &self.device,
                 config.memory.clone(),
                 config.generation.clone(),
-                Some(config.prompt.system.clone()),
+                config.prompt.clone(),
             )
             .map_err(|error| {
                 BackendFailure::asset(format!("load local Hy-MT2 model: {error:#}"))
@@ -187,6 +193,7 @@ mod tests {
     use super::{BackendEngine, DeviceKind};
     use crate::{
         backend::{input::decode_image, settings::BackendSettings},
+        model_config::{GenerationConfig, MemoryConfig, PromptConfig},
         model_support::CancellationToken,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -203,6 +210,9 @@ mod tests {
             translation_batch_size: 4,
             device_kind,
             idle_unload_minutes: 0,
+            prompt: PromptConfig::default(),
+            generation: GenerationConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 
@@ -210,6 +220,16 @@ mod tests {
     fn cpu_engine_is_constructible_but_translation_is_device_gated() {
         let engine = BackendEngine::new(settings(DeviceKind::Cpu)).expect("cpu device");
         assert_eq!(engine.settings.device_kind, DeviceKind::Cpu);
+    }
+
+    #[test]
+    fn cpu_engine_carries_effective_generation_config() {
+        let mut settings = settings(DeviceKind::Cpu);
+        settings.generation.max_new_tokens = 64;
+
+        let engine = BackendEngine::new(settings).expect("cpu device");
+
+        assert_eq!(engine.settings.generation.max_new_tokens, 64);
     }
     #[cfg(all(feature = "cuda", feature = "flash-attn"))]
     #[test]
@@ -234,6 +254,9 @@ mod tests {
             translation_batch_size: 4,
             device_kind: DeviceKind::Cuda,
             idle_unload_minutes: 0,
+            prompt: PromptConfig::default(),
+            generation: GenerationConfig::default(),
+            memory: MemoryConfig::default(),
         };
         let mut engine = BackendEngine::new(settings).expect("CUDA engine");
         let image = decode_image(

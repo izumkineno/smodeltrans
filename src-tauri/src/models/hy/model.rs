@@ -5,7 +5,7 @@
 //! 解码，再通过 [`stream`] 模块按稳定的 Unicode 字符增量输出。
 
 use super::generation::{HyDecoderState, HyTokenRng};
-use crate::model_config::GenerationConfig;
+use crate::model_config::{GenerationConfig, MAX_TOP_K};
 use anyhow::{Context, Result};
 use candle_core::{
     DType, Device, IndexOp, Module, Tensor,
@@ -53,8 +53,7 @@ const EOS_TOKEN_ID: u32 = 120020;
 ///
 /// Candle's cumulative-sum implementation materializes an `n × n` helper
 /// matrix, so unbounded `top_k` would turn a sampling option into an
-/// unbounded GPU allocation.
-const MAX_GPU_SAMPLE_CANDIDATES: usize = 1024;
+/// unbounded GPU allocation. The value is shared with settings validation.
 
 /// Hard metadata limits applied before RoPE or model-weight allocation.
 const MAX_HY_CONTEXT_LENGTH: usize = 262_144;
@@ -1296,8 +1295,8 @@ impl HySession {
             anyhow::bail!("Hy CUDA sampled selection requires top_k > 0; top_k=0 is unsupported");
         }
         anyhow::ensure!(
-            config.top_k <= MAX_GPU_SAMPLE_CANDIDATES,
-            "Hy CUDA sampled selection supports top_k <= {MAX_GPU_SAMPLE_CANDIDATES}"
+            config.top_k <= MAX_TOP_K,
+            "Hy CUDA sampled selection supports top_k <= {MAX_TOP_K}"
         );
         let logits = self.apply_token_penalties(logits, state, config, selection, &mut profile)?;
         let logits = logits.to_dtype(DType::F32)?;

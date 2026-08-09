@@ -21,6 +21,32 @@ export interface TranslationProgress {
   stage: string;
 }
 
+export type DeviceKind = "cpu" | "cuda";
+
+export interface BackendGenerationSettings {
+  maxNewTokens: number;
+  sampling: boolean;
+  temperature: number;
+  topK: number;
+  topP: number;
+  seed: string | null;
+  repetitionPenalty: number;
+  frequencyPenalty: number;
+  stopTokens: number[];
+  stopStrings: string[];
+}
+
+export interface BackendMemorySettings {
+  enabled: boolean;
+  maxTokens: number;
+  maxTurns: number;
+}
+
+export interface BackendPromptSettings {
+  system: string;
+  user: string;
+}
+
 export interface BackendStatus {
   ready: boolean;
   device: string;
@@ -28,8 +54,14 @@ export interface BackendStatus {
   recognizerModelDir: string;
   hyModel: string;
   fontPath: string | null;
+  targetLanguage: string;
+  regionParallelism: number;
+  translationBatchSize: number;
   translatorLoaded: boolean;
   idleUnloadMinutes: number;
+  generation: BackendGenerationSettings;
+  memory: BackendMemorySettings;
+  prompt: BackendPromptSettings;
   message: string;
 }
 
@@ -37,7 +69,15 @@ export interface BackendSettingsUpdate {
   detectorModelDir: string;
   recognizerModelDir: string;
   hyModel: string;
+  fontPath: string | null;
+  targetLanguage: string;
+  device: DeviceKind;
+  regionParallelism: number;
+  translationBatchSize: number;
   idleUnloadMinutes: number;
+  generation: BackendGenerationSettings;
+  memory: BackendMemorySettings;
+  prompt: BackendPromptSettings;
 }
 
 export interface TranslationProvider {
