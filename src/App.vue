@@ -5,7 +5,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   lightTheme,
   NButton,
-  NCard,
   NConfigProvider,
   NGlobalStyle,
   NIcon,
@@ -24,7 +23,9 @@ import type { WorkspaceRouteName } from "./app-router";
 import {
   backendStatus,
   fetchSharedBackendStatus,
+  fetchSharedModelRuntimeStatus,
   loadPersistedTargetLanguage,
+  modelRuntimeStatus,
 } from "./services/workspace-settings";
 
 type TagType = "default" | "success" | "warning" | "error" | "info";
@@ -324,6 +325,18 @@ const settingsStatusLabel = computed(() => {
   return backendStatus.value.ready ? "模型已就绪" : "需要检查";
 });
 
+const modelProviderLabel = computed(() => {
+  const status = modelRuntimeStatus.value;
+  if (!status) {
+    return settingsStatusLabel.value;
+  }
+  if (status.busy) {
+    return "正在推理";
+  }
+  const loadedCount = Number(status.ocrLoaded) + Number(status.translatorLoaded);
+  return loadedCount > 0 ? `已加载 ${loadedCount}/2` : "按需加载";
+});
+
 type PageMetadata = {
   title: string;
   titleId: string;
@@ -365,6 +378,18 @@ const pageMetadata = computed<PageMetadata>(() => {
         statusLabel: settingsStatusLabel.value,
         statusType: backendStatus.value?.ready ? "success" : "warning",
         statusAriaLabel: "后端状态",
+      };
+    case "model-monitor":
+      return {
+        title: "模型监控",
+        titleId: "model-monitor-title",
+        statusLabel: modelProviderLabel.value,
+        statusType: !modelRuntimeStatus.value
+          ? "warning"
+          : modelRuntimeStatus.value.busy
+            ? "warning"
+            : "success",
+        statusAriaLabel: "模型运行状态",
       };
   }
 });
@@ -448,6 +473,12 @@ function closeWindow() {
   }
 }
 
+function openModelMonitor() {
+  if (activeMenu.value !== "model-monitor") {
+    void router.push({ name: "model-monitor" });
+  }
+}
+
 function handleTitlebarMouseDown(event: MouseEvent) {
   if (!appWindow || event.button !== 0) {
     return;
@@ -472,6 +503,7 @@ onMounted(() => {
   void bindWindowStateListener();
   if (isDesktopRuntime) {
     void fetchSharedBackendStatus().catch(() => undefined);
+    void fetchSharedModelRuntimeStatus().catch(() => undefined);
   }
 });
 
@@ -573,13 +605,21 @@ onBeforeUnmount(() => {
             </nav>
 
             <div class="sidebar-bottom">
-              <n-card class="provider-card" :bordered="false" size="small">
-                <span class="provider-indicator" aria-hidden="true"></span>
+              <button class="provider-card" type="button" @click="openModelMonitor">
+                <span
+                  class="provider-indicator"
+                  :class="{
+                    'provider-indicator-active':
+                      modelRuntimeStatus?.ocrLoaded || modelRuntimeStatus?.translatorLoaded,
+                    'provider-indicator-busy': modelRuntimeStatus?.busy,
+                  }"
+                  aria-hidden="true"
+                ></span>
                 <div>
                   <strong>本地模型</strong>
-                  <span>{{ settingsStatusLabel }}</span>
+                  <span>{{ modelProviderLabel }}</span>
                 </div>
-              </n-card>
+              </button>
               <p class="sidebar-build">ver. 0.1.0</p>
             </div>
           </n-layout-sider>
@@ -927,18 +967,33 @@ a:focus-visible {
 }
 
 .provider-card {
-  flex: 0 0 auto;
-  border: 1px solid var(--divider);
-  border-radius: 4px;
-  background: var(--surface);
-  box-shadow: none;
-}
-
-.provider-card .n-card-content {
   display: flex;
+  width: 100%;
+  flex: 0 0 auto;
   align-items: center;
   gap: 9px;
   padding: 11px;
+  border: 1px solid var(--divider);
+  border-radius: 4px;
+  color: inherit;
+  background: var(--surface);
+  box-shadow: none;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 150ms ease,
+    background-color 150ms ease;
+}
+
+.provider-card:hover {
+  border-color: var(--primary);
+  background: #ecf5ff;
+}
+
+.provider-card:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 .provider-card strong,
@@ -964,8 +1019,17 @@ a:focus-visible {
   height: 8px;
   flex: 0 0 8px;
   border-radius: 50%;
-  background: var(--green);
-  box-shadow: 0 0 0 3px rgba(64, 158, 255, 0.14);
+  background: var(--text-muted);
+}
+
+.provider-indicator-active {
+  background: var(--success);
+  box-shadow: 0 0 0 3px rgba(103, 194, 58, 0.14);
+}
+
+.provider-indicator-busy {
+  background: var(--warning);
+  box-shadow: 0 0 0 3px rgba(230, 162, 60, 0.14);
 }
 
 .sidebar-build {

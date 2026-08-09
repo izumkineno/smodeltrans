@@ -1,13 +1,16 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  controlModel,
   createTauriOcrProvider,
   createTauriTextTranslationProvider,
   createTauriTranslationProvider,
   getBackendStatus,
+  getModelRuntimeStatus,
   isTranslationCancellation,
   updateBackendSettings,
   type BackendSettingsUpdate,
   type BackendStatus,
+  type ModelRuntimeStatus,
 } from "./translation-provider";
 
 const originalWindow = globalThis.window;
@@ -469,6 +472,62 @@ describe("backend settings commands", () => {
       {
         command: "update_backend_settings",
         args: { request: settings },
+      },
+    ]);
+  });
+
+  test("getModelRuntimeStatus preserves live metrics and events", async () => {
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const status = {
+      backend: {} as BackendStatus,
+      ocrLoaded: true,
+      translatorLoaded: false,
+      busy: true,
+      idleForMs: 1200,
+      requestCount: 3,
+      succeededRequests: 2,
+      failedRequests: 1,
+      averageDurationMs: 410,
+      lastDurationMs: 230,
+      lastOperation: "OCR 识别",
+      recentEvents: [
+        {
+          timestampMs: 123,
+          operation: "OCR 识别",
+          durationMs: 230,
+          success: true,
+          message: "处理完成",
+        },
+      ],
+    } satisfies ModelRuntimeStatus;
+
+    const result = await getModelRuntimeStatus(async <T>(command, args): Promise<T> => {
+      calls.push({ command, args });
+      return status as T;
+    });
+
+    expect(result.requestCount).toBe(3);
+    expect(result.recentEvents[0].operation).toBe("OCR 识别");
+    expect(calls).toEqual([{ command: "get_model_runtime_status", args: undefined }]);
+  });
+
+  test("controlModel sends the selected model and action", async () => {
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+
+    await controlModel("translator", "unload", async <T>(command, args): Promise<T> => {
+      calls.push({ command, args });
+      return {} as T;
+    });
+
+    expect(calls).toEqual([
+      {
+        command: "control_model",
+        args: {
+          request: {
+            model: "translator",
+            action: "unload",
+          },
+        },
       },
     ]);
   });

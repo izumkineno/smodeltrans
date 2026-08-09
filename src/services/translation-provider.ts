@@ -65,6 +65,32 @@ export interface BackendStatus {
   message: string;
 }
 
+export type ModelTarget = "ocr" | "translator";
+export type ModelAction = "load" | "unload";
+
+export interface ModelRuntimeEvent {
+  timestampMs: number;
+  operation: string;
+  durationMs: number;
+  success: boolean;
+  message: string;
+}
+
+export interface ModelRuntimeStatus {
+  backend: BackendStatus;
+  ocrLoaded: boolean;
+  translatorLoaded: boolean;
+  busy: boolean;
+  idleForMs: number;
+  requestCount: number;
+  succeededRequests: number;
+  failedRequests: number;
+  averageDurationMs: number;
+  lastDurationMs: number | null;
+  lastOperation: string | null;
+  recentEvents: ModelRuntimeEvent[];
+}
+
 export interface BackendSettingsUpdate {
   detectorModelDir: string;
   recognizerModelDir: string;
@@ -256,6 +282,22 @@ export async function updateBackendSettings(
   invokeFn: InvokeFn = invoke,
 ): Promise<BackendStatus> {
   return invokeFn<BackendStatus>("update_backend_settings", { request: settings });
+}
+
+export async function getModelRuntimeStatus(
+  invokeFn: InvokeFn = invoke,
+): Promise<ModelRuntimeStatus> {
+  return invokeFn<ModelRuntimeStatus>("get_model_runtime_status");
+}
+
+export async function controlModel(
+  model: ModelTarget,
+  action: ModelAction,
+  invokeFn: InvokeFn = invoke,
+): Promise<ModelRuntimeStatus> {
+  return invokeFn<ModelRuntimeStatus>("control_model", {
+    request: { model, action },
+  });
 }
 
 export class TauriTranslationProvider implements TranslationProvider {

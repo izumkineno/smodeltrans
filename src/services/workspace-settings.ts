@@ -1,11 +1,12 @@
 import { ref } from "vue";
-import { getBackendStatus } from "./translation-provider";
-import type { BackendStatus } from "./translation-provider";
+import { getBackendStatus, getModelRuntimeStatus } from "./translation-provider";
+import type { BackendStatus, ModelRuntimeStatus } from "./translation-provider";
 
 const TARGET_LANGUAGE_STORAGE_KEY = "smodeltrans.targetLanguage";
 
 export const targetLanguage = ref("Chinese");
 export const backendStatus = ref<BackendStatus | null>(null);
+export const modelRuntimeStatus = ref<ModelRuntimeStatus | null>(null);
 
 let persistedTargetLanguageLoaded = false;
 
@@ -40,8 +41,19 @@ export function applySharedBackendStatus(status: BackendStatus) {
   targetLanguage.value = status.targetLanguage;
 }
 
+export function applySharedModelRuntimeStatus(status: ModelRuntimeStatus) {
+  modelRuntimeStatus.value = status;
+  applySharedBackendStatus(status.backend);
+}
+
 export async function fetchSharedBackendStatus(): Promise<BackendStatus> {
   const status = await getBackendStatus();
   applySharedBackendStatus(status);
+  return status;
+}
+
+export async function fetchSharedModelRuntimeStatus(): Promise<ModelRuntimeStatus> {
+  const status = await getModelRuntimeStatus();
+  applySharedModelRuntimeStatus(status);
   return status;
 }

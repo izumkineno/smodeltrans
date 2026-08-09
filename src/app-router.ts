@@ -9,6 +9,7 @@ export const WORKSPACE_ROUTE_NAMES = [
   "ocr",
   "ocr-translate",
   "settings",
+  "model-monitor",
 ] as const;
 
 export type WorkspaceRouteName = (typeof WORKSPACE_ROUTE_NAMES)[number];
@@ -41,6 +42,11 @@ const routes: RouteRecordRaw[] = [
     path: "/settings",
     name: "settings",
     component: () => import("./components/SettingsPage.vue"),
+  },
+  {
+    path: "/model-monitor",
+    name: "model-monitor",
+    component: () => import("./components/ModelMonitorPage.vue"),
   },
   {
     path: "/:pathMatch(.*)*",

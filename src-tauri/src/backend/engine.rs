@@ -32,13 +32,65 @@ impl BackendEngine {
         })
     }
 
+    pub(crate) fn ocr_loaded(&self) -> bool {
+        self.ocr.is_some()
+    }
+
     pub(crate) fn translator_loaded(&self) -> bool {
         self.hy.is_some()
     }
 
-    pub(crate) fn unload_models(&mut self) {
+    pub(crate) fn model_states(&self) -> (bool, bool) {
+        (self.ocr_loaded(), self.translator_loaded())
+    }
+
+    pub(crate) fn load_ocr(&mut self) -> Result<(), BackendFailure> {
+        if self.ocr.is_none() {
+            self.ocr = Some(PpOcrV5Provider::load(
+                &self.settings.detector_model_dir,
+                &self.settings.recognizer_model_dir,
+                &self.device,
+                self.settings.region_parallelism,
+            )?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn load_translator(&mut self, target_language: &str) -> Result<(), BackendFailure> {
+        let config = ModelConfig::from_parts(
+            target_language,
+            self.settings.prompt.clone(),
+            self.settings.generation.clone(),
+            self.settings.memory.clone(),
+        )
+        .map_err(|error| BackendFailure::arguments(format!("invalid model config: {error:#}")))?;
+        if self.hy.is_none() {
+            let translator = hy::load_with_config(
+                &self.settings.hy_model,
+                &self.device,
+                config.memory,
+                config.generation,
+                config.prompt,
+            )
+            .map_err(|error| {
+                BackendFailure::asset(format!("load local Hy-MT2 model: {error:#}"))
+            })?;
+            self.hy = Some(translator);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unload_ocr(&mut self) {
         self.ocr = None;
+    }
+
+    pub(crate) fn unload_translator(&mut self) {
         self.hy = None;
+    }
+
+    pub(crate) fn unload_models(&mut self) {
+        self.unload_ocr();
+        self.unload_translator();
     }
 
     pub(crate) fn translate(
@@ -49,15 +101,7 @@ impl BackendEngine {
     ) -> Result<TranslationOutput, BackendFailure> {
         cancellation.check()?;
         report_progress(20, "正在准备 PP-OCRv5");
-        if self.ocr.is_none() {
-            self.ocr = Some(PpOcrV5Provider::load(
-                &self.settings.detector_model_dir,
-                &self.settings.recognizer_model_dir,
-                &self.device,
-                self.settings.region_parallelism,
-            )?);
-        }
-        report_progress(35, "PP-OCRv5 已就绪");
+        self.load_ocr()?;
         let ocr = self
             .ocr
             .as_mut()
@@ -81,7 +125,7 @@ impl BackendEngine {
         }
 
         report_progress(60, "正在准备 Hy-MT2");
-        self.ensure_hy_loaded(image.target_language())?;
+        self.load_translator(image.target_language())?;
         report_progress(70, "Hy-MT2 已就绪");
         let translator = self
             .hy
@@ -145,29 +189,6 @@ impl BackendEngine {
         report_progress(100, "翻译完成");
         Ok(output)
     }
-    fn ensure_hy_loaded(&mut self, target_language: &str) -> Result<(), BackendFailure> {
-        let config = ModelConfig::from_parts(
-            target_language,
-            self.settings.prompt.clone(),
-            self.settings.generation.clone(),
-            self.settings.memory.clone(),
-        )
-        .map_err(|error| BackendFailure::arguments(format!("invalid model config: {error:#}")))?;
-        if self.hy.is_none() {
-            let translator = hy::load_with_config(
-                &self.settings.hy_model,
-                &self.device,
-                config.memory,
-                config.generation,
-                config.prompt,
-            )
-            .map_err(|error| {
-                BackendFailure::asset(format!("load local Hy-MT2 model: {error:#}"))
-            })?;
-            self.hy = Some(translator);
-        }
-        Ok(())
-    }
 
     pub(crate) fn translate_text(
         &mut self,
@@ -178,7 +199,7 @@ impl BackendEngine {
     ) -> Result<String, BackendFailure> {
         cancellation.check()?;
         report_progress(20, "正在准备 Hy-MT2");
-        self.ensure_hy_loaded(target_language)?;
+        self.load_translator(target_language)?;
         report_progress(45, "Hy-MT2 已就绪");
         let prompt = self.settings.prompt.clone();
         let generation = self.settings.generation.clone();
@@ -227,15 +248,7 @@ impl BackendEngine {
     ) -> Result<OcrOutput, BackendFailure> {
         cancellation.check()?;
         report_progress(20, "正在准备 PP-OCRv5");
-        if self.ocr.is_none() {
-            self.ocr = Some(PpOcrV5Provider::load(
-                &self.settings.detector_model_dir,
-                &self.settings.recognizer_model_dir,
-                &self.device,
-                self.settings.region_parallelism,
-            )?);
-        }
-        report_progress(35, "PP-OCRv5 已就绪");
+        self.load_ocr()?;
         let ocr = self
             .ocr
             .as_mut()

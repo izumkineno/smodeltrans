@@ -5,6 +5,7 @@ use super::{
     input::{
         DecodedImage, decode_image, decode_ocr_image, validate_target_language, validate_text,
     },
+    runtime::{RuntimeMetrics, RuntimeMetricsSnapshot},
     settings::{BackendSettings, BackendSettingsUpdate, BackendStatus},
 };
 
@@ -24,6 +25,7 @@ pub(crate) struct BackendState {
     pub(crate) settings: Arc<Mutex<Result<BackendSettings, String>>>,
     pub(crate) engine: Arc<Mutex<Option<BackendEngine>>>,
     pub(crate) last_activity: Arc<Mutex<Instant>>,
+    pub(crate) runtime: Arc<Mutex<RuntimeMetrics>>,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) runs: RunRegistry,
 }
@@ -50,6 +52,7 @@ impl BackendState {
             )),
             engine: Arc::new(Mutex::new(None)),
             last_activity: Arc::new(Mutex::new(Instant::now())),
+            runtime: Arc::new(Mutex::new(RuntimeMetrics::default())),
             config_path,
             runs: RunRegistry::default(),
         }
@@ -59,6 +62,7 @@ impl BackendState {
         let settings = Arc::clone(&self.settings);
         let engine = Arc::clone(&self.engine);
         let last_activity = Arc::clone(&self.last_activity);
+        let runtime = Arc::clone(&self.runtime);
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(5));
@@ -86,10 +90,24 @@ impl BackendState {
                 let Ok(mut engine) = engine.try_lock() else {
                     continue;
                 };
-                if last_used.elapsed() >= idle_for {
-                    if let Some(engine) = engine.as_mut() {
+                let unloaded = if last_used.elapsed() >= idle_for {
+                    engine.as_mut().is_some_and(|engine| {
+                        let (ocr_loaded, translator_loaded) = engine.model_states();
                         engine.unload_models();
-                    }
+                        ocr_loaded || translator_loaded
+                    })
+                } else {
+                    false
+                };
+                drop(engine);
+                if unloaded && let Ok(mut runtime) = runtime.lock() {
+                    runtime.set_model_states(false, false);
+                    runtime.record_control(
+                        "自动卸载全部模型",
+                        Duration::ZERO,
+                        true,
+                        "达到空闲释放时间",
+                    );
                 }
             }
         });
@@ -99,6 +117,38 @@ impl BackendState {
         if let Ok(mut last_activity) = self.last_activity.lock() {
             *last_activity = Instant::now();
         }
+    }
+
+    fn set_model_states(&self, ocr_loaded: bool, translator_loaded: bool) {
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.set_model_states(ocr_loaded, translator_loaded);
+        }
+    }
+
+    fn record_request(&self, operation: &str, duration: Duration, success: bool, message: &str) {
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.record_request(operation, duration, success, message);
+        }
+    }
+
+    fn record_control(&self, operation: &str, duration: Duration, success: bool, message: &str) {
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.record_control(operation, duration, success, message);
+        }
+    }
+
+    fn runtime_snapshot(&self) -> Result<RuntimeMetricsSnapshot, BackendFailure> {
+        let idle_for = self
+            .last_activity
+            .lock()
+            .map_err(|_| BackendFailure::internal("后端活动时间锁已损坏"))?
+            .elapsed();
+        let busy = self.runs.is_busy()?;
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| BackendFailure::internal("模型运行状态锁已损坏"))?;
+        Ok(runtime.snapshot(idle_for, busy))
     }
 }
 
@@ -134,6 +184,63 @@ pub(crate) struct OcrImageRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CancelTranslationRequest {
     pub(crate) request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ModelControlRequest {
+    pub(crate) model: String,
+    pub(crate) action: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ModelTarget {
+    Ocr,
+    Translator,
+}
+
+impl ModelTarget {
+    fn parse(value: &str) -> Result<Self, BackendFailure> {
+        match value {
+            "ocr" => Ok(Self::Ocr),
+            "translator" => Ok(Self::Translator),
+            _ => Err(BackendFailure::arguments(
+                "model must be 'ocr' or 'translator'",
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ocr => "PP-OCRv5",
+            Self::Translator => "Hy-MT2",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ModelAction {
+    Load,
+    Unload,
+}
+
+impl ModelAction {
+    fn parse(value: &str) -> Result<Self, BackendFailure> {
+        match value {
+            "load" => Ok(Self::Load),
+            "unload" => Ok(Self::Unload),
+            _ => Err(BackendFailure::arguments(
+                "action must be 'load' or 'unload'",
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Load => "加载",
+            Self::Unload => "卸载",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -235,6 +342,14 @@ pub(crate) struct BackendError {
     pub(crate) message: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ModelRuntimeStatus {
+    pub(crate) backend: BackendStatus,
+    #[serde(flatten)]
+    pub(crate) runtime: RuntimeMetricsSnapshot,
+}
+
 impl From<BackendFailure> for BackendError {
     fn from(failure: BackendFailure) -> Self {
         Self {
@@ -244,10 +359,7 @@ impl From<BackendFailure> for BackendError {
     }
 }
 
-#[tauri::command]
-pub(crate) fn get_backend_status(
-    state: State<'_, BackendState>,
-) -> Result<BackendStatus, BackendError> {
+fn current_backend_status(state: &BackendState) -> Result<BackendStatus, BackendError> {
     let settings = state
         .settings
         .lock()
@@ -257,15 +369,47 @@ pub(crate) fn get_backend_status(
         Ok(settings) => settings,
         Err(message) => return Ok(BackendStatus::configuration_error(&message)),
     };
-    let engine = state
-        .engine
+    let translator_loaded = state
+        .runtime
         .lock()
-        .map_err(|_| BackendFailure::internal("后端状态锁已损坏"))?;
-    Ok(settings.status(
-        engine
-            .as_ref()
-            .is_some_and(BackendEngine::translator_loaded),
-    ))
+        .map_err(|_| BackendFailure::internal("模型运行状态锁已损坏"))?
+        .model_states()
+        .1;
+    Ok(settings.status(translator_loaded))
+}
+
+fn current_model_runtime_status(state: &BackendState) -> Result<ModelRuntimeStatus, BackendError> {
+    Ok(ModelRuntimeStatus {
+        backend: current_backend_status(state)?,
+        runtime: state.runtime_snapshot()?,
+    })
+}
+
+fn record_request_result<T>(
+    state: &BackendState,
+    operation: &str,
+    started_at: Instant,
+    result: &Result<T, BackendFailure>,
+) {
+    let (success, message) = match result {
+        Ok(_) => (true, "处理完成"),
+        Err(error) => (false, error.message()),
+    };
+    state.record_request(operation, started_at.elapsed(), success, message);
+}
+
+#[tauri::command]
+pub(crate) fn get_backend_status(
+    state: State<'_, BackendState>,
+) -> Result<BackendStatus, BackendError> {
+    current_backend_status(state.inner())
+}
+
+#[tauri::command]
+pub(crate) fn get_model_runtime_status(
+    state: State<'_, BackendState>,
+) -> Result<ModelRuntimeStatus, BackendError> {
+    current_model_runtime_status(state.inner())
 }
 
 #[tauri::command]
@@ -297,6 +441,9 @@ pub(crate) fn update_backend_settings(
         .lock()
         .map_err(|_| BackendFailure::internal("后端状态锁已损坏"))?;
     *engine = None;
+    drop(engine);
+    state.set_model_states(false, false);
+    state.record_control("重置模型运行时", Duration::ZERO, true, "模型设置已更新");
     state.touch_activity();
     Ok(updated.status(false))
 }
@@ -315,6 +462,81 @@ fn persist_backend_settings(
     std::fs::write(config_path, content)
         .map_err(|error| BackendFailure::internal(format!("保存模型设置失败：{error}")))?;
     Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn control_model(
+    request: ModelControlRequest,
+    state: State<'_, BackendState>,
+) -> Result<ModelRuntimeStatus, BackendError> {
+    let target = ModelTarget::parse(request.model.trim())?;
+    let action = ModelAction::parse(request.action.trim())?;
+    let operation = format!("{} {}", action.label(), target.label());
+    let success_message = format!("{}已{}", target.label(), action.label());
+    let started_at = Instant::now();
+    let worker_state = state.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<(), BackendFailure> {
+        if worker_state.runs.is_busy()? {
+            return Err(BackendFailure::arguments(
+                "模型正在处理请求，请在当前任务完成后重试",
+            ));
+        }
+        let settings = worker_state
+            .settings
+            .lock()
+            .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
+            .clone()
+            .map_err(BackendFailure::arguments)?;
+        let mut engine = worker_state
+            .engine
+            .lock()
+            .map_err(|_| BackendFailure::internal("后端状态锁已损坏"))?;
+        if matches!(action, ModelAction::Load) && engine.is_none() {
+            *engine = Some(BackendEngine::new(settings)?);
+        }
+        let result = match (engine.as_mut(), target, action) {
+            (Some(engine), ModelTarget::Ocr, ModelAction::Load) => engine.load_ocr(),
+            (Some(engine), ModelTarget::Translator, ModelAction::Load) => {
+                let target_language = engine.settings.target_language.clone();
+                engine.load_translator(&target_language)
+            }
+            (Some(engine), ModelTarget::Ocr, ModelAction::Unload) => {
+                engine.unload_ocr();
+                Ok(())
+            }
+            (Some(engine), ModelTarget::Translator, ModelAction::Unload) => {
+                engine.unload_translator();
+                Ok(())
+            }
+            (None, _, ModelAction::Unload) => Ok(()),
+            (None, _, ModelAction::Load) => Err(BackendFailure::internal("Candle 后端未初始化")),
+        };
+        let (ocr_loaded, translator_loaded) = engine
+            .as_ref()
+            .map(BackendEngine::model_states)
+            .unwrap_or((false, false));
+        drop(engine);
+        worker_state.set_model_states(ocr_loaded, translator_loaded);
+        worker_state.touch_activity();
+        result
+    })
+    .await
+    .map_err(|error| {
+        BackendFailure::internal(format!("Candle worker exited unexpectedly: {error}"))
+    })
+    .and_then(|result| result);
+    let event_message = result
+        .as_ref()
+        .map(|_| success_message.as_str())
+        .unwrap_or_else(|error| error.message());
+    state.record_control(
+        &operation,
+        started_at.elapsed(),
+        result.is_ok(),
+        event_message,
+    );
+    result?;
+    current_model_runtime_status(state.inner())
 }
 
 #[tauri::command]
@@ -339,21 +561,32 @@ pub(crate) async fn translate_image(
     emit_translation_progress(&app, &run_id, 5, "正在准备翻译请求");
     let decoded = decode_request(request)?;
     emit_translation_progress(&app, &run_id, 15, "图片已解码");
-    let state = state.inner().clone();
+    let worker_state = state.inner().clone();
+    let metrics_state = worker_state.clone();
     let app = app.clone();
     let run_id = run_id.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Result<TranslationResponse, BackendFailure> {
-        lease.token().check()?;
-        let response =
-            translate_image_blocking(decoded, &state, lease.token(), &app, &run_id, started_at)?;
-        lease.finalize_success()?;
-        Ok(response)
-    })
+    let result = tauri::async_runtime::spawn_blocking(
+        move || -> Result<TranslationResponse, BackendFailure> {
+            lease.token().check()?;
+            let response = translate_image_blocking(
+                decoded,
+                &worker_state,
+                lease.token(),
+                &app,
+                &run_id,
+                started_at,
+            )?;
+            lease.finalize_success()?;
+            Ok(response)
+        },
+    )
     .await
     .map_err(|error| {
         BackendFailure::internal(format!("Candle worker exited unexpectedly: {error}"))
-    })?
-    .map_err(BackendError::from)
+    })
+    .and_then(|result| result);
+    record_request_result(&metrics_state, "图片翻译", started_at, &result);
+    result.map_err(BackendError::from)
 }
 
 #[tauri::command]
@@ -368,16 +601,17 @@ pub(crate) async fn translate_text(
     emit_translation_progress(&app, &run_id, 5, "正在准备翻译请求");
     let (text, target_language) = decode_text_request(request)?;
     emit_translation_progress(&app, &run_id, 15, "文本请求已验证");
-    let state = state.inner().clone();
+    let worker_state = state.inner().clone();
+    let metrics_state = worker_state.clone();
     let app = app.clone();
     let run_id = run_id.clone();
-    tauri::async_runtime::spawn_blocking(
+    let result = tauri::async_runtime::spawn_blocking(
         move || -> Result<TextTranslationResponse, BackendFailure> {
             lease.token().check()?;
             let response = translate_text_blocking(
                 text,
                 target_language,
-                &state,
+                &worker_state,
                 lease.token(),
                 &app,
                 &run_id,
@@ -390,8 +624,10 @@ pub(crate) async fn translate_text(
     .await
     .map_err(|error| {
         BackendFailure::internal(format!("Candle worker exited unexpectedly: {error}"))
-    })?
-    .map_err(BackendError::from)
+    })
+    .and_then(|result| result);
+    record_request_result(&metrics_state, "文本翻译", started_at, &result);
+    result.map_err(BackendError::from)
 }
 
 #[tauri::command]
@@ -406,21 +642,31 @@ pub(crate) async fn ocr_image(
     emit_translation_progress(&app, &run_id, 5, "正在准备 OCR 请求");
     let decoded = decode_ocr_request(request)?;
     emit_translation_progress(&app, &run_id, 15, "图片已解码");
-    let state = state.inner().clone();
+    let worker_state = state.inner().clone();
+    let metrics_state = worker_state.clone();
     let app = app.clone();
     let run_id = run_id.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Result<OcrResponse, BackendFailure> {
-        lease.token().check()?;
-        let response =
-            ocr_image_blocking(decoded, &state, lease.token(), &app, &run_id, started_at)?;
-        lease.finalize_success()?;
-        Ok(response)
-    })
-    .await
-    .map_err(|error| {
-        BackendFailure::internal(format!("Candle worker exited unexpectedly: {error}"))
-    })?
-    .map_err(BackendError::from)
+    let result =
+        tauri::async_runtime::spawn_blocking(move || -> Result<OcrResponse, BackendFailure> {
+            lease.token().check()?;
+            let response = ocr_image_blocking(
+                decoded,
+                &worker_state,
+                lease.token(),
+                &app,
+                &run_id,
+                started_at,
+            )?;
+            lease.finalize_success()?;
+            Ok(response)
+        })
+        .await
+        .map_err(|error| {
+            BackendFailure::internal(format!("Candle worker exited unexpectedly: {error}"))
+        })
+        .and_then(|result| result);
+    record_request_result(&metrics_state, "OCR 识别", started_at, &result);
+    result.map_err(BackendError::from)
 }
 
 fn decode_request(request: TranslateImageRequest) -> Result<DecodedImage, BackendFailure> {
@@ -456,7 +702,7 @@ fn translate_image_blocking(
         .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
         .clone()
         .map_err(BackendFailure::arguments)?;
-    let result = {
+    let (result, (ocr_loaded, translator_loaded)) = {
         let mut engine = lock_with_cancellation(&state.engine, cancellation)?;
         if engine.is_none() {
             *engine = Some(BackendEngine::new(settings)?);
@@ -464,10 +710,12 @@ fn translate_image_blocking(
         let engine = engine
             .as_mut()
             .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
-        engine.translate(&request, cancellation, |progress, stage| {
+        let result = engine.translate(&request, cancellation, |progress, stage| {
             emit_translation_progress(app, run_id, progress, stage);
-        })
+        });
+        (result, engine.model_states())
     };
+    state.set_model_states(ocr_loaded, translator_loaded);
     state.touch_activity();
     let result = result?;
     let image_base64 = BASE64.encode(result.annotated_png);
@@ -497,7 +745,7 @@ fn translate_text_blocking(
         .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
         .clone()
         .map_err(BackendFailure::arguments)?;
-    let result = {
+    let (result, (ocr_loaded, translator_loaded)) = {
         let mut engine = lock_with_cancellation(&state.engine, cancellation)?;
         if engine.is_none() {
             *engine = Some(BackendEngine::new(settings)?);
@@ -505,10 +753,13 @@ fn translate_text_blocking(
         let engine = engine
             .as_mut()
             .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
-        engine.translate_text(&text, &target_language, cancellation, |progress, stage| {
-            emit_translation_progress(app, run_id, progress, stage);
-        })
+        let result =
+            engine.translate_text(&text, &target_language, cancellation, |progress, stage| {
+                emit_translation_progress(app, run_id, progress, stage);
+            });
+        (result, engine.model_states())
     };
+    state.set_model_states(ocr_loaded, translator_loaded);
     state.touch_activity();
     Ok(TextTranslationResponse {
         text: result?,
@@ -533,7 +784,7 @@ fn ocr_image_blocking(
         .clone()
         .map_err(BackendFailure::arguments)?;
     let (image_width, image_height) = request.canvas().dimensions();
-    let result = {
+    let (result, (ocr_loaded, translator_loaded)) = {
         let mut engine = lock_with_cancellation(&state.engine, cancellation)?;
         if engine.is_none() {
             *engine = Some(BackendEngine::new(settings)?);
@@ -541,10 +792,12 @@ fn ocr_image_blocking(
         let engine = engine
             .as_mut()
             .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
-        engine.ocr(&request, cancellation, |progress, stage| {
+        let result = engine.ocr(&request, cancellation, |progress, stage| {
             emit_translation_progress(app, run_id, progress, stage);
-        })
+        });
+        (result, engine.model_states())
     };
+    state.set_model_states(ocr_loaded, translator_loaded);
     state.touch_activity();
     let result = result?;
     let image_base64 = BASE64.encode(result.annotated_png);

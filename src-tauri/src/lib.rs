@@ -28,6 +28,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             backend::commands::get_backend_status,
+            backend::commands::get_model_runtime_status,
+            backend::commands::control_model,
             backend::commands::update_backend_settings,
             backend::commands::cancel_translation,
             backend::commands::translate_image,

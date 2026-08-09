@@ -154,6 +154,14 @@ impl RunRegistry {
         })
     }
 
+    pub(crate) fn is_busy(&self) -> Result<bool, BackendFailure> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| BackendFailure::internal("运行注册表锁已损坏"))?;
+        Ok(!inner.active.is_empty())
+    }
+
     pub(crate) fn cancel(&self, run_id: &RunId) -> Result<(), BackendFailure> {
         let mut inner = self
             .inner
