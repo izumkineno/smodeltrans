@@ -1,6 +1,6 @@
 use crate::{
     backend::{
-        contracts::{OutputPort, RegionRecord, TranslationOutput},
+        contracts::{OcrOutput, OutputPort, RegionRecord, TranslationOutput},
         failure::BackendFailure,
         input::{DecodedImage, MAX_TEXT_BYTES},
     },
@@ -116,6 +116,93 @@ impl OutputPort for ImageOutput {
             is_translated: !regions.is_empty(),
         })
     }
+
+    fn render_ocr(
+        &mut self,
+        image: &DecodedImage,
+        regions: &[RegionRecord],
+        cancellation: &CancellationToken,
+    ) -> Result<OcrOutput, BackendFailure> {
+        cancellation.check()?;
+        let mut rendered: RgbaImage = DynamicImage::ImageRgb8(image.canvas().clone()).into_rgba8();
+        let ordered = ordered_regions(regions);
+        let mut recognized_text = Vec::with_capacity(ordered.len());
+        for region in &ordered {
+            cancellation.check()?;
+            if region.order == 0 || region.source_text.trim().is_empty() {
+                return Err(BackendFailure::output("输出区域缺少有效顺序或识别文本"));
+            }
+            let rect = quad_rect(region.quad_points, rendered.width(), rendered.height())
+                .ok_or_else(|| BackendFailure::output("OCR 区域超出图像或几何退化"))?;
+            if rect.width() < 8 || rect.height() < 8 {
+                return Err(BackendFailure::output("OCR 区域没有足够的标注空间"));
+            }
+            draw_hollow_rect_mut(&mut rendered, rect, BORDER);
+            recognized_text.push(clean_annotation(&region.source_text));
+        }
+        if !ordered.is_empty() {
+            let font = resolve_font(self.font_path.as_deref(), &recognized_text)?;
+            for (region, text) in ordered.iter().zip(recognized_text.iter()) {
+                cancellation.check()?;
+                let rect = quad_rect(region.quad_points, rendered.width(), rendered.height())
+                    .ok_or_else(|| BackendFailure::output("OCR 区域几何无效"))?;
+                let inset = Rect::at(rect.left() + 2, rect.top() + 2).of_size(
+                    rect.width().saturating_sub(4),
+                    rect.height().saturating_sub(4),
+                );
+                draw_filled_rect_mut(&mut rendered, inset, OVERLAY);
+                let size = (inset.height() as f32 * 0.72).clamp(8.0, 32.0);
+                draw_text_mut(
+                    &mut rendered,
+                    WHITE,
+                    inset.left() + 2,
+                    inset.top() + 2,
+                    PxScale::from(size),
+                    &font,
+                    text,
+                );
+            }
+        }
+        cancellation.check()?;
+        let markdown = write_ocr_markdown(image.file_name(), regions)?;
+        if markdown.len() > MAX_TEXT_BYTES {
+            return Err(BackendFailure::output("Markdown 输出超过 8 MiB 上限"));
+        }
+        let text = ordered
+            .iter()
+            .map(|region| region.source_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.len() > MAX_TEXT_BYTES {
+            return Err(BackendFailure::output("文本输出超过 8 MiB 上限"));
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(rendered)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .map_err(|error| BackendFailure::output(format!("PNG 编码失败：{error}")))?;
+        let png = bytes.into_inner();
+        if png.len() > MAX_PNG_BYTES {
+            return Err(BackendFailure::output("PNG 输出超过 8 MiB 上限"));
+        }
+        let data_url_len = 22usize
+            .checked_add((png.len() + 2) / 3 * 4)
+            .ok_or_else(|| BackendFailure::output("PNG data URL 长度溢出"))?;
+        if data_url_len > MAX_DATA_URL_CHARS {
+            return Err(BackendFailure::output("PNG data URL 超过长度上限"));
+        }
+        Ok(OcrOutput {
+            annotated_png: png,
+            markdown,
+            text,
+            provider_label: "PP-OCRv5 / Candle".to_owned(),
+        })
+    }
+}
+
+fn ordered_regions(regions: &[RegionRecord]) -> Vec<&RegionRecord> {
+    let mut ordered = regions.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|region| region.order);
+    ordered
 }
 
 fn quad_rect(quad: [[i32; 2]; 4], width: u32, height: u32) -> Option<Rect> {
@@ -255,6 +342,60 @@ fn write_markdown(
     Ok(markdown)
 }
 
+fn write_ocr_markdown(
+    file_name: &str,
+    regions: &[RegionRecord],
+) -> Result<String, BackendFailure> {
+    let ordered = ordered_regions(regions);
+    let mut markdown = String::new();
+    markdown.push_str("---\nsource_image: ");
+    markdown.push_str(&escape_scalar(file_name));
+    markdown.push_str(&format!("\nregion_count: {}\n---\n\n# OCR\n", regions.len()));
+    for region in ordered {
+        markdown.push_str(&format!(
+            "\n## Region {}\n\n- order: {}\n- quad_points: [",
+            region.order, region.order
+        ));
+        for (index, point) in region.quad_points.iter().enumerate() {
+            if index > 0 {
+                markdown.push_str(", ");
+            }
+            markdown.push_str(&format!("[{}, {}]", point[0], point[1]));
+        }
+        markdown.push_str("]\n- recognized_text: ");
+        markdown.push_str(&escape_scalar(&region.source_text));
+        markdown.push('\n');
+    }
+    Ok(markdown)
+}
+
 pub(crate) fn max_data_url_chars() -> usize {
     MAX_DATA_URL_CHARS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_ocr_markdown;
+    use crate::backend::contracts::RegionRecord;
+
+    #[test]
+    fn ocr_markdown_contains_recognized_text_in_reading_order() {
+        let regions = vec![
+            RegionRecord::untranslated(2, [[10, 10]; 4], "second"),
+            RegionRecord::untranslated(1, [[0, 0]; 4], "first"),
+        ];
+        let markdown = write_ocr_markdown("screen.png", &regions).expect("OCR markdown");
+
+        assert!(markdown.contains("# OCR"));
+        assert!(markdown.contains("- recognized_text: \"first\""));
+        assert!(markdown.contains("- recognized_text: \"second\""));
+        assert!(
+            markdown
+                .find("recognized_text: \"first\"")
+                .expect("first text")
+                < markdown
+                    .find("recognized_text: \"second\"")
+                    .expect("second text")
+        );
+    }
 }

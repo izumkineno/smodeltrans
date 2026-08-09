@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  createTauriOcrProvider,
+  createTauriTextTranslationProvider,
   createTauriTranslationProvider,
   getBackendStatus,
   isTranslationCancellation,
@@ -75,10 +77,15 @@ describe("TauriTranslationProvider", () => {
   test("abort sends additive backend cancellation and normalizes AbortError", async () => {
     installTauriWindow();
     const pending = deferred<never>();
+    const started = deferred<void>();
     const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
     const provider = createTauriTranslationProvider(<T>(command: string, args?: Record<string, unknown>): Promise<T> => {
       calls.push({ command, args });
-      return command === "translate_image" ? pending.promise : Promise.resolve(undefined as T);
+      if (command === "translate_image") {
+        started.resolve(undefined);
+        return pending.promise;
+      }
+      return Promise.resolve(undefined as T);
     });
     const controller = new AbortController();
     const promise = provider.translate(
@@ -89,7 +96,7 @@ describe("TauriTranslationProvider", () => {
       controller.signal,
     );
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await started.promise;
     controller.abort();
     const error = await promise.catch((value: unknown) => value);
 
@@ -114,6 +121,211 @@ describe("TauriTranslationProvider", () => {
         {
           file: new File([new Uint8Array([1])], "sample.png", { type: "image/png" }),
           targetLanguage: "Chinese",
+        },
+        new AbortController().signal,
+      )
+      .catch((value: unknown) => value);
+
+    expect(isTranslationCancellation(error)).toBe(true);
+  });
+});
+
+describe("TauriTextTranslationProvider", () => {
+  test("sends exact text payload and maps the response", async () => {
+    installTauriWindow();
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const provider = createTauriTextTranslationProvider(async <T>(command, args): Promise<T> => {
+      calls.push({ command, args });
+      return {
+        text: "Hello",
+        providerLabel: "Hy-MT2 / Candle",
+        durationMs: 42,
+      } as T;
+    });
+
+    const result = await provider.translate(
+      {
+        text: "你好",
+        targetLanguage: "English",
+        requestId: "ui-test",
+      },
+      new AbortController().signal,
+    );
+
+    expect(result).toEqual({
+      text: "Hello",
+      providerLabel: "Hy-MT2 / Candle",
+      durationMs: 42,
+    });
+    expect(calls).toEqual([
+      {
+        command: "translate_text",
+        args: {
+          request: {
+            text: "你好",
+            targetLanguage: "English",
+            requestId: "ui-test",
+          },
+        },
+      },
+    ]);
+  });
+
+  test("abort sends cancellation with the same text request ID", async () => {
+    installTauriWindow();
+    const pending = deferred<never>();
+    const started = deferred<void>();
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const provider = createTauriTextTranslationProvider(<T>(
+      command: string,
+      args?: Record<string, unknown>,
+    ): Promise<T> => {
+      calls.push({ command, args });
+      if (command === "translate_text") {
+        started.resolve(undefined);
+        return pending.promise;
+      }
+      return Promise.resolve(undefined as T);
+    });
+    const controller = new AbortController();
+    const promise = provider.translate(
+      {
+        text: "你好",
+        targetLanguage: "English",
+        requestId: "text-test",
+      },
+      controller.signal,
+    );
+
+    await started.promise;
+    controller.abort();
+    const error = await promise.catch((value: unknown) => value);
+
+    expect(isTranslationCancellation(error)).toBe(true);
+    expect(calls.map((call) => call.command)).toEqual(["translate_text", "cancel_translation"]);
+    const translateRequest = calls[0].args?.request as Record<string, unknown>;
+    const cancelRequest = calls[1].args?.request as Record<string, unknown>;
+    expect(cancelRequest.requestId).toBe(translateRequest.requestId);
+    expect(cancelRequest.requestId).toBe("text-test");
+  });
+
+  test("backend cancelled code normalizes to AbortError", async () => {
+    installTauriWindow();
+    const provider = createTauriTextTranslationProvider(<T>(command: string): Promise<T> => {
+      if (command === "translate_text") {
+        return Promise.reject({ code: "cancelled", message: "cancelled" });
+      }
+      return Promise.resolve(undefined as T);
+    });
+
+    const error = await provider
+      .translate(
+        {
+          text: "你好",
+          targetLanguage: "English",
+        },
+        new AbortController().signal,
+      )
+      .catch((value: unknown) => value);
+
+    expect(isTranslationCancellation(error)).toBe(true);
+  });
+});
+
+describe("TauriOcrProvider", () => {
+  test("sends exact base64 payload and maps the OCR response", async () => {
+    installTauriWindow();
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const provider = createTauriOcrProvider(async <T>(command, args): Promise<T> => {
+      calls.push({ command, args });
+      return {
+        text: "识别文本",
+        markdown: "# OCR\n\n识别文本",
+        annotatedImageDataUrl: "data:image/png;base64,AAAA",
+        providerLabel: "PP-OCRv5 / Candle",
+        durationMs: 321,
+      } as T;
+    });
+
+    const result = await provider.recognize(
+      {
+        file: new File([new Uint8Array([1, 2, 3])], "sample.png", { type: "image/png" }),
+        requestId: "ocr-test",
+      },
+      new AbortController().signal,
+    );
+
+    expect(result).toEqual({
+      text: "识别文本",
+      markdown: "# OCR\n\n识别文本",
+      annotatedImageDataUrl: "data:image/png;base64,AAAA",
+      providerLabel: "PP-OCRv5 / Candle",
+      durationMs: 321,
+    });
+    expect(calls).toEqual([
+      {
+        command: "ocr_image",
+        args: {
+          request: {
+            imageBase64: "AQID",
+            fileName: "sample.png",
+            requestId: "ocr-test",
+          },
+        },
+      },
+    ]);
+  });
+
+  test("abort sends cancellation with the same OCR request ID", async () => {
+    installTauriWindow();
+    const pending = deferred<never>();
+    const started = deferred<void>();
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const provider = createTauriOcrProvider(<T>(
+      command: string,
+      args?: Record<string, unknown>,
+    ): Promise<T> => {
+      calls.push({ command, args });
+      if (command === "ocr_image") {
+        started.resolve(undefined);
+        return pending.promise;
+      }
+      return Promise.resolve(undefined as T);
+    });
+    const controller = new AbortController();
+    const promise = provider.recognize(
+      {
+        file: new File([new Uint8Array([1])], "sample.png", { type: "image/png" }),
+        requestId: "ocr-cancel-test",
+      },
+      controller.signal,
+    );
+
+    await started.promise;
+    controller.abort();
+    const error = await promise.catch((value: unknown) => value);
+
+    expect(isTranslationCancellation(error)).toBe(true);
+    expect(calls.map((call) => call.command)).toEqual(["ocr_image", "cancel_translation"]);
+    const ocrRequest = calls[0].args?.request as Record<string, unknown>;
+    const cancelRequest = calls[1].args?.request as Record<string, unknown>;
+    expect(cancelRequest.requestId).toBe(ocrRequest.requestId);
+    expect(cancelRequest.requestId).toBe("ocr-cancel-test");
+  });
+
+  test("backend cancelled code normalizes to AbortError", async () => {
+    installTauriWindow();
+    const provider = createTauriOcrProvider(<T>(command: string): Promise<T> => {
+      if (command === "ocr_image") {
+        return Promise.reject({ code: "cancelled", message: "cancelled" });
+      }
+      return Promise.resolve(undefined as T);
+    });
+
+    const error = await provider
+      .recognize(
+        {
+          file: new File([new Uint8Array([1])], "sample.png", { type: "image/png" }),
         },
         new AbortController().signal,
       )

@@ -41,19 +41,53 @@ impl DecodedImage {
     }
 }
 
+pub(crate) fn validate_target_language(value: &str) -> Result<String, BackendFailure> {
+    let value = value.trim();
+    let scalar_count = value.chars().count();
+    if !(1..=64).contains(&scalar_count) {
+        return Err(BackendFailure::arguments(
+            "targetLanguage must contain 1..=64 Unicode scalar values",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+pub(crate) fn validate_text(value: &str) -> Result<String, BackendFailure> {
+    if value.len() > MAX_TEXT_BYTES {
+        return Err(BackendFailure::arguments(
+            "text exceeds the 8 MiB transport limit",
+        ));
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(BackendFailure::arguments("text must not be empty"));
+    }
+    Ok(value.to_owned())
+}
+
 pub(crate) fn decode_image(
     image_base64: &str,
     file_name: String,
     target_language: String,
 ) -> Result<DecodedImage, BackendFailure> {
     validate_file_name(&file_name)?;
-    let target_language = target_language.trim().to_owned();
-    let scalar_count = target_language.chars().count();
-    if !(1..=64).contains(&scalar_count) {
-        return Err(BackendFailure::arguments(
-            "targetLanguage must contain 1..=64 Unicode scalar values",
-        ));
-    }
+    let target_language = validate_target_language(&target_language)?;
+    decode_encoded_image(image_base64, file_name, target_language)
+}
+
+pub(crate) fn decode_ocr_image(
+    image_base64: &str,
+    file_name: String,
+) -> Result<DecodedImage, BackendFailure> {
+    validate_file_name(&file_name)?;
+    decode_encoded_image(image_base64, file_name, String::new())
+}
+
+fn decode_encoded_image(
+    image_base64: &str,
+    file_name: String,
+    target_language: String,
+) -> Result<DecodedImage, BackendFailure> {
     if image_base64.is_empty() || image_base64.len() > MAX_BASE64_CHARS || !image_base64.is_ascii()
     {
         return Err(BackendFailure::arguments(
@@ -131,4 +165,39 @@ fn validate_file_name(file_name: &str) -> Result<(), BackendFailure> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_TEXT_BYTES, decode_ocr_image, validate_target_language, validate_text,
+    };
+
+    #[test]
+    fn target_language_validation_trims_and_bounds_unicode_scalars() {
+        assert_eq!(
+            validate_target_language("  English  ").expect("valid target"),
+            "English"
+        );
+        assert!(validate_target_language("   ").is_err());
+        assert!(validate_target_language(&"中".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn text_validation_trims_rejects_empty_and_enforces_byte_bound() {
+        assert_eq!(validate_text("  hello\n").expect("valid text"), "hello");
+        assert!(validate_text(" \t\r\n").is_err());
+        assert!(validate_text(&"x".repeat(MAX_TEXT_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn ocr_decoder_does_not_require_a_target_language() {
+        let image = decode_ocr_image(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            "sample.png".to_owned(),
+        )
+        .expect("valid PNG");
+        assert_eq!(image.target_language(), "");
+        assert_eq!(image.file_name(), "sample.png");
+    }
 }

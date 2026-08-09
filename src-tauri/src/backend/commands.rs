@@ -1,9 +1,12 @@
 use super::{
     engine::BackendEngine,
     failure::BackendFailure,
-    input::{DecodedImage, decode_image},
+    input::{
+        DecodedImage, decode_image, decode_ocr_image, validate_target_language, validate_text,
+    },
     settings::{BackendSettings, BackendSettingsUpdate, BackendStatus},
 };
+
 use crate::model_support::{RunId, RunRegistry, lock_with_cancellation};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
@@ -110,6 +113,24 @@ pub(crate) struct TranslateImageRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct TranslateTextRequest {
+    pub(crate) text: String,
+    pub(crate) target_language: String,
+    #[serde(default)]
+    pub(crate) request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OcrImageRequest {
+    pub(crate) image_base64: String,
+    pub(crate) file_name: String,
+    #[serde(default)]
+    pub(crate) request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct CancelTranslationRequest {
     pub(crate) request_id: String,
 }
@@ -122,6 +143,24 @@ pub(crate) struct TranslationResponse {
     pub(crate) annotated_image_data_url: String,
     pub(crate) provider_label: String,
     pub(crate) is_translated: bool,
+    pub(crate) duration_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TextTranslationResponse {
+    pub(crate) text: String,
+    pub(crate) provider_label: String,
+    pub(crate) duration_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OcrResponse {
+    pub(crate) text: String,
+    pub(crate) markdown: String,
+    pub(crate) annotated_image_data_url: String,
+    pub(crate) provider_label: String,
     pub(crate) duration_ms: u64,
 }
 
@@ -277,12 +316,91 @@ pub(crate) async fn translate_image(
     .map_err(BackendError::from)
 }
 
+#[tauri::command]
+pub(crate) async fn translate_text(
+    app: tauri::AppHandle,
+    request: TranslateTextRequest,
+    state: State<'_, BackendState>,
+) -> Result<TextTranslationResponse, BackendError> {
+    let started_at = Instant::now();
+    let run_id = RunId::from_optional(request.request_id.as_deref())?;
+    let lease = state.runs.register(run_id.clone())?;
+    emit_translation_progress(&app, &run_id, 5, "正在准备翻译请求");
+    let (text, target_language) = decode_text_request(request)?;
+    emit_translation_progress(&app, &run_id, 15, "文本请求已验证");
+    let state = state.inner().clone();
+    let app = app.clone();
+    let run_id = run_id.clone();
+    tauri::async_runtime::spawn_blocking(
+        move || -> Result<TextTranslationResponse, BackendFailure> {
+            lease.token().check()?;
+            let response = translate_text_blocking(
+                text,
+                target_language,
+                &state,
+                lease.token(),
+                &app,
+                &run_id,
+                started_at,
+            )?;
+            lease.finalize_success()?;
+            Ok(response)
+        },
+    )
+    .await
+    .map_err(|error| {
+        BackendFailure::internal(format!("Candle worker exited unexpectedly: {error}"))
+    })?
+    .map_err(BackendError::from)
+}
+
+#[tauri::command]
+pub(crate) async fn ocr_image(
+    app: tauri::AppHandle,
+    request: OcrImageRequest,
+    state: State<'_, BackendState>,
+) -> Result<OcrResponse, BackendError> {
+    let started_at = Instant::now();
+    let run_id = RunId::from_optional(request.request_id.as_deref())?;
+    let lease = state.runs.register(run_id.clone())?;
+    emit_translation_progress(&app, &run_id, 5, "正在准备 OCR 请求");
+    let decoded = decode_ocr_request(request)?;
+    emit_translation_progress(&app, &run_id, 15, "图片已解码");
+    let state = state.inner().clone();
+    let app = app.clone();
+    let run_id = run_id.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<OcrResponse, BackendFailure> {
+        lease.token().check()?;
+        let response =
+            ocr_image_blocking(decoded, &state, lease.token(), &app, &run_id, started_at)?;
+        lease.finalize_success()?;
+        Ok(response)
+    })
+    .await
+    .map_err(|error| {
+        BackendFailure::internal(format!("Candle worker exited unexpectedly: {error}"))
+    })?
+    .map_err(BackendError::from)
+}
+
 fn decode_request(request: TranslateImageRequest) -> Result<DecodedImage, BackendFailure> {
     decode_image(
         &request.image_base64,
         request.file_name,
         request.target_language,
     )
+}
+
+fn decode_text_request(
+    request: TranslateTextRequest,
+) -> Result<(String, String), BackendFailure> {
+    let text = validate_text(&request.text)?;
+    let target_language = validate_target_language(&request.target_language)?;
+    Ok((text, target_language))
+}
+
+fn decode_ocr_request(request: OcrImageRequest) -> Result<DecodedImage, BackendFailure> {
+    decode_ocr_image(&request.image_base64, request.file_name)
 }
 
 fn translate_image_blocking(
@@ -325,11 +443,87 @@ fn translate_image_blocking(
     })
 }
 
+fn translate_text_blocking(
+    text: String,
+    target_language: String,
+    state: &BackendState,
+    cancellation: &crate::model_support::CancellationToken,
+    app: &tauri::AppHandle,
+    run_id: &RunId,
+    started_at: Instant,
+) -> Result<TextTranslationResponse, BackendFailure> {
+    state.touch_activity();
+    let settings = state
+        .settings
+        .lock()
+        .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
+        .clone()
+        .map_err(BackendFailure::arguments)?;
+    let result = {
+        let mut engine = lock_with_cancellation(&state.engine, cancellation)?;
+        if engine.is_none() {
+            *engine = Some(BackendEngine::new(settings)?);
+        }
+        let engine = engine
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
+        engine.translate_text(&text, &target_language, cancellation, |progress, stage| {
+            emit_translation_progress(app, run_id, progress, stage);
+        })
+    };
+    state.touch_activity();
+    Ok(TextTranslationResponse {
+        text: result?,
+        provider_label: "Hy-MT2 / Candle".to_owned(),
+        duration_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+    })
+}
+
+fn ocr_image_blocking(
+    request: DecodedImage,
+    state: &BackendState,
+    cancellation: &crate::model_support::CancellationToken,
+    app: &tauri::AppHandle,
+    run_id: &RunId,
+    started_at: Instant,
+) -> Result<OcrResponse, BackendFailure> {
+    state.touch_activity();
+    let settings = state
+        .settings
+        .lock()
+        .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
+        .clone()
+        .map_err(BackendFailure::arguments)?;
+    let result = {
+        let mut engine = lock_with_cancellation(&state.engine, cancellation)?;
+        if engine.is_none() {
+            *engine = Some(BackendEngine::new(settings)?);
+        }
+        let engine = engine
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
+        engine.ocr(&request, cancellation, |progress, stage| {
+            emit_translation_progress(app, run_id, progress, stage);
+        })
+    };
+    state.touch_activity();
+    let result = result?;
+    let image_base64 = BASE64.encode(result.annotated_png);
+    Ok(OcrResponse {
+        text: result.text,
+        markdown: result.markdown,
+        annotated_image_data_url: format!("data:image/png;base64,{image_base64}"),
+        provider_label: result.provider_label,
+        duration_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BackendSettingsUpdate, TranslateImageRequest};
+    use super::{
+        BackendSettingsUpdate, OcrImageRequest, TranslateImageRequest, TranslateTextRequest,
+    };
     use std::path::PathBuf;
-
     #[test]
     fn old_translate_request_without_request_id_still_deserializes() {
         let request: TranslateImageRequest = serde_json::from_value(serde_json::json!({
@@ -338,6 +532,30 @@ mod tests {
             "targetLanguage": "Chinese"
         }))
         .expect("old request shape");
+        assert!(request.request_id.is_none());
+    }
+
+    #[test]
+    fn text_request_uses_camel_case_and_defaults_request_id() {
+        let request: TranslateTextRequest = serde_json::from_value(serde_json::json!({
+            "text": "你好",
+            "targetLanguage": "English"
+        }))
+        .expect("text request shape");
+        assert_eq!(request.text, "你好");
+        assert_eq!(request.target_language, "English");
+        assert!(request.request_id.is_none());
+    }
+
+    #[test]
+    fn ocr_request_uses_camel_case_and_defaults_request_id() {
+        let request: OcrImageRequest = serde_json::from_value(serde_json::json!({
+            "imageBase64": "AAAA",
+            "fileName": "sample.png"
+        }))
+        .expect("OCR request shape");
+        assert_eq!(request.image_base64, "AAAA");
+        assert_eq!(request.file_name, "sample.png");
         assert!(request.request_id.is_none());
     }
 

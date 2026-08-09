@@ -30,7 +30,9 @@ pub fn run() {
             backend::commands::get_backend_status,
             backend::commands::update_backend_settings,
             backend::commands::cancel_translation,
-            backend::commands::translate_image
+            backend::commands::translate_image,
+            backend::commands::translate_text,
+            backend::commands::ocr_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running smodeltrans application");

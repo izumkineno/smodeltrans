@@ -1,6 +1,6 @@
 use crate::{
     backend::{
-        contracts::{HyPort, OcrPort, OutputPort, TranslationOutput},
+        contracts::{HyPort, OcrOutput, OcrPort, OutputPort, TranslationOutput},
         failure::BackendFailure,
         input::DecodedImage,
         settings::{BackendSettings, DeviceKind},
@@ -81,28 +81,7 @@ impl BackendEngine {
         }
 
         report_progress(60, "正在准备 Hy-MT2");
-        if self.hy.is_none() {
-            let config = ModelConfig::from_parts(
-                image.target_language(),
-                self.settings.prompt.clone(),
-                self.settings.generation.clone(),
-                self.settings.memory.clone(),
-            )
-            .map_err(|error| {
-                BackendFailure::arguments(format!("invalid model config: {error:#}"))
-            })?;
-            let translator = hy::load_with_config(
-                &self.settings.hy_model,
-                &self.device,
-                config.memory.clone(),
-                config.generation.clone(),
-                config.prompt.clone(),
-            )
-            .map_err(|error| {
-                BackendFailure::asset(format!("load local Hy-MT2 model: {error:#}"))
-            })?;
-            self.hy = Some(translator);
-        }
+        self.ensure_hy_loaded(image.target_language())?;
         report_progress(70, "Hy-MT2 已就绪");
         let translator = self
             .hy
@@ -164,6 +143,116 @@ impl BackendEngine {
             .output
             .render(image, &records, image.target_language(), cancellation)?;
         report_progress(100, "翻译完成");
+        Ok(output)
+    }
+    fn ensure_hy_loaded(&mut self, target_language: &str) -> Result<(), BackendFailure> {
+        let config = ModelConfig::from_parts(
+            target_language,
+            self.settings.prompt.clone(),
+            self.settings.generation.clone(),
+            self.settings.memory.clone(),
+        )
+        .map_err(|error| BackendFailure::arguments(format!("invalid model config: {error:#}")))?;
+        if self.hy.is_none() {
+            let translator = hy::load_with_config(
+                &self.settings.hy_model,
+                &self.device,
+                config.memory,
+                config.generation,
+                config.prompt,
+            )
+            .map_err(|error| {
+                BackendFailure::asset(format!("load local Hy-MT2 model: {error:#}"))
+            })?;
+            self.hy = Some(translator);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn translate_text(
+        &mut self,
+        text: &str,
+        target_language: &str,
+        cancellation: &CancellationToken,
+        mut report_progress: impl FnMut(u8, &'static str),
+    ) -> Result<String, BackendFailure> {
+        cancellation.check()?;
+        report_progress(20, "正在准备 Hy-MT2");
+        self.ensure_hy_loaded(target_language)?;
+        report_progress(45, "Hy-MT2 已就绪");
+        let prompt = self.settings.prompt.clone();
+        let generation = self.settings.generation.clone();
+        let translator = self
+            .hy
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("Hy provider was not initialized"))?;
+        report_progress(70, "Hy-MT2 生成中");
+        let result = translator
+            .translate_text(
+                text,
+                target_language,
+                &prompt,
+                &generation,
+                cancellation,
+                |_| Ok(()),
+            )
+            .map_err(|error| {
+                if cancellation.is_cancelled() {
+                    BackendFailure::cancelled("Hy translation was cancelled")
+                } else {
+                    BackendFailure::translation(format!("Hy text translation failed: {error:#}"))
+                }
+            })?;
+        cancellation.check()?;
+        let text = result.text.trim().to_owned();
+        if text.is_empty() {
+            return Err(BackendFailure::translation(
+                "Hy returned empty text translation",
+            ));
+        }
+        if text.len() > crate::backend::input::MAX_TEXT_BYTES {
+            return Err(BackendFailure::translation(
+                "text output exceeds the 8 MiB limit",
+            ));
+        }
+        report_progress(100, "翻译完成");
+        Ok(text)
+    }
+
+    pub(crate) fn ocr(
+        &mut self,
+        image: &DecodedImage,
+        cancellation: &CancellationToken,
+        mut report_progress: impl FnMut(u8, &'static str),
+    ) -> Result<OcrOutput, BackendFailure> {
+        cancellation.check()?;
+        report_progress(20, "正在准备 PP-OCRv5");
+        if self.ocr.is_none() {
+            self.ocr = Some(PpOcrV5Provider::load(
+                &self.settings.detector_model_dir,
+                &self.settings.recognizer_model_dir,
+                &self.device,
+                self.settings.region_parallelism,
+            )?);
+        }
+        report_progress(35, "PP-OCRv5 已就绪");
+        let ocr = self
+            .ocr
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("PP-OCRv5 provider was not initialized"))?;
+        let document = ocr.recognize(image, cancellation)?;
+        cancellation.check()?;
+        report_progress(75, "OCR 识别完成");
+        if document.regions.len() > crate::backend::input::MAX_REGIONS {
+            return Err(BackendFailure::ocr(
+                "OCR region count exceeds the supported bound",
+            ));
+        }
+        report_progress(85, "正在生成 OCR 标注图");
+        let output = self
+            .output
+            .render_ocr(image, &document.regions, cancellation)?;
+        report_progress(100, "OCR 处理完成");
         Ok(output)
     }
 }

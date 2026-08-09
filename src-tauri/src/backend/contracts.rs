@@ -52,6 +52,14 @@ pub(crate) struct TranslationOutput {
     pub(crate) is_translated: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct OcrOutput {
+    pub(crate) annotated_png: Vec<u8>,
+    pub(crate) markdown: String,
+    pub(crate) text: String,
+    pub(crate) provider_label: String,
+}
+
 pub(crate) trait OcrPort: Send {
     fn recognize(
         &mut self,
@@ -79,4 +87,11 @@ pub(crate) trait OutputPort: Send {
         target_language: &str,
         cancellation: &CancellationToken,
     ) -> Result<TranslationOutput, BackendFailure>;
+
+    fn render_ocr(
+        &mut self,
+        image: &DecodedImage,
+        regions: &[RegionRecord],
+        cancellation: &CancellationToken,
+    ) -> Result<OcrOutput, BackendFailure>;
 }
