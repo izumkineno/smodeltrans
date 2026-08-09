@@ -1,61 +1,32 @@
 <script setup lang="ts">
-import { computed, h, onBeforeUnmount, onMounted, ref, type CSSProperties } from "vue";
+import { computed, h, onBeforeUnmount, onMounted, ref } from "vue";
+import type { CSSProperties } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { readImage } from "@tauri-apps/plugin-clipboard-manager";
-import { open as openNativeDialog } from "@tauri-apps/plugin-dialog";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   lightTheme,
-  NAlert,
   NButton,
   NCard,
   NConfigProvider,
-  NEmpty,
   NGlobalStyle,
   NIcon,
-  NInput,
-  NInputNumber,
   NLayout,
   NLayoutContent,
   NLayoutSider,
+  NMessageProvider,
   NMenu,
-  NSelect,
-  NProgress,
-  NSpin,
-  NSpace,
   NTag,
-  NSwitch,
-  type ImageRenderToolbarProps,
-  type GlobalThemeOverrides,
-  type MenuOption,
   zhCN,
 } from "naive-ui";
+import type { GlobalThemeOverrides, MenuOption } from "naive-ui";
+import { RouterView, useRoute, useRouter } from "vue-router";
+import { isWorkspaceRouteName } from "./app-router";
+import type { WorkspaceRouteName } from "./app-router";
 import {
-  copyTranslationText,
-  createImagePreview,
-  MAX_IMAGE_BYTES,
-  MAX_IMAGE_PIXELS,
-  releaseImagePreview,
-  saveTranslationText,
-  saveImageDataUrl,
-  SUPPORTED_IMAGE_EXTENSIONS,
-  validateImageFile,
-  validateImagePreview,
-} from "./services/file-adapter";
-import ImagePreviewFrame from "./components/ImagePreviewFrame.vue";
-import {
-  createTranslationRequestId,
-  getBackendStatus,
-  isTranslationCancellation,
-  translationProvider,
-  updateBackendSettings,
-  type BackendSettingsUpdate,
-  type BackendStatus,
-  type DeviceKind,
-  type TranslationProgress,
-} from "./services/translation-provider";
+  backendStatus,
+  fetchSharedBackendStatus,
+  loadPersistedTargetLanguage,
+} from "./services/workspace-settings";
 
-type WorkflowState = "idle" | "preview" | "processing" | "result" | "cancelled" | "error";
 type TagType = "default" | "success" | "warning" | "error" | "info";
 
 const themePalette = {
@@ -185,8 +156,6 @@ const appThemeStyle = {
   "--green-soft": themePalette.primarySuppl,
 } as CSSProperties;
 
-const activeMenu = ref("translate");
-
 function renderTranslationIcon() {
   return h(
     NIcon,
@@ -206,6 +175,75 @@ function renderTranslationIcon() {
             "stroke-width": "1.4",
             "stroke-linecap": "round",
             "stroke-linejoin": "round",
+          }),
+        ]),
+    },
+  );
+}
+
+function renderOcrIcon() {
+  return h(
+    NIcon,
+    { size: 16 },
+    {
+      default: () =>
+        h("svg", { viewBox: "0 0 20 20", fill: "none", "aria-hidden": "true" }, [
+          h("rect", {
+            x: "3.25",
+            y: "4.25",
+            width: "13.5",
+            height: "11.5",
+            rx: "1.5",
+            stroke: "currentColor",
+            "stroke-width": "1.2",
+          }),
+          h("circle", {
+            cx: "7",
+            cy: "8",
+            r: "1.35",
+            stroke: "currentColor",
+            "stroke-width": "1.2",
+          }),
+          h("path", {
+            d: "m5 13 3-2.8 2.5 2 2.5-2.2 2 3",
+            stroke: "currentColor",
+            "stroke-width": "1.2",
+            "stroke-linecap": "round",
+            "stroke-linejoin": "round",
+          }),
+        ]),
+    },
+  );
+}
+
+function renderOcrTranslationIcon() {
+  return h(
+    NIcon,
+    { size: 16 },
+    {
+      default: () =>
+        h("svg", { viewBox: "0 0 20 20", fill: "none", "aria-hidden": "true" }, [
+          h("rect", {
+            x: "3.25",
+            y: "3.25",
+            width: "7.5",
+            height: "7.5",
+            rx: "1.2",
+            stroke: "currentColor",
+            "stroke-width": "1.2",
+          }),
+          h("path", {
+            d: "m4.8 9 1.8-1.8L8 8.4l1.7-1.7",
+            stroke: "currentColor",
+            "stroke-width": "1.2",
+            "stroke-linecap": "round",
+            "stroke-linejoin": "round",
+          }),
+          h("path", {
+            d: "M12.5 12.5h4M14.5 10.5v4M11.5 16h5",
+            stroke: "currentColor",
+            "stroke-width": "1.2",
+            "stroke-linecap": "round",
           }),
         ]),
     },
@@ -244,107 +282,40 @@ const menuOptions: MenuOption[] = [
     icon: renderTranslationIcon,
   },
   {
+    label: "OCR",
+    key: "ocr",
+    icon: renderOcrIcon,
+  },
+  {
+    label: "OCR翻译",
+    key: "ocr-translate",
+    icon: renderOcrTranslationIcon,
+  },
+  {
     label: "设置",
     key: "settings",
     icon: renderSettingsIcon,
   },
 ];
 
-const workflowState = ref<WorkflowState>("idle");
-const selectedFile = ref<File | null>(null);
-const previewUrl = ref<string | null>(null);
-const resultText = ref<string | null>(null);
-const annotatedResultUrl = ref<string | null>(null);
-const resultIsTranslated = ref(false);
-const providerLabel = ref("");
-const translationDurationMs = ref<number | null>(null);
-const errorMessage = ref("");
-const actionFeedback = ref("");
-const statusMessage = ref("请选择一张图片开始。");
-const targetLanguage = ref("Chinese");
-const modelDetectorPath = ref("");
-const modelRecognizerPath = ref("");
-const modelHyPath = ref("");
-const modelFontPath = ref<string | null>(null);
-const device = ref<DeviceKind>("cuda");
-const regionParallelism = ref(16);
-const translationBatchSize = ref(4);
-const idleUnloadMinutes = ref(30);
-const generationMaxNewTokens = ref(128);
-const generationSampling = ref(false);
-const generationTemperature = ref(1);
-const generationTopK = ref(0);
-const generationTopP = ref(1);
-const generationSeed = ref("");
-const generationRepetitionPenalty = ref(1);
-const generationFrequencyPenalty = ref(0);
-const generationStopTokensText = ref("");
-const generationStopStringsText = ref("");
-const memoryEnabled = ref(false);
-const memoryMaxTokens = ref(4096);
-const memoryMaxTurns = ref(16);
-const systemPrompt = ref("");
-const userPrompt = ref("");
-const deviceOptions: Array<{ label: string; value: DeviceKind }> = [
-  { label: "CUDA", value: "cuda" },
-  { label: "CPU（仅用于状态检查；Hy 翻译需要 CUDA）", value: "cpu" },
-];
-const settingsMessage = ref("");
-const settingsLoading = ref(false);
-const isDragActive = ref(false);
-const processingProgress = ref(0);
-const fileInput = ref<HTMLInputElement | null>(null);
+const route = useRoute();
+const router = useRouter();
+const activeMenu = computed<WorkspaceRouteName>(() =>
+  isWorkspaceRouteName(route.name) ? route.name : "ocr-translate",
+);
+
+function handleMenuUpdate(value: string) {
+  if (!isWorkspaceRouteName(value) || value === activeMenu.value) {
+    return;
+  }
+  void router.push({ name: value });
+}
+
 const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const appWindow = isDesktopRuntime ? getCurrentWindow() : null;
 const isWindowMaximized = ref(false);
-const activeController = ref<AbortController | null>(null);
-
-let progressUnlisten: UnlistenFn | undefined;
-let windowStateUnlisten: UnlistenFn | undefined;
+let windowStateUnlisten: (() => void) | undefined;
 let windowStateListenerActive = true;
-const backendStatus = ref<BackendStatus | null>(null);
-let selectionVersion = 0;
-
-const workflowStatus = computed(() => {
-  switch (workflowState.value) {
-    case "preview":
-      return "准备翻译";
-    case "processing":
-      return "翻译中";
-    case "result":
-      return "结果就绪";
-    case "cancelled":
-      return "已取消翻译";
-    case "error":
-      return "需要处理";
-    default:
-      return "等待上传图片";
-  }
-});
-
-const workflowTagType = computed<TagType>(() => {
-  switch (workflowState.value) {
-    case "preview":
-      return "info";
-    case "processing":
-      return "warning";
-    case "result":
-      return "success";
-    case "cancelled":
-      return "default";
-    case "error":
-      return "error";
-    default:
-      return "default";
-  }
-});
-
-const settingsTagType = computed<TagType>(() => {
-  if (!backendStatus.value) {
-    return "default";
-  }
-  return backendStatus.value.ready ? "success" : "warning";
-});
 
 const settingsStatusLabel = computed(() => {
   if (!backendStatus.value) {
@@ -353,46 +324,49 @@ const settingsStatusLabel = computed(() => {
   return backendStatus.value.ready ? "模型已就绪" : "需要检查";
 });
 
-const canStartTranslation = computed(
-  () =>
-    selectedFile.value !== null &&
-    (workflowState.value === "preview" ||
-      workflowState.value === "cancelled" ||
-      workflowState.value === "error"),
-);
+type PageMetadata = {
+  title: string;
+  titleId: string;
+  statusLabel: string;
+  statusType: TagType;
+  statusAriaLabel: string;
+};
 
-const startButtonLabel = computed(() => {
-  if (workflowState.value === "cancelled" || workflowState.value === "error") {
-    return "再次尝试";
+const pageMetadata = computed<PageMetadata>(() => {
+  switch (activeMenu.value) {
+    case "translate":
+      return {
+        title: "翻译",
+        titleId: "translate-title",
+        statusLabel: "文本翻译",
+        statusType: "info",
+        statusAriaLabel: "文本翻译状态",
+      };
+    case "ocr":
+      return {
+        title: "OCR",
+        titleId: "ocr-title",
+        statusLabel: "OCR 识别",
+        statusType: "info",
+        statusAriaLabel: "OCR 状态",
+      };
+    case "ocr-translate":
+      return {
+        title: "OCR翻译",
+        titleId: "ocr-translate-title",
+        statusLabel: "OCR 翻译",
+        statusType: "info",
+        statusAriaLabel: "OCR 翻译流程状态",
+      };
+    case "settings":
+      return {
+        title: "设置",
+        titleId: "settings-title",
+        statusLabel: settingsStatusLabel.value,
+        statusType: backendStatus.value?.ready ? "success" : "warning",
+        statusAriaLabel: "后端状态",
+      };
   }
-  return "开始翻译";
-});
-
-const fileSizeLabel = computed(() => {
-  if (!selectedFile.value) {
-    return "";
-  }
-
-  if (selectedFile.value.size < 1024) {
-    return `${selectedFile.value.size} B`;
-  }
-
-  if (selectedFile.value.size < 1024 * 1024) {
-    return `${(selectedFile.value.size / 1024).toFixed(1)} KB`;
-  }
-
-  return `${(selectedFile.value.size / (1024 * 1024)).toFixed(1)} MB`;
-});
-
-const translationDurationLabel = computed(() => {
-  const durationMs = translationDurationMs.value;
-  if (durationMs === null || !Number.isFinite(durationMs) || durationMs < 0) {
-    return "";
-  }
-  if (durationMs < 1000) {
-    return `${Math.max(1, Math.round(durationMs))} ms`;
-  }
-  return `${(durationMs / 1000).toFixed(2)} 秒`;
 });
 
 async function syncWindowState() {
@@ -400,13 +374,13 @@ async function syncWindowState() {
     isWindowMaximized.value = typeof document !== "undefined" && document.fullscreenElement !== null;
     return;
   }
-
   try {
     isWindowMaximized.value = await appWindow.isMaximized();
   } catch {
     // Window state is optional in the browser preview.
   }
 }
+
 async function bindWindowStateListener() {
   if (!appWindow) {
     if (typeof document === "undefined") {
@@ -421,7 +395,6 @@ async function bindWindowStateListener() {
     };
     return;
   }
-
   try {
     const unlisten = await appWindow.onResized(() => {
       void syncWindowState();
@@ -436,370 +409,10 @@ async function bindWindowStateListener() {
   }
 }
 
-function loadPersistedSettings() {
-  if (typeof window === "undefined") {
-    return;
-  }
-  try {
-    const persistedLanguage = window.localStorage.getItem("smodeltrans.targetLanguage");
-    if (persistedLanguage?.trim()) {
-      targetLanguage.value = persistedLanguage.trim();
-    }
-  } catch {
-    settingsMessage.value = "无法读取本地设置，将使用默认目标语言。";
-  }
-}
-
-function applyBackendStatus(status: BackendStatus) {
-  backendStatus.value = status;
-  modelDetectorPath.value = status.detectorModelDir;
-  modelRecognizerPath.value = status.recognizerModelDir;
-  modelHyPath.value = status.hyModel;
-  modelFontPath.value = status.fontPath;
-  targetLanguage.value = status.targetLanguage;
-  device.value = status.device === "cpu" ? "cpu" : "cuda";
-  regionParallelism.value = status.regionParallelism;
-  translationBatchSize.value = status.translationBatchSize;
-  idleUnloadMinutes.value = status.idleUnloadMinutes;
-  generationMaxNewTokens.value = status.generation.maxNewTokens;
-  generationSampling.value = status.generation.sampling;
-  generationTemperature.value = status.generation.temperature;
-  generationTopK.value = status.generation.topK;
-  generationTopP.value = status.generation.topP;
-  generationSeed.value = status.generation.seed ?? "";
-  generationRepetitionPenalty.value = status.generation.repetitionPenalty;
-  generationFrequencyPenalty.value = status.generation.frequencyPenalty;
-  generationStopTokensText.value = status.generation.stopTokens.join(", ");
-  generationStopStringsText.value = status.generation.stopStrings.join("\n");
-  memoryEnabled.value = status.memory.enabled;
-  memoryMaxTokens.value = status.memory.maxTokens;
-  memoryMaxTurns.value = status.memory.maxTurns;
-  systemPrompt.value = status.prompt.system;
-  userPrompt.value = status.prompt.user;
-}
-
-async function refreshBackendStatus() {
-  if (!isDesktopRuntime) {
-    settingsMessage.value = "设置状态仅在 Tauri 桌面端可读取。";
-    return;
-  }
-  settingsLoading.value = true;
-  try {
-    const status = await getBackendStatus();
-    applyBackendStatus(status);
-    settingsMessage.value = status.message;
-  } catch (error) {
-    settingsMessage.value =
-      error instanceof Error ? error.message : "无法读取后端模型状态。";
-  } finally {
-    settingsLoading.value = false;
-  }
-}
-
-type ModelPathField = "detector" | "recognizer" | "hy" | "font";
-
-function modelPathFor(field: ModelPathField): string {
-  if (field === "detector") {
-    return modelDetectorPath.value;
-  }
-  if (field === "recognizer") {
-    return modelRecognizerPath.value;
-  }
-  if (field === "hy") {
-    return modelHyPath.value;
-  }
-  return modelFontPath.value ?? "";
-}
-
-async function chooseModelPath(field: ModelPathField) {
-  if (!isDesktopRuntime) {
-    settingsMessage.value = "模型路径选择仅在 Tauri 桌面端可用。";
-    return;
-  }
-  try {
-    const currentPath = modelPathFor(field);
-    const selected =
-      field === "hy"
-        ? await openNativeDialog({
-            title: "选择 Hy-MT2 GGUF 模型",
-            defaultPath: currentPath || undefined,
-            multiple: false,
-            filters: [{ name: "GGUF 模型", extensions: ["gguf"] }],
-          })
-        : field === "font"
-          ? await openNativeDialog({
-              title: "选择标注字体",
-              defaultPath: currentPath || undefined,
-              multiple: false,
-              filters: [{ name: "字体文件", extensions: ["ttf", "otf"] }],
-            })
-          : await openNativeDialog({
-              title:
-                field === "detector"
-                  ? "选择 PP-OCRv5 detector 文件夹"
-                  : "选择 PP-OCRv5 recognizer 文件夹",
-              defaultPath: currentPath || undefined,
-              directory: true,
-              multiple: false,
-            });
-    if (typeof selected !== "string" || !selected.trim()) {
-      return;
-    }
-    if (field === "detector") {
-      modelDetectorPath.value = selected;
-    } else if (field === "recognizer") {
-      modelRecognizerPath.value = selected;
-    } else if (field === "hy") {
-      modelHyPath.value = selected;
-    } else {
-      modelFontPath.value = selected;
-    }
-    settingsMessage.value = "路径已选择，点击保存模型设置后生效。";
-  } catch (error) {
-    settingsMessage.value =
-      error instanceof Error ? error.message : "无法打开模型路径选择器。";
-  }
-}
-
-function useSystemFont() {
-  modelFontPath.value = null;
-  settingsMessage.value = "字体已切换为系统自动匹配，点击保存模型设置后生效。";
-}
-
-function requireInteger(value: number, min: number, max: number, label: string): number | null {
-  if (!Number.isInteger(value) || value < min || value > max) {
-    settingsMessage.value = `${label}必须为 ${min} 到 ${max} 的整数。`;
-    return null;
-  }
-  return value;
-}
-
-function requireFiniteRange(
-  value: number,
-  minExclusive: number | null,
-  minInclusive: number | null,
-  maxInclusive: number | null,
-  label: string,
-): number | null {
-  const minOk = minExclusive === null ? true : value > minExclusive;
-  const inclusiveOk = minInclusive === null ? true : value >= minInclusive;
-  const maxOk = maxInclusive === null ? true : value <= maxInclusive;
-  if (!Number.isFinite(value) || !minOk || !inclusiveOk || !maxOk) {
-    settingsMessage.value = `${label}超出允许范围。`;
-    return null;
-  }
-  return value;
-}
-
-function parseStopTokens(): number[] | null {
-  const text = generationStopTokensText.value.trim();
-  if (!text) {
-    return [];
-  }
-  const tokens: number[] = [];
-  const seen = new Set<number>();
-  for (const part of text.split(/[\s,]+/)) {
-    if (!/^\d+$/.test(part)) {
-      settingsMessage.value = "停止 token 必须是 0 到 1000000 的整数。";
-      return null;
-    }
-    const token = Number(part);
-    if (!Number.isInteger(token) || token < 0 || token > 1000000) {
-      settingsMessage.value = "停止 token 必须是 0 到 1000000 的整数。";
-      return null;
-    }
-    if (!seen.has(token)) {
-      seen.add(token);
-      tokens.push(token);
-    }
-  }
-  if (tokens.length > 32) {
-    settingsMessage.value = "停止 token 最多 32 个。";
-    return null;
-  }
-  return tokens;
-}
-
-function parseStopStrings(): string[] | null {
-  const stopStrings: string[] = [];
-  const seen = new Set<string>();
-  for (const line of generationStopStringsText.value.split(/\r?\n/)) {
-    const value = line.trim();
-    if (!value) {
-      continue;
-    }
-    if (Array.from(value).length > 128) {
-      settingsMessage.value = "每个停止字符串最多 128 个字符。";
-      return null;
-    }
-    if (!seen.has(value)) {
-      seen.add(value);
-      stopStrings.push(value);
-    }
-  }
-  if (stopStrings.length > 16) {
-    settingsMessage.value = "停止字符串最多 16 条。";
-    return null;
-  }
-  return stopStrings;
-}
-
-async function saveModelSettings() {
-  if (!isDesktopRuntime) {
-    saveSettings();
-    settingsMessage.value = "浏览器预览只保存目标语言；模型参数仅在 Tauri 桌面端可保存。";
-    return;
-  }
-
-  const nextLanguage = targetLanguage.value.trim();
-  if (Array.from(nextLanguage).length < 1 || Array.from(nextLanguage).length > 64) {
-    settingsMessage.value = "目标语言长度必须为 1 到 64 个字符。";
-    return;
-  }
-  const detectorModelDir = modelDetectorPath.value.trim();
-  const recognizerModelDir = modelRecognizerPath.value.trim();
-  const hyModel = modelHyPath.value.trim();
-  if (!detectorModelDir || !recognizerModelDir || !hyModel) {
-    settingsMessage.value = "请选择完整的 PP-OCRv5 与 Hy-MT2 模型路径。";
-    return;
-  }
-  const idleMinutes = requireInteger(idleUnloadMinutes.value ?? 0, 0, 1440, "模型空闲释放时间");
-  const ocrParallelism = requireInteger(regionParallelism.value ?? 0, 1, 16, "OCR 并发");
-  const batchSize = requireInteger(translationBatchSize.value ?? 0, 1, 4, "Hy 批大小");
-  const maxNewTokens = requireInteger(generationMaxNewTokens.value ?? 0, 1, 4096, "最大生成 token");
-  const topK = requireInteger(generationTopK.value ?? 0, 0, 1024, "top-k");
-  const memoryTokens = requireInteger(memoryMaxTokens.value ?? 0, 1, 262144, "记忆 token 预算");
-  const memoryTurns = requireInteger(memoryMaxTurns.value ?? 0, 1, 1024, "记忆轮数");
-  if (
-    idleMinutes === null ||
-    ocrParallelism === null ||
-    batchSize === null ||
-    maxNewTokens === null ||
-    topK === null ||
-    memoryTokens === null ||
-    memoryTurns === null
-  ) {
-    return;
-  }
-  if (generationSampling.value && topK === 0) {
-    settingsMessage.value = "开启 sampling 时 top-k 必须大于 0。";
-    return;
-  }
-  const temperature = requireFiniteRange(generationTemperature.value, 0, null, null, "temperature");
-  const topP = requireFiniteRange(generationTopP.value, 0, null, 1, "top-p");
-  const repetitionPenalty = requireFiniteRange(
-    generationRepetitionPenalty.value,
-    0,
-    null,
-    null,
-    "repetition penalty",
-  );
-  const frequencyPenalty = requireFiniteRange(
-    generationFrequencyPenalty.value,
-    null,
-    0,
-    null,
-    "frequency penalty",
-  );
-  if (
-    temperature === null ||
-    topP === null ||
-    repetitionPenalty === null ||
-    frequencyPenalty === null
-  ) {
-    return;
-  }
-  const seedText = generationSeed.value.trim();
-  if (seedText && !/^[1-9]\d*$/.test(seedText)) {
-    settingsMessage.value = "seed 必须为空，或为正整数十进制字符串。";
-    return;
-  }
-  const stopTokens = parseStopTokens();
-  const stopStrings = parseStopStrings();
-  if (stopTokens === null || stopStrings === null) {
-    return;
-  }
-  const trimmedSystemPrompt = systemPrompt.value.trim();
-  if (Array.from(trimmedSystemPrompt).length > 4096) {
-    settingsMessage.value = "system 预设提示词最多 4096 个字符。";
-    return;
-  }
-  const trimmedUserPrompt = userPrompt.value.trim();
-  if (Array.from(trimmedUserPrompt).length > 4096) {
-    settingsMessage.value = "user 预设提示词最多 4096 个字符。";
-    return;
-  }
-
-  const settings: BackendSettingsUpdate = {
-    detectorModelDir,
-    recognizerModelDir,
-    hyModel,
-    fontPath: modelFontPath.value?.trim() || null,
-    targetLanguage: nextLanguage,
-    device: device.value,
-    regionParallelism: ocrParallelism,
-    translationBatchSize: batchSize,
-    idleUnloadMinutes: idleMinutes,
-    generation: {
-      maxNewTokens,
-      sampling: generationSampling.value,
-      temperature,
-      topK,
-      topP,
-      seed: seedText || null,
-      repetitionPenalty,
-      frequencyPenalty,
-      stopTokens,
-      stopStrings,
-    },
-    memory: {
-      enabled: memoryEnabled.value,
-      maxTokens: memoryTokens,
-      maxTurns: memoryTurns,
-    },
-    prompt: {
-      system: trimmedSystemPrompt,
-      user: trimmedUserPrompt,
-    },
-  };
-
-  settingsLoading.value = true;
-  try {
-    const status = await updateBackendSettings(settings);
-    applyBackendStatus(status);
-    settingsMessage.value =
-      idleMinutes === 0
-        ? "模型设置已保存，下一次翻译会使用新的参数。自动释放已关闭。"
-        : "模型设置已保存，下一次翻译会使用新的参数。";
-  } catch (error) {
-    settingsMessage.value =
-      error instanceof Error ? error.message : "无法保存模型设置。";
-  } finally {
-    settingsLoading.value = false;
-  }
-}
-
-function saveSettings() {
-  const nextLanguage = targetLanguage.value.trim();
-  if (Array.from(nextLanguage).length < 1 || Array.from(nextLanguage).length > 64) {
-    settingsMessage.value = "目标语言长度必须为 1 到 64 个字符。";
-    return;
-  }
-  targetLanguage.value = nextLanguage;
-  try {
-    window.localStorage.setItem("smodeltrans.targetLanguage", nextLanguage);
-    settingsMessage.value = "翻译设置已保存。";
-  } catch {
-    settingsMessage.value = "无法写入本地设置，请检查应用存储权限。";
-  }
-}
-
 function minimizeWindow() {
-  if (!appWindow) {
-    return;
+  if (appWindow) {
+    void appWindow.minimize().catch(() => undefined);
   }
-
-  void appWindow.minimize().catch(() => undefined);
 }
 
 async function toggleWindowMaximize() {
@@ -820,7 +433,6 @@ async function toggleWindowMaximize() {
     }
     return;
   }
-
   try {
     await appWindow.toggleMaximize();
   } catch {
@@ -831,1185 +443,172 @@ async function toggleWindowMaximize() {
 }
 
 function closeWindow() {
-  if (!appWindow) {
-    return;
+  if (appWindow) {
+    void appWindow.close().catch(() => undefined);
   }
-
-  void appWindow.close().catch(() => undefined);
 }
 
 function handleTitlebarMouseDown(event: MouseEvent) {
   if (!appWindow || event.button !== 0) {
     return;
   }
-
   const target = event.target as HTMLElement | null;
   if (target?.closest("button")) {
     return;
   }
-
   void appWindow.startDragging().catch(() => undefined);
 }
 
 function handleTitlebarDoubleClick(event: MouseEvent) {
   const target = event.target as HTMLElement | null;
-  if (target?.closest("button")) {
-    return;
-  }
-
-  toggleWindowMaximize();
-}
-
-
-function clearProgressListener() {
-  progressUnlisten?.();
-  progressUnlisten = undefined;
-}
-
-async function selectFile(file: File | undefined) {
-  if (!file) {
-    return;
-  }
-
-  const currentSelection = ++selectionVersion;
-  activeController.value?.abort();
-  activeController.value = null;
-  clearProgressListener();
-
-  const validationMessage = validateImageFile(file);
-  if (validationMessage) {
-    releaseImagePreview(previewUrl.value);
-    selectedFile.value = null;
-    previewUrl.value = null;
-    resultText.value = null;
-    annotatedResultUrl.value = null;
-    resultIsTranslated.value = false;
-    translationDurationMs.value = null;
-    providerLabel.value = "";
-    errorMessage.value = validationMessage;
-    actionFeedback.value = "";
-    workflowState.value = "error";
-    statusMessage.value = validationMessage;
-    return;
-  }
-
-  const nextPreviewUrl = createImagePreview(file);
-  const previewValidationMessage = await validateImagePreview(nextPreviewUrl);
-  if (currentSelection !== selectionVersion) {
-    releaseImagePreview(nextPreviewUrl);
-    return;
-  }
-
-  if (previewValidationMessage) {
-    releaseImagePreview(nextPreviewUrl);
-    releaseImagePreview(previewUrl.value);
-    selectedFile.value = null;
-    previewUrl.value = null;
-    resultText.value = null;
-    annotatedResultUrl.value = null;
-    resultIsTranslated.value = false;
-    translationDurationMs.value = null;
-    providerLabel.value = "";
-    errorMessage.value = previewValidationMessage;
-    actionFeedback.value = "";
-    workflowState.value = "error";
-    statusMessage.value = previewValidationMessage;
-    return;
-  }
-
-  releaseImagePreview(previewUrl.value);
-  selectedFile.value = file;
-  previewUrl.value = nextPreviewUrl;
-  resultText.value = null;
-  providerLabel.value = "";
-  annotatedResultUrl.value = null;
-  resultIsTranslated.value = false;
-  translationDurationMs.value = null;
-  errorMessage.value = "";
-  actionFeedback.value = "";
-  workflowState.value = "preview";
-  statusMessage.value = `${file.name} 已准备好翻译。`;
-}
-
-function handlePreviewError() {
-  selectionVersion += 1;
-  activeController.value?.abort();
-  activeController.value = null;
-  clearProgressListener();
-  processingProgress.value = 0;
-  releaseImagePreview(previewUrl.value);
-  selectedFile.value = null;
-  previewUrl.value = null;
-  resultText.value = null;
-  providerLabel.value = "";
-  annotatedResultUrl.value = null;
-  resultIsTranslated.value = false;
-  translationDurationMs.value = null;
-  errorMessage.value = "无法显示这张图片，请选择其他文件。";
-  actionFeedback.value = "";
-  workflowState.value = "error";
-  statusMessage.value = errorMessage.value;
-}
-
-function handleFileInput(event: Event) {
-  const input = event.currentTarget as HTMLInputElement;
-  selectFile(input.files?.[0]);
-  input.value = "";
-}
-
-function handleDragOver(event: DragEvent) {
-  event.preventDefault();
-  isDragActive.value = true;
-}
-
-function handleDragLeave() {
-  isDragActive.value = false;
-}
-
-function handleDrop(event: DragEvent) {
-  event.preventDefault();
-  isDragActive.value = false;
-  selectFile(event.dataTransfer?.files[0]);
-}
-
-function openFilePicker() {
-  fileInput.value?.click();
-}
-
-async function startTranslation() {
-  const file = selectedFile.value;
-  if (!file || !canStartTranslation.value) {
-    return;
-  }
-
-  const controller = new AbortController();
-  activeController.value = controller;
-  resultText.value = null;
-  annotatedResultUrl.value = null;
-  resultIsTranslated.value = false;
-  translationDurationMs.value = null;
-  providerLabel.value = "";
-  errorMessage.value = "";
-  actionFeedback.value = "";
-  workflowState.value = "processing";
-  statusMessage.value = "翻译正在进行中。";
-  clearProgressListener();
-  processingProgress.value = 0;
-  const requestId = createTranslationRequestId();
-
-  try {
-    if (isDesktopRuntime) {
-      progressUnlisten = await listen<TranslationProgress>(
-        "translation-progress",
-        (event) => {
-          if (
-            event.payload.requestId !== requestId ||
-            activeController.value !== controller ||
-            workflowState.value !== "processing"
-          ) {
-            return;
-          }
-          processingProgress.value = Math.min(
-            100,
-            Math.max(0, Math.round(event.payload.progress)),
-          );
-          statusMessage.value = event.payload.stage;
-        },
-      );
-    }
-    const translation = await translationProvider.translate(
-      {
-        file,
-        targetLanguage: targetLanguage.value,
-        requestId,
-      },
-      controller.signal,
-    );
-
-    if (controller.signal.aborted || activeController.value !== controller) {
-      if (activeController.value === controller && controller.signal.aborted) {
-        workflowState.value = "cancelled";
-        statusMessage.value = "翻译已取消，图片预览仍可用。";
-      }
-      return;
-    }
-
-    resultText.value = translation.text;
-    annotatedResultUrl.value = translation.annotatedImageDataUrl;
-    providerLabel.value = translation.providerLabel;
-    resultIsTranslated.value = translation.isTranslated;
-    translationDurationMs.value = translation.durationMs;
-    processingProgress.value = 100;
-    workflowState.value = "result";
-    statusMessage.value = translation.isTranslated
-      ? "翻译结果已准备好。"
-      : "PP-OCRv5 识别结果已准备好；Hy 翻译需要 CUDA。";
-  } catch (error) {
-    if (controller.signal.aborted || isTranslationCancellation(error)) {
-      if (activeController.value === controller) {
-        workflowState.value = "cancelled";
-        statusMessage.value = "翻译已取消，图片预览仍可用。";
-      }
-      return;
-    }
-
-    if (activeController.value !== controller) {
-      return;
-    }
-
-    workflowState.value = "error";
-    errorMessage.value =
-      error instanceof Error
-        ? error.message
-        : "Candle 图片翻译后端未能完成，请检查模型配置后重试。";
-    statusMessage.value = errorMessage.value;
-  } finally {
-    if (activeController.value === controller) {
-      activeController.value = null;
-      clearProgressListener();
-      if (workflowState.value !== "result") {
-        processingProgress.value = 0;
-      }
-    }
+  if (!target?.closest("button")) {
+    void toggleWindowMaximize();
   }
 }
 
-function cancelTranslation() {
-  if (!activeController.value) {
-    return;
-  }
-
-  activeController.value.abort();
-  clearProgressListener();
-  processingProgress.value = 0;
-  workflowState.value = "cancelled";
-  statusMessage.value = "翻译已取消，图片预览仍可用。";
-}
-
-function resetWorkflow() {
-  selectionVersion += 1;
-  activeController.value?.abort();
-  activeController.value = null;
-  clearProgressListener();
-  releaseImagePreview(previewUrl.value);
-  selectedFile.value = null;
-  previewUrl.value = null;
-  resultText.value = null;
-  providerLabel.value = "";
-  annotatedResultUrl.value = null;
-  resultIsTranslated.value = false;
-  translationDurationMs.value = null;
-  errorMessage.value = "";
-  actionFeedback.value = "";
-  processingProgress.value = 0;
-  workflowState.value = "idle";
-  statusMessage.value = "请选择一张图片开始。";
-}
-
-async function copyResult() {
-  if (!resultText.value) {
-    return;
-  }
-
-  try {
-    await copyTranslationText(resultText.value);
-    actionFeedback.value = "结果已复制到剪贴板。";
-  } catch {
-    actionFeedback.value = "剪贴板不可用，请手动选择文本进行复制。";
-  }
-}
-
-function saveResult() {
-  if (!resultText.value || !selectedFile.value) {
-    return;
-  }
-
-  try {
-    saveTranslationText(resultText.value, selectedFile.value.name);
-    actionFeedback.value = "结果已保存为文本文件。";
-  } catch {
-    actionFeedback.value = "结果无法保存，请从结果面板重试。";
-  }
-}
-
-function saveAnnotatedImage() {
-  if (!annotatedResultUrl.value || !selectedFile.value) {
-    return;
-  }
-
-  try {
-    saveImageDataUrl(annotatedResultUrl.value, selectedFile.value.name);
-    actionFeedback.value = "标注图片已保存。";
-  } catch {
-    actionFeedback.value = "标注图片无法保存，请重试。";
-  }
-}
-
-
-function renderImageToolbar({ nodes }: ImageRenderToolbarProps) {
-  const zoomOutNode = h(
-    "span",
-    { "data-image-preview-zoom": "out" },
-    [nodes.zoomOut],
-  );
-  const zoomInNode = h(
-    "span",
-    { "data-image-preview-zoom": "in" },
-    [nodes.zoomIn],
-  );
-
-  return [
-    nodes.prev,
-    nodes.next,
-    nodes.rotateCounterclockwise,
-    nodes.rotateClockwise,
-    nodes.resizeToOriginalSize,
-    zoomOutNode,
-    zoomInNode,
-    nodes.download,
-    nodes.close,
-  ];
-}
-
-function handleImagePreviewWheel(event: WheelEvent) {
-  if (event.deltaY === 0) {
-    return;
-  }
-
-  const target = event.target;
-  if (!(target instanceof Element)) {
-    return;
-  }
-
-  const container = target.closest(".n-image-preview-container");
-  if (!container) {
-    return;
-  }
-
-  const direction = event.deltaY < 0 ? "in" : "out";
-  const zoomControl = container.querySelector<HTMLElement>(
-    `[data-image-preview-zoom="${direction}"]`,
-  );
-  const zoomButton =
-    zoomControl?.querySelector<HTMLElement>(".n-base-icon, button, [role='button']") ??
-    zoomControl;
-  if (!zoomButton) {
-    return;
-  }
-
-  event.preventDefault();
-  event.stopPropagation();
-  zoomButton.click();
-}
-
-function addImagePreviewWheelListener() {
-  window.addEventListener("wheel", handleImagePreviewWheel, {
-    capture: true,
-    passive: false,
-  });
-}
-
-function removeImagePreviewWheelListener() {
-  window.removeEventListener("wheel", handleImagePreviewWheel, { capture: true });
-}
-
-function clipboardFileFromEvent(event: ClipboardEvent): File | null {
-  const clipboardData = event.clipboardData;
-  if (!clipboardData) {
-    return null;
-  }
-  return (
-    Array.from(clipboardData.files).find((item) => item.type.startsWith("image/")) ??
-    Array.from(clipboardData.items)
-      .find((item) => item.kind === "file" && item.type.startsWith("image/"))
-      ?.getAsFile() ??
-    null
-  );
-}
-
-async function readTauriClipboardImage(): Promise<File> {
-  const image = await readImage();
-  const [rgba, size] = await Promise.all([image.rgba(), image.size()]);
-  const canvas = document.createElement("canvas");
-  canvas.width = size.width;
-  canvas.height = size.height;
-  const context = canvas.getContext("2d");
-  if (!context) {
-    throw new Error("无法创建剪贴板图片画布。");
-  }
-  context.putImageData(
-    new ImageData(new Uint8ClampedArray(rgba), size.width, size.height),
-    0,
-    0,
-  );
-  const blob = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((value) => {
-      if (value) {
-        resolve(value);
-      } else {
-        reject(new Error("无法编码剪贴板图片。"));
-      }
-    }, "image/png");
-  });
-  return new File([blob], `clipboard-${Date.now()}.png`, { type: "image/png" });
-}
-
-async function handlePaste(event: ClipboardEvent) {
-  const webFile = clipboardFileFromEvent(event);
-  if (webFile) {
-    event.preventDefault();
-    await selectFile(webFile);
-    return;
-  }
-  if (!isDesktopRuntime) {
-    return;
-  }
-  const clipboardTypes = Array.from(event.clipboardData?.types ?? []);
-  const mayContainImage =
-    clipboardTypes.length === 0 ||
-    clipboardTypes.includes("Files") ||
-    clipboardTypes.some((type) => type.startsWith("image/"));
-  if (!mayContainImage) {
-    return;
-  }
-  event.preventDefault();
-  try {
-    await selectFile(await readTauriClipboardImage());
-  } catch {
-    actionFeedback.value = "剪贴板中没有可读取的图片。";
-  }
-}
 onMounted(() => {
-  loadPersistedSettings();
+  loadPersistedTargetLanguage();
   void syncWindowState();
   void bindWindowStateListener();
-  void refreshBackendStatus();
-  window.addEventListener("paste", handlePaste);
-  addImagePreviewWheelListener();
+  if (isDesktopRuntime) {
+    void fetchSharedBackendStatus().catch(() => undefined);
+  }
 });
+
 onBeforeUnmount(() => {
   windowStateListenerActive = false;
-  selectionVersion += 1;
-  activeController.value?.abort();
-  clearProgressListener();
-  window.removeEventListener("paste", handlePaste);
-  removeImagePreviewWheelListener();
   windowStateUnlisten?.();
   windowStateUnlisten = undefined;
-  releaseImagePreview(previewUrl.value);
 });
 </script>
 
 <template>
   <n-config-provider :locale="zhCN" :theme="lightTheme" :theme-overrides="themeOverrides">
-    <n-global-style />
-    <a class="skip-link" href="#main-content">跳转到主要内容</a>
+    <n-message-provider>
+      <n-global-style />
+      <a class="skip-link" href="#main-content">跳转到主要内容</a>
 
-    <div class="app-shell" :style="appThemeStyle">
-    <header
-      class="titlebar"
-      data-tauri-drag-region
-      @mousedown="handleTitlebarMouseDown"
-      @dblclick="handleTitlebarDoubleClick"
-    >
-      <div class="titlebar-brand" data-tauri-drag-region>
-        <span class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none">
-            <path d="M5 5h5v5H5zM14 5h5v5h-5zM5 14h5v5H5z" fill="currentColor" />
-            <path d="M14 14h5M16.5 11.5V19M14 17h5" stroke="currentColor" stroke-width="1.7" />
-          </svg>
-        </span>
-        <span class="titlebar-name">smodeltrans</span>
-        <span class="titlebar-divider" aria-hidden="true">/</span>
-        <span class="titlebar-context">图片翻译</span>
-      </div>
-
-      <div class="window-controls" aria-label="窗口控制">
-        <n-button
-          class="window-control"
-          quaternary
-          circle
-          size="small"
-          aria-label="最小化窗口"
-          title="最小化"
-          @click.stop="minimizeWindow"
+      <div class="app-shell" :style="appThemeStyle">
+        <header
+          class="titlebar"
+          data-tauri-drag-region
+          @mousedown="handleTitlebarMouseDown"
+          @dblclick="handleTitlebarDoubleClick"
         >
-          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M3 8h10" stroke="currentColor" stroke-width="1.2" />
-          </svg>
-        </n-button>
-        <n-button
-          class="window-control"
-          quaternary
-          circle
-          size="small"
-          :aria-label="isWindowMaximized ? '恢复窗口' : '最大化窗口'"
-          :title="isWindowMaximized ? '恢复' : '最大化'"
-          @click.stop="toggleWindowMaximize"
-        >
-          <svg v-if="!isWindowMaximized" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <rect x="3.25" y="3.25" width="9.5" height="9.5" stroke="currentColor" stroke-width="1.2" />
-          </svg>
-          <svg v-else viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M5.5 5.5h6v6h-6z" stroke="currentColor" stroke-width="1.2" />
-            <path d="M4.5 10.5h-1v-7h7v1" stroke="currentColor" stroke-width="1.2" />
-          </svg>
-        </n-button>
-        <n-button
-          class="window-control window-control-close"
-          quaternary
-          circle
-          size="small"
-          aria-label="关闭窗口"
-          title="关闭"
-          @click.stop="closeWindow"
-        >
-          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.2" />
-          </svg>
-        </n-button>
-      </div>
-    </header>
+          <div class="titlebar-brand" data-tauri-drag-region>
+            <span class="brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <path d="M5 5h5v5H5zM14 5h5v5h-5zM5 14h5v5H5z" fill="currentColor" />
+                <path d="M14 14h5M16.5 11.5V19M14 17h5" stroke="currentColor" stroke-width="1.7" />
+              </svg>
+            </span>
+            <span class="titlebar-name">smodeltrans</span>
+            <span class="titlebar-divider" aria-hidden="true">/</span>
+            <span class="titlebar-context">{{ pageMetadata.title }}</span>
+          </div>
 
-    <n-layout has-sider class="workspace-shell">
-      <n-layout-sider class="sidebar" bordered :width="208" :native-scrollbar="false">
-        <div class="sidebar-header">
-          <p class="sidebar-kicker">工作区</p>
-          <p class="sidebar-title">SmodelTrans</p>
-          <p class="sidebar-subtitle">本地图片工作台</p>
-        </div>
-
-        <nav class="sidebar-nav" aria-label="主导航">
-          <p class="nav-heading">工作台</p>
-          <n-menu v-model:value="activeMenu" :icon-size="16" :options="menuOptions" />
-        </nav>
-
-        <div class="sidebar-bottom">
-          <n-card class="provider-card" :bordered="false" size="small">
-            <span class="provider-indicator" aria-hidden="true"></span>
-            <div>
-              <strong>本地模型</strong>
-              <span>{{ settingsStatusLabel }}</span>
-            </div>
-          </n-card>
-          <p class="sidebar-build">ver. 0.1.0</p>
-        </div>
-      </n-layout-sider>
-
-      <n-layout class="workspace-main">
-        <n-layout-content id="main-content" class="content">
-          <section
-            class="workspace-header"
-            :aria-labelledby="activeMenu === 'translate' ? 'page-title' : 'settings-title'"
-          >
-            <h1 :id="activeMenu === 'translate' ? 'page-title' : 'settings-title'">
-              {{ activeMenu === "translate" ? "图片翻译" : "设置" }}
-            </h1>
-            <n-tag
-              class="state-tag"
-              :type="activeMenu === 'translate' ? workflowTagType : settingsTagType"
-              round
+          <div class="window-controls" aria-label="窗口控制">
+            <n-button
+              class="window-control"
+              quaternary
+              circle
               size="small"
-              :aria-label="activeMenu === 'translate' ? '流程状态' : '后端状态'"
+              aria-label="最小化窗口"
+              title="最小化"
+              @click.stop="minimizeWindow"
             >
-              {{ activeMenu === "translate" ? workflowStatus : settingsStatusLabel }}
-            </n-tag>
-          </section>
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M3 8h10" stroke="currentColor" stroke-width="1.2" />
+              </svg>
+            </n-button>
+            <n-button
+              class="window-control"
+              quaternary
+              circle
+              size="small"
+              :aria-label="isWindowMaximized ? '恢复窗口' : '最大化窗口'"
+              :title="isWindowMaximized ? '恢复' : '最大化'"
+              @click.stop="toggleWindowMaximize"
+            >
+              <svg v-if="!isWindowMaximized" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <rect x="3.25" y="3.25" width="9.5" height="9.5" stroke="currentColor" stroke-width="1.2" />
+              </svg>
+              <svg v-else viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M5.5 5.5h6v6h-6z" stroke="currentColor" stroke-width="1.2" />
+                <path d="M4.5 10.5h-1v-7h7v1" stroke="currentColor" stroke-width="1.2" />
+              </svg>
+            </n-button>
+            <n-button
+              class="window-control window-control-close"
+              quaternary
+              circle
+              size="small"
+              aria-label="关闭窗口"
+              title="关闭"
+              @click.stop="closeWindow"
+            >
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.2" />
+              </svg>
+            </n-button>
+          </div>
+        </header>
 
-          <template v-if="activeMenu === 'translate'">
+        <n-layout has-sider class="workspace-shell">
+          <n-layout-sider class="sidebar" bordered :width="208" :native-scrollbar="false">
+            <div class="sidebar-header">
+              <p class="sidebar-kicker">工作区</p>
+              <p class="sidebar-title">SmodelTrans</p>
+              <p class="sidebar-subtitle">本地翻译工作台</p>
+            </div>
 
-        <p class="sr-only" aria-live="polite">{{ statusMessage }}</p>
+            <nav class="sidebar-nav" aria-label="主导航">
+              <p class="nav-heading">工作台</p>
+              <n-menu
+                :value="activeMenu"
+                :icon-size="16"
+                :options="menuOptions"
+                @update:value="handleMenuUpdate"
+              />
+            </nav>
 
-        <section class="workflow-grid" aria-label="图片翻译流程">
-          <n-card class="panel input-panel" :bordered="false">
-            <div class="panel-heading">
-              <div class="panel-title">
-                <span class="section-number">01</span>
+            <div class="sidebar-bottom">
+              <n-card class="provider-card" :bordered="false" size="small">
+                <span class="provider-indicator" aria-hidden="true"></span>
                 <div>
-                  <p class="panel-kicker">输入 / 图片</p>
-                  <h2>选择图片</h2>
-                  <p class="panel-copy">将图片拖放到这里，或从设备中浏览。</p>
+                  <strong>本地模型</strong>
+                  <span>{{ settingsStatusLabel }}</span>
                 </div>
-              </div>
-              <n-tag class="state-tag" :type="workflowTagType" round size="small">{{ workflowStatus }}</n-tag>
+              </n-card>
+              <p class="sidebar-build">ver. 0.1.0</p>
             </div>
+          </n-layout-sider>
 
-            <div
-              v-if="!selectedFile"
-              class="drop-zone"
-              :class="{ 'drop-zone-active': isDragActive }"
-              role="button"
-              tabindex="0"
-              aria-label="选择图片文件"
-              @click="openFilePicker"
-              @keydown.enter.prevent="openFilePicker"
-              @keydown.space.prevent="openFilePicker"
-              @dragover="handleDragOver"
-              @dragleave="handleDragLeave"
-              @drop="handleDrop"
-            >
-              <input
-                id="image-file"
-                ref="fileInput"
-                class="file-input"
-                type="file"
-                :accept="SUPPORTED_IMAGE_EXTENSIONS.map((extension) => `.${extension}`).join(',')"
-                aria-label="选择图片文件"
-                @change="handleFileInput"
-              />
-              <div class="drop-zone-label">
-                <span class="drop-icon" aria-hidden="true">
-                  <svg viewBox="0 0 32 32" fill="none">
-                    <rect x="4.5" y="5.5" width="23" height="21" rx="3" stroke="currentColor" stroke-width="1.5" />
-                    <circle cx="11" cy="12" r="2" stroke="currentColor" stroke-width="1.5" />
-                    <path d="m7 23 6.2-6 4.3 4 3-3 4.5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-                  </svg>
-                </span>
-                <span class="drop-zone-kicker">拖放图片以预览</span>
-                <span class="drop-zone-copy">或从设备选择文件，或按 Ctrl+V 粘贴图片</span>
-                <n-button text type="primary" size="small" class="drop-zone-action" @click.stop="openFilePicker">
-                  浏览文件 <span aria-hidden="true">↗</span>
-                </n-button>
-              </div>
-            </div>
-
-              <div v-else class="preview-layout">
-              <ImagePreviewFrame
-                title="输入预览"
-                state-label="已加载"
-                :src="previewUrl ?? undefined"
-                :preview-src="previewUrl ?? undefined"
-                :alt="`预览：${selectedFile.name}`"
-                variant="input"
-                :render-toolbar="renderImageToolbar"
-                @error="handlePreviewError"
-              />
-
-              <div class="preview-details">
-                <div class="file-identity">
-                  <span class="file-type-mark" aria-hidden="true">IMG</span>
-                  <div class="file-identity-copy">
-                    <p class="detail-label">已选文件</p>
-                    <h3>{{ selectedFile.name }}</h3>
-                    <p class="file-meta">
-                      {{ fileSizeLabel }} <span aria-hidden="true">·</span>
-                      {{ selectedFile.type || "图片文件" }}
-                    </p>
-                  </div>
-                </div>
-
-                <div class="button-row">
-                  <n-button secondary @click="resetWorkflow">选择其他</n-button>
-                  <n-button
-                    v-if="workflowState !== 'processing'"
-                    type="primary"
-                    :disabled="!canStartTranslation"
-                    @click="startTranslation"
-                  >
-                    {{ startButtonLabel }}
-                  </n-button>
-                  <n-button v-else tertiary type="warning" @click="cancelTranslation">
-                    取消翻译
-                  </n-button>
-                </div>
-
-                <n-alert
-                  v-if="workflowState === 'cancelled'"
-                  class="inline-alert"
-                  type="warning"
-                  title="翻译已取消"
-                  :show-icon="true"
+          <n-layout class="workspace-main">
+            <n-layout-content id="main-content" class="content">
+              <section class="workspace-header" :aria-labelledby="pageMetadata.titleId">
+                <h1 :id="pageMetadata.titleId">{{ pageMetadata.title }}</h1>
+                <n-tag
+                  class="state-tag"
+                  :type="pageMetadata.statusType"
+                  round
+                  size="small"
+                  :aria-label="pageMetadata.statusAriaLabel"
                 >
-                  预览仍在此处，可以随时重新开始。
-                </n-alert>
-                <n-alert
-                  v-if="workflowState === 'error'"
-                  class="inline-alert"
-                  type="error"
-                  title="翻译需要处理"
-                  :show-icon="true"
-                >
-                  {{ errorMessage }}
-                </n-alert>
-              </div>
-            </div>
+                  {{ pageMetadata.statusLabel }}
+                </n-tag>
+              </section>
 
-            <n-alert
-              v-if="workflowState === 'error' && !selectedFile"
-              class="inline-alert"
-              type="error"
-              title="图片无法使用"
-              :show-icon="true"
-            >
-              {{ errorMessage }}
-            </n-alert>
-
-            <p class="input-helper">
-              支持：{{ SUPPORTED_IMAGE_EXTENSIONS.map((extension) => extension.toUpperCase()).join(" · ") }}
-              <span aria-hidden="true"> / </span>
-              最大 {{ MAX_IMAGE_BYTES / (1024 * 1024) }} MB · {{ MAX_IMAGE_PIXELS / 1000000 }} MP
-            </p>
-          </n-card>
-
-          <n-card class="panel output-panel" :bordered="false">
-            <div class="panel-heading">
-              <div class="panel-title">
-                <span class="section-number">02</span>
-                <div>
-                  <p class="panel-kicker">输出 / 文本</p>
-                  <h2>翻译结果</h2>
-                  <p class="panel-copy">复制结果，或将其保存为文本文件。</p>
-                </div>
-              </div>
-              <n-tag v-if="providerLabel" type="success" round size="small">{{ providerLabel }}</n-tag>
-            </div>
-
-            <div v-if="workflowState === 'processing'" class="processing-state" aria-busy="true">
-              <div class="processing-visual" aria-hidden="true">
-                <n-spin size="medium" />
-              </div>
-              <div class="processing-copy">
-                <p class="detail-label">正在处理图片</p>
-                <p>Candle OCR 与 Hy-MT2 正在准备结果。</p>
-              </div>
-              <n-progress
-                type="line"
-                :percentage="processingProgress"
-                :show-indicator="false"
-                aria-label="翻译进度"
-                :aria-valuetext="`${statusMessage}，${processingProgress}% 完成`"
-                processing
-              />
-              <div class="progress-meta">
-                <span id="progress-status">{{ statusMessage }}</span>
-                <strong>{{ processingProgress }}%</strong>
-              </div>
-            </div>
-
-            <div v-else-if="workflowState === 'result' && resultText" class="result-state">
-              <ImagePreviewFrame
-                v-if="annotatedResultUrl"
-                title="OCR 标注预览"
-                variant="result"
-                :src="annotatedResultUrl"
-                :preview-src="annotatedResultUrl"
-                :alt="resultIsTranslated ? 'OCR 标注后的翻译图片' : 'PP-OCRv5 标注识别图片'"
-                :render-toolbar="renderImageToolbar"
-              >
-                <template #actions>
-                  <n-button text size="small" @click="saveAnnotatedImage">保存 PNG</n-button>
-                </template>
-              </ImagePreviewFrame>
-              <div class="result-toolbar">
-                <span>{{ resultIsTranslated ? "翻译输出" : "OCR 输出" }}</span>
-                <div class="result-toolbar-meta">
-                  <span>{{ resultIsTranslated ? "译文" : "原文" }}</span>
-                  <span
-                    v-if="translationDurationLabel"
-                    class="result-duration"
-                    :aria-label="resultIsTranslated ? '翻译用时' : '处理用时'"
-                  >
-                    {{ resultIsTranslated ? "翻译用时" : "处理用时" }}
-                    {{ translationDurationLabel }}
-                  </span>
-                </div>
-              </div>
-
-              <p v-if="!resultIsTranslated" class="result-mode-note">
-                当前使用 CPU，仅展示 PP-OCRv5 识别文本；切换 CUDA 后可启用 Hy-MT2 翻译。
-              </p>
-              <n-input
-                class="result-input"
-                type="textarea"
-                :value="resultText"
-                readonly
-                :autosize="{ minRows: 9, maxRows: 16 }"
-                :aria-label="resultIsTranslated ? '翻译结果文本' : 'PP-OCRv5 识别文本'"
-              />
-              <div class="result-actions">
-                <n-space :size="10" wrap>
-                  <n-button secondary @click="copyResult">复制文本</n-button>
-                  <n-button type="primary" @click="saveResult">保存 .txt</n-button>
-                </n-space>
-                <p v-if="actionFeedback" class="action-feedback" aria-live="polite">{{ actionFeedback }}</p>
-              </div>
-            </div>
-
-            <div v-else-if="workflowState === 'error'" class="output-message">
-              <n-alert
-                class="inline-alert"
-                type="error"
-                title="本次翻译未完成"
-                :show-icon="true"
-              >
-                {{ errorMessage }}
-              </n-alert>
-              <n-button v-if="selectedFile" type="primary" @click="startTranslation">再次尝试</n-button>
-              <n-button v-else secondary @click="openFilePicker">选择图片</n-button>
-            </div>
-
-            <div v-else-if="workflowState === 'cancelled'" class="output-message">
-              <n-alert
-                class="inline-alert"
-                type="warning"
-                title="流程已取消"
-                :show-icon="true"
-              >
-                没有丢失任何内容，图片预览已准备好，可以再次尝试。
-              </n-alert>
-              <n-button type="primary" @click="startTranslation">再次尝试</n-button>
-            </div>
-
-            <div v-else class="empty-output">
-              <n-empty
-                size="small"
-                :description="
-                  workflowState === 'preview'
-                    ? '开始翻译以查看首版预览结果。'
-                    : '翻译结果将在此处显示。'
-                "
-              />
-            </div>
-          </n-card>
-        </section>
-
-        <footer class="workspace-footer">
-          <span>Candle 本地推理</span>
-          <span class="footer-separator" aria-hidden="true"></span>
-          <span>PP-OCRv5 · Hy-MT2 · Tauri</span>
-          <span class="footer-spacer"></span>
-          <span>PNG · JPG · WEBP · GIF · BMP</span>
-        </footer>
-          </template>
-          <section v-else class="settings-page" aria-labelledby="settings-title">
-            <div class="settings-grid">
-              <n-card class="settings-card" :bordered="false">
-                <div class="settings-card-heading">
-                  <div>
-                    <p class="panel-kicker">运行状态</p>
-                    <h2>模型服务</h2>
-                  </div>
-                  <n-tag :type="settingsTagType" round size="small">{{ settingsStatusLabel }}</n-tag>
-                </div>
-                <p class="settings-card-copy">
-                  这里显示后端实际读取到的设备与模型状态，不会伪造就绪结果。
-                </p>
-                <div class="settings-metrics">
-                  <div>
-                    <span>设备</span>
-                    <strong>{{ backendStatus?.device ?? "未读取" }}</strong>
-                  </div>
-                  <div>
-                    <span>翻译器</span>
-                    <strong>{{ backendStatus?.translatorLoaded ? "已加载" : "按需加载" }}</strong>
-                  </div>
-                  <div>
-                    <span>OCR 并发</span>
-                    <strong>{{ backendStatus?.regionParallelism ?? regionParallelism }}</strong>
-                  </div>
-                  <div>
-                    <span>Hy 批大小</span>
-                    <strong>{{ backendStatus?.translationBatchSize ?? translationBatchSize }}</strong>
-                  </div>
-                </div>
-                <n-alert v-if="settingsMessage" class="settings-alert" type="info" :show-icon="false">
-                  {{ settingsMessage }}
-                </n-alert>
-              </n-card>
-
-              <n-card class="settings-card" :bordered="false">
-                <div class="settings-card-heading">
-                  <div>
-                    <p class="panel-kicker">翻译参数</p>
-                    <h2>翻译默认值</h2>
-                  </div>
-                </div>
-                <p class="settings-card-copy">目标语言、system 预设提示词和 user 预设提示词会作为下一次翻译请求的默认模型上下文。</p>
-                <div class="settings-field-grid">
-                  <label class="settings-field">
-                    <span>目标语言</span>
-                    <n-input
-                      v-model:value="targetLanguage"
-                      maxlength="64"
-                      placeholder="例如：Chinese"
-                      aria-label="目标语言"
-                    />
-                  </label>
-                  <label class="settings-field settings-field-wide settings-textarea">
-                    <span>System 预设提示词</span>
-                    <n-input
-                      v-model:value="systemPrompt"
-                      type="textarea"
-                      maxlength="4096"
-                      placeholder="可选：例如 Return concise JSON."
-                      :autosize="{ minRows: 3, maxRows: 6 }"
-                      aria-label="Hy system prompt"
-                    />
-                  </label>
-                  <label class="settings-field settings-field-wide settings-textarea">
-                    <span>User 预设提示词</span>
-                    <n-input
-                      v-model:value="userPrompt"
-                      type="textarea"
-                      maxlength="4096"
-                      placeholder="可选：例如 Preserve product names and translate only visible text."
-                      :autosize="{ minRows: 3, maxRows: 6 }"
-                      aria-label="Hy user preset prompt"
-                    />
-                  </label>
-                </div>
-              </n-card>
-
-              <n-card class="settings-card settings-card-wide" :bordered="false">
-                <div class="settings-card-heading">
-                  <div>
-                    <p class="panel-kicker">模型资源</p>
-                    <h2>本地模型路径</h2>
-                  </div>
-                </div>
-                <p class="settings-card-copy">
-                  选择后端实际使用的 PP-OCRv5 文件夹、Hy-MT2 GGUF 文件和可选字体；保存后立即应用，下一次翻译会按新路径加载。
-                </p>
-                <dl class="settings-path-list">
-                  <div>
-                    <dt>PP-OCRv5 detector</dt>
-                    <dd>
-                      <span class="settings-path-value">{{ modelDetectorPath || "未读取" }}</span>
-                      <n-button secondary size="small" @click="chooseModelPath('detector')">选择文件夹</n-button>
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>PP-OCRv5 recognizer</dt>
-                    <dd>
-                      <span class="settings-path-value">{{ modelRecognizerPath || "未读取" }}</span>
-                      <n-button secondary size="small" @click="chooseModelPath('recognizer')">选择文件夹</n-button>
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Hy-MT2</dt>
-                    <dd>
-                      <span class="settings-path-value">{{ modelHyPath || "未读取" }}</span>
-                      <n-button secondary size="small" @click="chooseModelPath('hy')">选择 GGUF</n-button>
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>标注字体</dt>
-                    <dd>
-                      <span class="settings-path-value">{{ modelFontPath || "系统自动匹配" }}</span>
-                      <n-button secondary size="small" @click="chooseModelPath('font')">选择字体</n-button>
-                      <n-button tertiary size="small" @click="useSystemFont">使用系统字体</n-button>
-                    </dd>
-                  </div>
-                </dl>
-              </n-card>
-
-              <n-card class="settings-card settings-card-wide" :bordered="false">
-                <div class="settings-card-heading">
-                  <div>
-                    <p class="panel-kicker">运行资源</p>
-                    <h2>设备、批处理与释放</h2>
-                  </div>
-                  <n-tag type="info" round size="small">CUDA</n-tag>
-                </div>
-                <p class="settings-card-copy">
-                  控制本地推理设备、OCR 区域并发、Hy 翻译批大小，以及翻译完成后保持模型在显存中的时间。
-                </p>
-                <div class="settings-field-grid">
-                  <label class="settings-field">
-                    <span>设备</span>
-                    <n-select
-                      v-model:value="device"
-                      :options="deviceOptions"
-                      aria-label="模型运行设备"
-                    />
-                    <span class="settings-help">CPU 可用于状态检查；Hy 翻译仍需要 CUDA。</span>
-                  </label>
-                  <label class="settings-field settings-number-field">
-                    <span>OCR 并发</span>
-                    <n-input-number
-                      v-model:value="regionParallelism"
-                      :min="1"
-                      :max="16"
-                      :step="1"
-                      aria-label="OCR 区域并发"
-                    />
-                  </label>
-                  <label class="settings-field settings-number-field">
-                    <span>Hy 批大小</span>
-                    <n-input-number
-                      v-model:value="translationBatchSize"
-                      :min="1"
-                      :max="4"
-                      :step="1"
-                      aria-label="Hy 翻译批大小"
-                    />
-                  </label>
-                  <label class="settings-field settings-number-field">
-                    <span>空闲释放时间（分钟）</span>
-                    <n-input-number
-                      v-model:value="idleUnloadMinutes"
-                      :min="0"
-                      :max="1440"
-                      :step="5"
-                      aria-label="模型空闲释放时间"
-                    />
-                  </label>
-                </div>
-              </n-card>
-
-              <n-card class="settings-card settings-card-wide" :bordered="false">
-                <div class="settings-card-heading">
-                  <div>
-                    <p class="panel-kicker">Hy 生成参数</p>
-                    <h2>采样与惩罚</h2>
-                  </div>
-                  <n-switch v-model:value="generationSampling" aria-label="启用 Hy sampling">
-                    <template #checked>Sampling</template>
-                    <template #unchecked>Greedy</template>
-                  </n-switch>
-                </div>
-                <p class="settings-card-copy">
-                  Greedy 模式忽略 top-k；开启 sampling 时 top-k 必须大于 0，且最大为 1024。
-                </p>
-                <div class="settings-field-grid">
-                  <label class="settings-field settings-number-field">
-                    <span>最大生成 token</span>
-                    <n-input-number
-                      v-model:value="generationMaxNewTokens"
-                      :min="1"
-                      :max="4096"
-                      :step="16"
-                      aria-label="Hy 最大生成 token"
-                    />
-                  </label>
-                  <label class="settings-field settings-number-field">
-                    <span>temperature</span>
-                    <n-input-number
-                      v-model:value="generationTemperature"
-                      :min="0.01"
-                      :step="0.05"
-                      aria-label="Hy temperature"
-                    />
-                  </label>
-                  <label class="settings-field settings-number-field">
-                    <span>top-k</span>
-                    <n-input-number
-                      v-model:value="generationTopK"
-                      :min="0"
-                      :max="1024"
-                      :step="1"
-                      aria-label="Hy top-k"
-                    />
-                  </label>
-                  <label class="settings-field settings-number-field">
-                    <span>top-p</span>
-                    <n-input-number
-                      v-model:value="generationTopP"
-                      :min="0.01"
-                      :max="1"
-                      :step="0.01"
-                      aria-label="Hy top-p"
-                    />
-                  </label>
-                  <label class="settings-field">
-                    <span>seed</span>
-                    <n-input
-                      v-model:value="generationSeed"
-                      placeholder="空表示默认；例如 42"
-                      aria-label="Hy sampling seed"
-                    />
-                  </label>
-                  <label class="settings-field settings-number-field">
-                    <span>repetition penalty</span>
-                    <n-input-number
-                      v-model:value="generationRepetitionPenalty"
-                      :min="0.01"
-                      :step="0.05"
-                      aria-label="Hy repetition penalty"
-                    />
-                  </label>
-                  <label class="settings-field settings-number-field">
-                    <span>frequency penalty</span>
-                    <n-input-number
-                      v-model:value="generationFrequencyPenalty"
-                      :min="0"
-                      :step="0.05"
-                      aria-label="Hy frequency penalty"
-                    />
-                  </label>
-                </div>
-              </n-card>
-
-              <n-card class="settings-card settings-card-wide" :bordered="false">
-                <div class="settings-card-heading">
-                  <div>
-                    <p class="panel-kicker">停止条件与记忆</p>
-                    <h2>Stop tokens、stop strings 与对话记忆</h2>
-                  </div>
-                  <n-switch v-model:value="memoryEnabled" aria-label="启用 Hy 对话记忆">
-                    <template #checked>Memory on</template>
-                    <template #unchecked>Memory off</template>
-                  </n-switch>
-                </div>
-                <p class="settings-card-copy">
-                  Stop tokens 用逗号或空白分隔；stop strings 每行一条。记忆关闭时仍保存预算，方便后续重新启用。
-                </p>
-                <div class="settings-field-grid">
-                  <label class="settings-field settings-field-wide settings-textarea">
-                    <span>stop tokens</span>
-                    <n-input
-                      v-model:value="generationStopTokensText"
-                      type="textarea"
-                      placeholder="例如：120020"
-                      :autosize="{ minRows: 2, maxRows: 4 }"
-                      aria-label="Hy stop tokens"
-                    />
-                  </label>
-                  <label class="settings-field settings-field-wide settings-textarea">
-                    <span>stop strings</span>
-                    <n-input
-                      v-model:value="generationStopStringsText"
-                      type="textarea"
-                      placeholder="每行一个停止字符串"
-                      :autosize="{ minRows: 2, maxRows: 5 }"
-                      aria-label="Hy stop strings"
-                    />
-                  </label>
-                  <label class="settings-field settings-number-field">
-                    <span>记忆 token 预算</span>
-                    <n-input-number
-                      v-model:value="memoryMaxTokens"
-                      :min="1"
-                      :max="262144"
-                      :step="256"
-                      aria-label="Hy 记忆 token 预算"
-                    />
-                  </label>
-                  <label class="settings-field settings-number-field">
-                    <span>记忆轮数</span>
-                    <n-input-number
-                      v-model:value="memoryMaxTurns"
-                      :min="1"
-                      :max="1024"
-                      :step="1"
-                      aria-label="Hy 记忆轮数"
-                    />
-                  </label>
-                </div>
-              </n-card>
-
-              <div class="settings-card-actions settings-page-actions settings-card-wide">
-                <n-button secondary :loading="settingsLoading" @click="refreshBackendStatus">刷新状态</n-button>
-                <n-button type="primary" :loading="settingsLoading" @click="saveModelSettings">
-                  保存模型设置
-                </n-button>
-              </div>
-            </div>
-          </section>
-        </n-layout-content>
-      </n-layout>
-      </n-layout>
-  </div>
+              <RouterView v-slot="{ Component }">
+                <KeepAlive>
+                  <component :is="Component" />
+                </KeepAlive>
+              </RouterView>
+            </n-layout-content>
+          </n-layout>
+        </n-layout>
+      </div>
+    </n-message-provider>
   </n-config-provider>
 </template>
 

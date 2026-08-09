@@ -5,14 +5,14 @@
   "identifier": "com.tauri-app.smodeltrans",
   "build": {
     "beforeDevCommand": "bun run dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://127.0.0.1:5173",
     "beforeBuildCommand": "bun run build",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
-        "title": "smodeltrans - 图片翻译",
+        "title": "smodeltrans - 翻译工作区",
         "width": 1180,
         "height": 760,
         "minWidth": 720,
