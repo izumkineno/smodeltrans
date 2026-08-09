@@ -1,4 +1,5 @@
 use super::{
+    contracts::RegionRecord,
     engine::BackendEngine,
     failure::BackendFailure,
     input::{
@@ -156,12 +157,51 @@ pub(crate) struct TextTranslationResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct OcrCharacterResponse {
+    pub(crate) order: u32,
+    pub(crate) quad: [[i32; 2]; 4],
+    pub(crate) recognized_text: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OcrRegionResponse {
+    pub(crate) order: u32,
+    pub(crate) quad: [[i32; 2]; 4],
+    pub(crate) recognized_text: String,
+    pub(crate) char_boxes: Vec<OcrCharacterResponse>,
+}
+
+impl From<RegionRecord> for OcrRegionResponse {
+    fn from(region: RegionRecord) -> Self {
+        Self {
+            order: region.order,
+            quad: region.quad_points,
+            recognized_text: region.source_text,
+            char_boxes: region
+                .characters
+                .into_iter()
+                .map(|character| OcrCharacterResponse {
+                    order: character.order,
+                    quad: character.quad_points,
+                    recognized_text: character.source_text,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct OcrResponse {
     pub(crate) text: String,
     pub(crate) markdown: String,
     pub(crate) annotated_image_data_url: String,
     pub(crate) provider_label: String,
     pub(crate) duration_ms: u64,
+    pub(crate) image_width: u32,
+    pub(crate) image_height: u32,
+    pub(crate) regions: Vec<OcrRegionResponse>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -391,9 +431,7 @@ fn decode_request(request: TranslateImageRequest) -> Result<DecodedImage, Backen
     )
 }
 
-fn decode_text_request(
-    request: TranslateTextRequest,
-) -> Result<(String, String), BackendFailure> {
+fn decode_text_request(request: TranslateTextRequest) -> Result<(String, String), BackendFailure> {
     let text = validate_text(&request.text)?;
     let target_language = validate_target_language(&request.target_language)?;
     Ok((text, target_language))
@@ -494,6 +532,7 @@ fn ocr_image_blocking(
         .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
         .clone()
         .map_err(BackendFailure::arguments)?;
+    let (image_width, image_height) = request.canvas().dimensions();
     let result = {
         let mut engine = lock_with_cancellation(&state.engine, cancellation)?;
         if engine.is_none() {
@@ -515,14 +554,23 @@ fn ocr_image_blocking(
         annotated_image_data_url: format!("data:image/png;base64,{image_base64}"),
         provider_label: result.provider_label,
         duration_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        image_width,
+        image_height,
+        regions: result
+            .regions
+            .into_iter()
+            .map(OcrRegionResponse::from)
+            .collect(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendSettingsUpdate, OcrImageRequest, TranslateImageRequest, TranslateTextRequest,
+        BackendSettingsUpdate, OcrImageRequest, OcrRegionResponse, TranslateImageRequest,
+        TranslateTextRequest,
     };
+    use crate::backend::contracts::{CharacterRecord, RegionRecord};
     use std::path::PathBuf;
     #[test]
     fn old_translate_request_without_request_id_still_deserializes() {
@@ -605,5 +653,28 @@ mod tests {
         assert!(request.memory.enabled);
         assert_eq!(request.prompt.system, "Return concise JSON.");
         assert_eq!(request.prompt.user, "Preserve product names.");
+    }
+    #[test]
+    fn ocr_region_response_serializes_selectable_character_boxes() {
+        let response = OcrRegionResponse::from(RegionRecord {
+            order: 1,
+            quad_points: [[0, 0], [20, 0], [20, 10], [0, 10]],
+            source_text: "AB".to_owned(),
+            translated_text: String::new(),
+            characters: vec![CharacterRecord {
+                order: 1,
+                quad_points: [[0, 0], [10, 0], [10, 10], [0, 10]],
+                source_text: "A".to_owned(),
+            }],
+        });
+
+        let value = serde_json::to_value(response).unwrap();
+
+        assert_eq!(value["recognizedText"], "AB");
+        assert_eq!(value["charBoxes"][0]["recognizedText"], "A");
+        assert_eq!(
+            value["charBoxes"][0]["quad"][2],
+            serde_json::json!([10, 10])
+        );
     }
 }

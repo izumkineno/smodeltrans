@@ -244,6 +244,22 @@ describe("TauriOcrProvider", () => {
         annotatedImageDataUrl: "data:image/png;base64,AAAA",
         providerLabel: "PP-OCRv5 / Candle",
         durationMs: 321,
+        imageWidth: 640,
+        imageHeight: 480,
+        regions: [
+          {
+            order: 1,
+            quad: [[0, 0], [20, 0], [20, 10], [0, 10]],
+            recognizedText: "识别",
+            charBoxes: [
+              {
+                order: 1,
+                quad: [[0, 0], [10, 0], [10, 10], [0, 10]],
+                recognizedText: "识",
+              },
+            ],
+          },
+        ],
       } as T;
     });
 
@@ -261,6 +277,22 @@ describe("TauriOcrProvider", () => {
       annotatedImageDataUrl: "data:image/png;base64,AAAA",
       providerLabel: "PP-OCRv5 / Candle",
       durationMs: 321,
+      imageWidth: 640,
+      imageHeight: 480,
+      regions: [
+        {
+          order: 1,
+          quad: [[0, 0], [20, 0], [20, 10], [0, 10]],
+          recognizedText: "识别",
+          charBoxes: [
+            {
+              order: 1,
+              quad: [[0, 0], [10, 0], [10, 10], [0, 10]],
+              recognizedText: "识",
+            },
+          ],
+        },
+      ],
     });
     expect(calls).toEqual([
       {

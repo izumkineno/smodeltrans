@@ -251,7 +251,7 @@ impl BackendEngine {
         report_progress(85, "正在生成 OCR 标注图");
         let output = self
             .output
-            .render_ocr(image, &document.regions, cancellation)?;
+            .render_ocr(image, document.regions, cancellation)?;
         report_progress(100, "OCR 处理完成");
         Ok(output)
     }

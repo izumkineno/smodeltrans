@@ -169,9 +169,7 @@ fn validate_file_name(file_name: &str) -> Result<(), BackendFailure> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_TEXT_BYTES, decode_ocr_image, validate_target_language, validate_text,
-    };
+    use super::{MAX_TEXT_BYTES, decode_ocr_image, validate_target_language, validate_text};
 
     #[test]
     fn target_language_validation_trims_and_bounds_unicode_scalars() {

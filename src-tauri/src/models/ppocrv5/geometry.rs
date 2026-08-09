@@ -393,9 +393,50 @@ fn sample_bicubic(image: &RgbImage, x: f64, y: f64) -> Rgb<u8> {
     Rgb(channels.map(|value| value.round().clamp(0.0, 255.0) as u8))
 }
 
+/// A recognition crop plus the inverse transform needed to project recognizer
+/// coordinates back onto the original image.
+#[derive(Debug)]
+pub struct RegionCrop {
+    pub image: RgbImage,
+    transform: [f64; 8],
+    warped_width: u32,
+    rotated: bool,
+}
+
+impl RegionCrop {
+    pub fn map_output_point(&self, point: [f64; 2]) -> Result<[f64; 2]> {
+        ensure!(
+            point[0].is_finite() && point[1].is_finite(),
+            "crop point contains a non-finite coordinate"
+        );
+        let (x, y) = if self.rotated {
+            (f64::from(self.warped_width) - point[1], point[0])
+        } else {
+            (point[0], point[1])
+        };
+        let denominator = self.transform[6] * x + self.transform[7] * y + 1.0;
+        ensure!(
+            denominator.abs() > EPSILON,
+            "invalid crop transform denominator"
+        );
+        Ok([
+            (self.transform[0] * x + self.transform[1] * y + self.transform[2]) / denominator,
+            (self.transform[3] * x + self.transform[4] * y + self.transform[5]) / denominator,
+        ])
+    }
+
+    pub fn map_output_quad(&self, quad: QuadF) -> Result<QuadF> {
+        let mut mapped = [[0.0_f64; 2]; 4];
+        for (index, point) in quad.into_iter().enumerate() {
+            mapped[index] = self.map_output_point(point)?;
+        }
+        Ok(mapped)
+    }
+}
+
 /// Crop a region from the original RGB image using the official
 /// min-area-rectangle → perspective-warp → tall-rotation sequence.
-pub fn crop_region(image: &RgbImage, quad: QuadI) -> Result<RgbImage> {
+pub fn crop_region(image: &RgbImage, quad: QuadI) -> Result<RegionCrop> {
     ensure!(
         image.width() > 0 && image.height() > 0,
         "source image is empty"
@@ -434,11 +475,18 @@ pub fn crop_region(image: &RgbImage, quad: QuadI) -> Result<RgbImage> {
             );
         }
     }
-    if f64::from(height) / f64::from(width) >= 1.5 {
-        Ok(imageops::rotate270(&warped))
+    let rotated = f64::from(height) / f64::from(width) >= 1.5;
+    let image = if rotated {
+        imageops::rotate270(&warped)
     } else {
-        Ok(warped)
-    }
+        warped
+    };
+    Ok(RegionCrop {
+        image,
+        transform,
+        warped_width: width,
+        rotated,
+    })
 }
 
 #[cfg(test)]
@@ -467,5 +515,19 @@ mod tests {
     #[test]
     fn rejects_self_intersecting_quad() {
         assert!(canonicalize_quad([[0, 0], [10, 10], [0, 10], [10, 0]]).is_err());
+    }
+    #[test]
+    fn crop_coordinates_map_back_to_the_source_quad() {
+        let image = RgbImage::new(40, 30);
+        let crop = crop_region(&image, [[10, 5], [30, 5], [30, 15], [10, 15]]).unwrap();
+        assert_eq!(crop.image.dimensions(), (20, 10));
+
+        let mapped = crop
+            .map_output_quad([[0.0, 0.0], [20.0, 0.0], [20.0, 10.0], [0.0, 10.0]])
+            .unwrap();
+        assert_eq!(
+            mapped,
+            [[10.0, 5.0], [30.0, 5.0], [30.0, 15.0], [10.0, 15.0]]
+        );
     }
 }

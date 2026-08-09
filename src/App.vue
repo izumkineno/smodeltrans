@@ -997,6 +997,7 @@ a:focus-visible {
   width: 100%;
   max-width: none;
   margin: 24px auto 0;
+  padding-bottom: 88px;
 }
 
 .settings-grid {
@@ -1162,9 +1163,18 @@ a:focus-visible {
 }
 
 .settings-page-actions {
+  position: sticky;
+  z-index: 20;
+  bottom: 0;
   align-items: center;
   justify-content: flex-end;
   margin-top: 0;
+  padding: 12px 16px;
+  border: 1px solid rgba(220, 223, 230, 0.86);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.12);
+  backdrop-filter: blur(14px);
 }
 
 .settings-number-field .n-input-number {
@@ -1812,6 +1822,16 @@ h1 {
 @media (max-width: 720px) {
   .settings-page {
     margin-top: 16px;
+  }
+
+  .settings-page-actions {
+    bottom: 8px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .settings-page-actions .n-button {
+    width: 100%;
   }
 
   .settings-path-list > div {

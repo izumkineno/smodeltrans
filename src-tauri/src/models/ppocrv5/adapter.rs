@@ -2,9 +2,9 @@
 
 use super::{
     assets::{GraphRole, PpOcrV5Assets},
-    geometry::{self, DetectorProfile, QuadI},
+    geometry::{self, DetectorProfile, QuadI, RegionCrop},
     model::{self, PpOcrV5Detector, PpOcrV5Recognizer, RecognizerOutput},
-    records::PpOcrRegionRecord,
+    records::{PpOcrCharacterRecord, PpOcrRegionRecord},
 };
 use crate::{
     backend::{
@@ -462,8 +462,21 @@ fn detector_quads(output: &model::DetectorOutput, profile: DetectorProfile) -> R
 struct RecognitionJob {
     index: usize,
     quad: QuadI,
-    crop: RgbImage,
+    crop: RegionCrop,
     resized_width: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecodedToken {
+    token: usize,
+    timestep: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DecodedRecognizer {
+    text: String,
+    tokens: Vec<DecodedToken>,
+    time_steps: usize,
 }
 
 fn fill_recognition_tensor(
@@ -533,7 +546,7 @@ fn recognition_batch_tensor(jobs: &[&RecognitionJob], device: &Device) -> Result
     for (batch_index, job) in jobs.iter().enumerate() {
         let offset = batch_index * sample_stride;
         fill_recognition_tensor(
-            &job.crop,
+            &job.crop.image,
             job.resized_width,
             batch_width,
             &mut values[offset..offset + sample_stride],
@@ -543,7 +556,7 @@ fn recognition_batch_tensor(jobs: &[&RecognitionJob], device: &Device) -> Result
         .context("construct recognizer batch tensor")
 }
 
-fn decode_recognizer_row(logits: &Tensor, characters: &[String]) -> Result<String> {
+fn decode_recognizer_row(logits: &Tensor, characters: &[String]) -> Result<DecodedRecognizer> {
     ensure!(
         logits.rank() == 2,
         "recognizer row must be [T, V], got shape {:?}",
@@ -560,8 +573,9 @@ fn decode_recognizer_row(logits: &Tensor, characters: &[String]) -> Result<Strin
         "recognizer output tensor size does not match its shape"
     );
     let mut text = String::new();
+    let mut tokens = Vec::new();
     let mut previous = 0usize;
-    for scores in flat.chunks(vocab) {
+    for (timestep, scores) in flat.chunks(vocab).enumerate() {
         let (token, _) = scores
             .iter()
             .copied()
@@ -577,10 +591,15 @@ fn decode_recognizer_row(logits: &Tensor, characters: &[String]) -> Result<Strin
                 .get(token)
                 .with_context(|| format!("recognizer token {token} exceeds character list"))?;
             text.push_str(character);
+            tokens.push(DecodedToken { token, timestep });
         }
         previous = token;
     }
-    Ok(text)
+    Ok(DecodedRecognizer {
+        text,
+        tokens,
+        time_steps: time,
+    })
 }
 
 #[cfg(test)]
@@ -589,22 +608,130 @@ fn decode_recognizer(output: &RecognizerOutput, characters: &[String]) -> Result
         output.shape.len() == 3 && output.shape[0] == 1 && output.shape[2] > 0,
         "recognizer output must be [1, T, V] with a positive vocabulary"
     );
-    decode_recognizer_row(&output.tensor().i(0)?, characters)
+    Ok(decode_recognizer_row(&output.tensor().i(0)?, characters)?.text)
 }
 
-fn decode_recognizer_batch(
+fn decode_recognizer_batch_detailed(
     output: &RecognizerOutput,
     characters: &[String],
-) -> Result<Vec<String>> {
+) -> Result<Vec<DecodedRecognizer>> {
     ensure!(
         output.shape.len() == 3 && output.shape[0] > 0 && output.shape[2] > 0,
         "recognizer output must be [B, T, V] with a positive vocabulary"
     );
-    let mut texts = Vec::with_capacity(output.shape[0]);
+    let mut decoded = Vec::with_capacity(output.shape[0]);
     for row in 0..output.shape[0] {
-        texts.push(decode_recognizer_row(&output.tensor().i(row)?, characters)?);
+        decoded.push(decode_recognizer_row(&output.tensor().i(row)?, characters)?);
     }
-    Ok(texts)
+    Ok(decoded)
+}
+
+#[cfg(test)]
+fn decode_recognizer_batch(
+    output: &RecognizerOutput,
+    characters: &[String],
+) -> Result<Vec<String>> {
+    Ok(decode_recognizer_batch_detailed(output, characters)?
+        .into_iter()
+        .map(|decoded| decoded.text)
+        .collect())
+}
+
+fn character_records(
+    job: &RecognitionJob,
+    decoded: &DecodedRecognizer,
+    characters: &[String],
+    batch_width: usize,
+    image_width: u32,
+    image_height: u32,
+) -> Result<Vec<PpOcrCharacterRecord>> {
+    let mut tokens = decoded
+        .tokens
+        .iter()
+        .map(|token| {
+            characters
+                .get(token.token)
+                .cloned()
+                .map(|text| (token.timestep, text))
+                .with_context(|| format!("recognizer token {} exceeds character list", token.token))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    while tokens
+        .first()
+        .is_some_and(|(_, text)| text.trim_start().is_empty())
+    {
+        tokens.remove(0);
+    }
+    if let Some((_, text)) = tokens.first_mut() {
+        *text = text.trim_start().to_owned();
+    }
+    while tokens
+        .last()
+        .is_some_and(|(_, text)| text.trim_end().is_empty())
+    {
+        tokens.pop();
+    }
+    if let Some((_, text)) = tokens.last_mut() {
+        *text = text.trim_end().to_owned();
+    }
+    ensure!(
+        tokens
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<String>()
+            == decoded.text.trim(),
+        "recognizer character sequence does not match region text"
+    );
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let valid_time_steps = decoded
+        .time_steps
+        .checked_mul(job.resized_width)
+        .context("recognizer timestep scaling overflowed")?
+        .div_ceil(batch_width)
+        .max(1);
+    let position_time_steps =
+        valid_time_steps.max(tokens.last().map(|(timestep, _)| timestep + 1).unwrap_or(1));
+    let centers = tokens
+        .iter()
+        .map(|(timestep, _)| (*timestep as f64 + 0.5) / position_time_steps as f64)
+        .collect::<Vec<_>>();
+    let crop_width = f64::from(job.crop.image.width());
+    let crop_height = f64::from(job.crop.image.height());
+    let max_x = f64::from(image_width.saturating_sub(1));
+    let max_y = f64::from(image_height.saturating_sub(1));
+    let mut records = Vec::with_capacity(tokens.len());
+    for (index, ((_, text), center)) in tokens.iter().zip(centers.iter()).enumerate() {
+        let left = if index == 0 {
+            0.0
+        } else {
+            (centers[index - 1] + center) * 0.5
+        };
+        let right = if index + 1 == centers.len() {
+            1.0
+        } else {
+            (center + centers[index + 1]) * 0.5
+        };
+        let mapped = job.crop.map_output_quad([
+            [left * crop_width, 0.0],
+            [right * crop_width, 0.0],
+            [right * crop_width, crop_height],
+            [left * crop_width, crop_height],
+        ])?;
+        records.push(PpOcrCharacterRecord {
+            order: u32::try_from(index + 1).context("OCR character order overflowed")?,
+            quad_points: mapped.map(|[x, y]| {
+                [
+                    x.round().clamp(0.0, max_x) as i32,
+                    y.round().clamp(0.0, max_y) as i32,
+                ]
+            }),
+            source_text: text.clone(),
+        });
+    }
+    Ok(records)
 }
 
 fn recognize_regions(
@@ -628,8 +755,8 @@ fn recognize_regions(
     for (index, &quad) in quads.iter().enumerate() {
         let crop = geometry::crop_region(image, quad)
             .with_context(|| format!("crop OCR region {}", index + 1))?;
-        let crop_pixels = u64::from(crop.width())
-            .checked_mul(u64::from(crop.height()))
+        let crop_pixels = u64::from(crop.image.width())
+            .checked_mul(u64::from(crop.image.height()))
             .context("OCR crop pixel count overflowed")?;
         total_crop_pixels = total_crop_pixels
             .checked_add(crop_pixels)
@@ -638,7 +765,8 @@ fn recognize_regions(
             total_crop_pixels <= MAX_TOTAL_CROP_PIXELS,
             "OCR crop pixel budget exceeded"
         );
-        let resized_width = recognizer_resize_width(crop.width(), crop.height())? as usize;
+        let resized_width =
+            recognizer_resize_width(crop.image.width(), crop.image.height())? as usize;
         jobs.push(RecognitionJob {
             index,
             quad,
@@ -658,42 +786,63 @@ fn recognize_regions(
         });
     }
 
-    let mut records: Vec<Option<(QuadI, String)>> = vec![None; jobs.len()];
+    let mut records: Vec<Option<(QuadI, String, Vec<PpOcrCharacterRecord>)>> =
+        vec![None; jobs.len()];
     cancellation
         .check()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     for chunk in jobs.chunks(region_parallelism) {
         let batch = chunk.iter().collect::<Vec<_>>();
+        let batch_width = batch
+            .iter()
+            .map(|job| job.resized_width)
+            .max()
+            .context("recognizer batch is empty")?
+            .max(320);
         let tensor = recognition_batch_tensor(&batch, device)?;
         let output = recognizer
             .forward(&tensor)
             .with_context(|| format!("recognize OCR batch with {} regions", batch.len()))?;
-        let texts = decode_recognizer_batch(&output, characters)?;
+        let decoded = decode_recognizer_batch_detailed(&output, characters)?;
         cancellation
             .check()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        for (job, source_text) in batch.into_iter().zip(texts) {
-            let source_text = source_text.trim().to_owned();
+        for (job, decoded) in batch.into_iter().zip(decoded) {
+            let source_text = decoded.text.trim().to_owned();
             ensure!(
                 !source_text.is_empty(),
                 "PP-OCRv5 region {} produced empty recognition text",
                 job.index + 1
             );
-            records[job.index] = Some((job.quad, source_text));
+            let characters = character_records(
+                job,
+                &decoded,
+                characters,
+                batch_width,
+                image.width(),
+                image.height(),
+            )?;
+            records[job.index] = Some((job.quad, source_text, characters));
         }
     }
 
     let mut output = Vec::with_capacity(records.len());
     for (index, result) in records.into_iter().enumerate() {
-        let (quad, source_text) = result.context("recognition result missing")?;
-        output.push(PpOcrRegionRecord::new(index as u32 + 1, quad, source_text));
+        let (quad, source_text, characters) = result.context("recognition result missing")?;
+        output.push(PpOcrRegionRecord::new(
+            index as u32 + 1,
+            quad,
+            source_text,
+            characters,
+        ));
     }
     Ok(output)
 }
 #[cfg(test)]
 mod tests {
     use super::{
-        DetectorProfile, RecognizerOutput, clip_detector_quad, component_quad, decode_recognizer,
+        DecodedRecognizer, DecodedToken, DetectorProfile, RecognitionJob, RecognizerOutput,
+        character_records, clip_detector_quad, component_quad, decode_recognizer,
         decode_recognizer_batch, detector_contours, detector_tensor, filled_quad_score,
         recognition_tensor, recognizer_resize_width, unclipped_quad,
     };
@@ -858,5 +1007,42 @@ mod tests {
         let characters = vec!["blank".to_owned(), " A ".to_owned(), "B ".to_owned()];
         let text = decode_recognizer(&output, &characters).unwrap();
         assert_eq!(text, " A B ");
+    }
+    #[test]
+    fn character_records_partition_the_source_region_in_ctc_order() {
+        let image = RgbImage::new(100, 40);
+        let crop =
+            super::geometry::crop_region(&image, [[10, 10], [90, 10], [90, 30], [10, 30]]).unwrap();
+        let job = RecognitionJob {
+            index: 0,
+            quad: [[10, 10], [90, 10], [90, 30], [10, 30]],
+            crop,
+            resized_width: 320,
+        };
+        let decoded = DecodedRecognizer {
+            text: "AB".to_owned(),
+            tokens: vec![
+                DecodedToken {
+                    token: 1,
+                    timestep: 5,
+                },
+                DecodedToken {
+                    token: 2,
+                    timestep: 25,
+                },
+            ],
+            time_steps: 40,
+        };
+        let characters = vec!["blank".to_owned(), "A".to_owned(), "B".to_owned()];
+
+        let records = character_records(&job, &decoded, &characters, 320, 100, 40).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].source_text, "A");
+        assert_eq!(records[1].source_text, "B");
+        assert_eq!(records[0].quad_points[0], [10, 10]);
+        assert_eq!(records[0].quad_points[2], [41, 30]);
+        assert_eq!(records[1].quad_points[0], [41, 10]);
+        assert_eq!(records[1].quad_points[2], [90, 30]);
     }
 }

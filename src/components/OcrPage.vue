@@ -36,6 +36,7 @@ import {
   createTranslationRequestId,
   isTranslationCancellation,
   ocrProvider,
+  type OcrRegion,
   type OcrResult,
   type TranslationProgress,
 } from "../services/translation-provider";
@@ -53,6 +54,10 @@ const resultText = ref<string | null>(null);
 const resultMarkdown = ref<string | null>(null);
 const providerLabel = ref("");
 const durationMs = ref<number | null>(null);
+const resultRegions = ref<OcrRegion[]>([]);
+const resultImageWidth = ref(0);
+const resultImageHeight = ref(0);
+const selectedImageText = ref("");
 const outputMode = ref<"text" | "markdown">("text");
 const isDragActive = ref(false);
 const processingProgress = ref(0);
@@ -156,6 +161,13 @@ const durationLabel = computed(() => {
 const activeOutput = computed(() =>
   outputMode.value === "markdown" ? resultMarkdown.value ?? "" : resultText.value ?? "",
 );
+const imageSelectionHint = computed(() => {
+  if (!selectedImageText.value) {
+    return "点击图片打开大图，拖拽文字进行选择，按 Ctrl+C 可直接复制。";
+  }
+  const characterCount = Array.from(selectedImageText.value.replace(/\n/g, "")).length;
+  return `已选择 ${characterCount} 个字符，按 Ctrl+C 复制。`;
+});
 
 function clearProgressListener() {
   progressUnlisten?.();
@@ -168,6 +180,10 @@ function resetResult() {
   resultMarkdown.value = null;
   providerLabel.value = "";
   durationMs.value = null;
+  resultRegions.value = [];
+  resultImageWidth.value = 0;
+  resultImageHeight.value = 0;
+  selectedImageText.value = "";
   outputMode.value = "text";
   actionFeedback.value = "";
   errorMessage.value = "";
@@ -299,6 +315,9 @@ async function startOcr() {
     annotatedResultUrl.value = result.annotatedImageDataUrl;
     providerLabel.value = result.providerLabel;
     durationMs.value = result.durationMs;
+    resultRegions.value = result.regions;
+    resultImageWidth.value = result.imageWidth;
+    resultImageHeight.value = result.imageHeight;
     processingProgress.value = 100;
     workflowState.value = "result";
     setStatusToast("success", "OCR 识别结果已准备好。");
@@ -616,19 +635,29 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-else-if="workflowState === 'result' && resultText !== null" class="ocr-result-state">
-          <ImagePreviewFrame
-            v-if="annotatedResultUrl"
-            title="OCR 标注预览"
-            variant="result"
-            :src="annotatedResultUrl"
-            :preview-src="annotatedResultUrl"
-            alt="PP-OCRv5 标注识别图片"
-            :render-toolbar="renderImageToolbar"
+          <div
+            v-if="annotatedResultUrl && resultImageWidth > 0 && resultImageHeight > 0"
+            class="ocr-selectable-result"
           >
-            <template #actions>
-              <n-button text size="small" @click="saveAnnotatedImage">保存 PNG</n-button>
-            </template>
-          </ImagePreviewFrame>
+            <ImagePreviewFrame
+              title="OCR 标注图片"
+              state-label="打开大图后可选字"
+              variant="result"
+              :src="annotatedResultUrl"
+              :preview-src="annotatedResultUrl"
+              alt="可在放大预览中选择文字的 PP-OCRv5 标注识别图片"
+              :render-toolbar="renderImageToolbar"
+              :image-width="resultImageWidth"
+              :image-height="resultImageHeight"
+              :regions="resultRegions"
+              @selection-change="selectedImageText = $event"
+            >
+              <template #actions>
+                <n-button text size="small" @click="saveAnnotatedImage">保存 PNG</n-button>
+              </template>
+            </ImagePreviewFrame>
+            <p class="ocr-selection-hint" aria-live="polite">{{ imageSelectionHint }}</p>
+          </div>
           <div class="ocr-result-toolbar">
             <span>识别输出</span>
             <div class="ocr-result-toolbar-meta">
@@ -970,6 +999,18 @@ onBeforeUnmount(() => {
   min-height: 360px;
   flex: 1;
   flex-direction: column;
+}
+
+.ocr-selectable-result {
+  display: grid;
+  gap: 7px;
+}
+
+.ocr-selection-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .ocr-result-toolbar {

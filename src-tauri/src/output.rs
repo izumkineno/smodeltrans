@@ -120,12 +120,12 @@ impl OutputPort for ImageOutput {
     fn render_ocr(
         &mut self,
         image: &DecodedImage,
-        regions: &[RegionRecord],
+        regions: Vec<RegionRecord>,
         cancellation: &CancellationToken,
     ) -> Result<OcrOutput, BackendFailure> {
         cancellation.check()?;
         let mut rendered: RgbaImage = DynamicImage::ImageRgb8(image.canvas().clone()).into_rgba8();
-        let ordered = ordered_regions(regions);
+        let ordered = ordered_regions(&regions);
         let mut recognized_text = Vec::with_capacity(ordered.len());
         for region in &ordered {
             cancellation.check()?;
@@ -164,7 +164,7 @@ impl OutputPort for ImageOutput {
             }
         }
         cancellation.check()?;
-        let markdown = write_ocr_markdown(image.file_name(), regions)?;
+        let markdown = write_ocr_markdown(image.file_name(), &regions)?;
         if markdown.len() > MAX_TEXT_BYTES {
             return Err(BackendFailure::output("Markdown 输出超过 8 MiB 上限"));
         }
@@ -195,6 +195,7 @@ impl OutputPort for ImageOutput {
             markdown,
             text,
             provider_label: "PP-OCRv5 / Candle".to_owned(),
+            regions,
         })
     }
 }
@@ -342,15 +343,15 @@ fn write_markdown(
     Ok(markdown)
 }
 
-fn write_ocr_markdown(
-    file_name: &str,
-    regions: &[RegionRecord],
-) -> Result<String, BackendFailure> {
+fn write_ocr_markdown(file_name: &str, regions: &[RegionRecord]) -> Result<String, BackendFailure> {
     let ordered = ordered_regions(regions);
     let mut markdown = String::new();
     markdown.push_str("---\nsource_image: ");
     markdown.push_str(&escape_scalar(file_name));
-    markdown.push_str(&format!("\nregion_count: {}\n---\n\n# OCR\n", regions.len()));
+    markdown.push_str(&format!(
+        "\nregion_count: {}\n---\n\n# OCR\n",
+        regions.len()
+    ));
     for region in ordered {
         markdown.push_str(&format!(
             "\n## Region {}\n\n- order: {}\n- quad_points: [",

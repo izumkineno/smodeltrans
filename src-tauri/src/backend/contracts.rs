@@ -4,11 +4,19 @@ use crate::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CharacterRecord {
+    pub(crate) order: u32,
+    pub(crate) quad_points: [[i32; 2]; 4],
+    pub(crate) source_text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RegionRecord {
     pub(crate) order: u32,
     pub(crate) quad_points: [[i32; 2]; 4],
     pub(crate) source_text: String,
     pub(crate) translated_text: String,
+    pub(crate) characters: Vec<CharacterRecord>,
 }
 
 impl RegionRecord {
@@ -22,6 +30,7 @@ impl RegionRecord {
             quad_points,
             source_text: source_text.into(),
             translated_text: String::new(),
+            characters: Vec::new(),
         }
     }
 }
@@ -58,6 +67,7 @@ pub(crate) struct OcrOutput {
     pub(crate) markdown: String,
     pub(crate) text: String,
     pub(crate) provider_label: String,
+    pub(crate) regions: Vec<RegionRecord>,
 }
 
 pub(crate) trait OcrPort: Send {
@@ -91,7 +101,7 @@ pub(crate) trait OutputPort: Send {
     fn render_ocr(
         &mut self,
         image: &DecodedImage,
-        regions: &[RegionRecord],
+        regions: Vec<RegionRecord>,
         cancellation: &CancellationToken,
     ) -> Result<OcrOutput, BackendFailure>;
 }

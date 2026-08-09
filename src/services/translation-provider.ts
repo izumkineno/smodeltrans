@@ -105,12 +105,30 @@ export interface OcrRequest {
   requestId?: string;
 }
 
+export type OcrQuad = [[number, number], [number, number], [number, number], [number, number]];
+
+export interface OcrCharacterBox {
+  order: number;
+  quad: OcrQuad;
+  recognizedText: string;
+}
+
+export interface OcrRegion {
+  order: number;
+  quad: OcrQuad;
+  recognizedText: string;
+  charBoxes: OcrCharacterBox[];
+}
+
 export interface OcrResult {
   text: string;
   markdown: string;
   annotatedImageDataUrl: string;
   providerLabel: string;
   durationMs: number;
+  imageWidth: number;
+  imageHeight: number;
+  regions: OcrRegion[];
 }
 
 export interface OcrProvider {
@@ -137,6 +155,9 @@ interface TauriOcrResponse {
   annotatedImageDataUrl: string;
   providerLabel: string;
   durationMs: number;
+  imageWidth: number;
+  imageHeight: number;
+  regions: OcrRegion[];
 }
 
 interface BackendErrorPayload {
@@ -357,6 +378,9 @@ export class TauriOcrProvider implements OcrProvider {
       annotatedImageDataUrl: response.annotatedImageDataUrl,
       providerLabel: response.providerLabel,
       durationMs: response.durationMs,
+      imageWidth: response.imageWidth,
+      imageHeight: response.imageHeight,
+      regions: response.regions,
     };
   }
 }
