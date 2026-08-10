@@ -26,6 +26,8 @@ const DETECTOR_BOX_THRESHOLD: f32 = 0.60;
 const UNCLIP_RATIO: f32 = 1.50;
 const MIN_BOX_SIDE: f32 = 3.0;
 const MAX_TOTAL_CROP_PIXELS: u64 = 64 * 1024 * 1024;
+const RECOGNIZER_IMAGE_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+const RECOGNIZER_IMAGE_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 /// A loaded PP-OCRv5 detector and recognizer pair.
 ///
@@ -503,15 +505,16 @@ fn fill_recognition_tensor(
         48,
         imageops::FilterType::Triangle,
     );
-    let image_mean = [0.5_f32; 3];
-    let image_std = [0.5_f32; 3];
+    // The local Transformers PP-OCRv5 recognizer first converts inputs to RGB,
+    // then applies its inherited ImageNet normalization. The detector uses a
+    // separate BGR contract, so do not share its preprocessing here.
     for channel in 0..3 {
         for y in 0..48 {
             for x in 0..resized_width {
                 let pixel = resized.get_pixel(x as u32, y as u32);
                 let value = f32::from(pixel[channel]) / 255.0;
                 values[channel * plane + y * tensor_width + x] =
-                    (value - image_mean[channel]) / image_std[channel];
+                    (value - RECOGNIZER_IMAGE_MEAN[channel]) / RECOGNIZER_IMAGE_STD[channel];
             }
         }
     }
@@ -734,6 +737,47 @@ fn character_records(
     Ok(records)
 }
 
+fn recognized_region_record(
+    job: &RecognitionJob,
+    decoded: &DecodedRecognizer,
+    characters: &[String],
+    batch_width: usize,
+    image_width: u32,
+    image_height: u32,
+) -> Result<Option<(QuadI, String, Vec<PpOcrCharacterRecord>)>> {
+    let source_text = decoded.text.trim().to_owned();
+    if source_text.is_empty() {
+        return Ok(None);
+    }
+    let characters = character_records(
+        job,
+        decoded,
+        characters,
+        batch_width,
+        image_width,
+        image_height,
+    )?;
+    Ok(Some((job.quad, source_text, characters)))
+}
+
+fn finalize_recognition_records(
+    records: Vec<Option<(QuadI, String, Vec<PpOcrCharacterRecord>)>>,
+) -> Result<Vec<PpOcrRegionRecord>> {
+    let mut output = Vec::with_capacity(records.len());
+    for (index, result) in records.into_iter().enumerate() {
+        let Some((quad, source_text, characters)) = result else {
+            continue;
+        };
+        output.push(PpOcrRegionRecord::new(
+            index as u32 + 1,
+            quad,
+            source_text,
+            characters,
+        ));
+    }
+    Ok(output)
+}
+
 fn recognize_regions(
     image: &RgbImage,
     quads: &[QuadI],
@@ -808,13 +852,7 @@ fn recognize_regions(
             .check()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         for (job, decoded) in batch.into_iter().zip(decoded) {
-            let source_text = decoded.text.trim().to_owned();
-            ensure!(
-                !source_text.is_empty(),
-                "PP-OCRv5 region {} produced empty recognition text",
-                job.index + 1
-            );
-            let characters = character_records(
+            records[job.index] = recognized_region_record(
                 job,
                 &decoded,
                 characters,
@@ -822,21 +860,10 @@ fn recognize_regions(
                 image.width(),
                 image.height(),
             )?;
-            records[job.index] = Some((job.quad, source_text, characters));
         }
     }
 
-    let mut output = Vec::with_capacity(records.len());
-    for (index, result) in records.into_iter().enumerate() {
-        let (quad, source_text, characters) = result.context("recognition result missing")?;
-        output.push(PpOcrRegionRecord::new(
-            index as u32 + 1,
-            quad,
-            source_text,
-            characters,
-        ));
-    }
-    Ok(output)
+    finalize_recognition_records(records)
 }
 #[cfg(test)]
 mod tests {
@@ -844,26 +871,23 @@ mod tests {
         DecodedRecognizer, DecodedToken, DetectorProfile, RecognitionJob, RecognizerOutput,
         character_records, clip_detector_quad, component_quad, decode_recognizer,
         decode_recognizer_batch, detector_contours, detector_tensor, filled_quad_score,
-        recognition_tensor, recognizer_resize_width, unclipped_quad,
+        finalize_recognition_records, recognition_tensor, recognized_region_record,
+        recognizer_resize_width, unclipped_quad,
     };
     use candle_core::{Device, Tensor};
     use image::{Rgb, RgbImage};
 
     #[test]
     fn detector_tensor_matches_processor_bgr_channel_order() {
-        let image = RgbImage::from_pixel(1, 1, Rgb([255, 128, 0]));
-        let profile = DetectorProfile::for_image(1, 1).unwrap();
+        let image = RgbImage::from_pixel(32, 32, Rgb([255, 128, 0]));
+        let profile = DetectorProfile::for_image(32, 32).unwrap();
         let tensor = detector_tensor(&image, profile, &Device::Cpu).unwrap();
-        assert_eq!(tensor.dims(), &[1, 3, 1, 1]);
+        assert_eq!(tensor.dims(), &[1, 3, 32, 32]);
         let values = tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let expected = [
-            (0.0 - 0.485) / 0.229,
-            (128.0 / 255.0 - 0.456) / 0.224,
-            (1.0 - 0.406) / 0.225,
-        ];
-        for (actual, expected) in values.iter().zip(expected) {
-            assert!((actual - expected).abs() < 1e-6);
-        }
+        let plane = 32 * 32;
+        assert!((values[0] - (0.0 - 0.485) / 0.229).abs() < 1e-6);
+        assert!((values[plane] - (128.0 / 255.0 - 0.456) / 0.224).abs() < 1e-6);
+        assert!((values[2 * plane] - (1.0 - 0.406) / 0.225).abs() < 1e-6);
     }
 
     #[test]
@@ -882,16 +906,16 @@ mod tests {
     }
 
     #[test]
-    fn recognizer_tensor_right_pads_after_normalization() {
+    fn recognizer_tensor_matches_transformers_rgb_imagenet_normalization() {
         let crop = RgbImage::from_pixel(10, 10, Rgb([255, 0, 127]));
         let tensor = recognition_tensor(&crop, &Device::Cpu).unwrap();
         assert_eq!(tensor.dims(), &[1, 3, 48, 320]);
         let values = tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let plane = 48 * 320;
-        assert!((values[0] - (1.0 - 0.5) / 0.5).abs() < 1e-6);
+        assert!((values[0] - (1.0 - 0.485) / 0.229).abs() < 1e-6);
         assert_eq!(values[48], 0.0);
-        assert!((values[plane] - (0.0 - 0.5) / 0.5).abs() < 1e-6);
-        assert!((values[2 * plane] - (127.0 / 255.0 - 0.5) / 0.5).abs() < 1e-6);
+        assert!((values[plane] - (0.0 - 0.456) / 0.224).abs() < 1e-6);
+        assert!((values[2 * plane] - (127.0 / 255.0 - 0.406) / 0.225).abs() < 1e-6);
     }
 
     #[test]
@@ -993,6 +1017,46 @@ mod tests {
         let characters = vec!["blank".to_owned(), "A".to_owned(), "B".to_owned()];
         let texts = decode_recognizer_batch(&output, &characters).unwrap();
         assert_eq!(texts, vec!["A".to_owned(), "B".to_owned()]);
+    }
+
+    #[test]
+    fn empty_recognition_text_is_skipped_without_character_geometry() {
+        let image = RgbImage::new(100, 40);
+        let crop =
+            super::geometry::crop_region(&image, [[10, 10], [90, 10], [90, 30], [10, 30]]).unwrap();
+        let job = RecognitionJob {
+            index: 0,
+            quad: [[10, 10], [90, 10], [90, 30], [10, 30]],
+            crop,
+            resized_width: 320,
+        };
+        let decoded = DecodedRecognizer {
+            text: " \n ".to_owned(),
+            tokens: Vec::new(),
+            time_steps: 1,
+        };
+
+        let result =
+            recognized_region_record(&job, &decoded, &["blank".to_owned()], 320, 100, 40).unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn finalizing_records_drops_unrecognized_region_slots() {
+        let quad = [[10, 10], [90, 10], [90, 30], [10, 30]];
+        let records = finalize_recognition_records(vec![
+            Some((quad, "first".to_owned(), Vec::new())),
+            None,
+            Some((quad, "third".to_owned(), Vec::new())),
+        ])
+        .unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].order, 1);
+        assert_eq!(records[0].source_text, "first");
+        assert_eq!(records[1].order, 3);
+        assert_eq!(records[1].source_text, "third");
     }
 
     #[test]

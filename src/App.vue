@@ -27,6 +27,8 @@ import {
   loadPersistedTargetLanguage,
   modelRuntimeStatus,
 } from "./services/workspace-settings";
+import LiveSelectionWindow from "./components/LiveSelectionWindow.vue";
+import LiveSubtitleOverlay from "./components/LiveSubtitleOverlay.vue";
 
 type TagType = "default" | "success" | "warning" | "error" | "info";
 
@@ -293,6 +295,11 @@ const menuOptions: MenuOption[] = [
     icon: renderOcrTranslationIcon,
   },
   {
+    label: "实时翻译",
+    key: "live-translation",
+    icon: renderOcrTranslationIcon,
+  },
+  {
     label: "设置",
     key: "settings",
     icon: renderSettingsIcon,
@@ -314,6 +321,10 @@ function handleMenuUpdate(value: string) {
 
 const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const appWindow = isDesktopRuntime ? getCurrentWindow() : null;
+const windowLabel = appWindow?.label ?? "main";
+const isLiveSelectorWindow = windowLabel === "live-selector";
+const isLiveOverlayWindow = windowLabel === "live-overlay";
+const isMainWorkspaceWindow = !isLiveSelectorWindow && !isLiveOverlayWindow;
 const isWindowMaximized = ref(false);
 let windowStateUnlisten: (() => void) | undefined;
 let windowStateListenerActive = true;
@@ -370,6 +381,14 @@ const pageMetadata = computed<PageMetadata>(() => {
         statusLabel: "OCR 翻译",
         statusType: "info",
         statusAriaLabel: "OCR 翻译流程状态",
+      };
+    case "live-translation":
+      return {
+        title: "实时翻译",
+        titleId: "live-translation-title",
+        statusLabel: "窗口 OCR 翻译",
+        statusType: "info",
+        statusAriaLabel: "实时翻译状态",
       };
     case "settings":
       return {
@@ -498,6 +517,9 @@ function handleTitlebarDoubleClick(event: MouseEvent) {
 }
 
 onMounted(() => {
+  if (!isMainWorkspaceWindow) {
+    return;
+  }
   loadPersistedTargetLanguage();
   void syncWindowState();
   void bindWindowStateListener();
@@ -518,9 +540,11 @@ onBeforeUnmount(() => {
   <n-config-provider :locale="zhCN" :theme="lightTheme" :theme-overrides="themeOverrides">
     <n-message-provider>
       <n-global-style />
-      <a class="skip-link" href="#main-content">跳转到主要内容</a>
+      <a v-if="isMainWorkspaceWindow" class="skip-link" href="#main-content">跳转到主要内容</a>
 
-      <div class="app-shell" :style="appThemeStyle">
+      <LiveSelectionWindow v-if="isLiveSelectorWindow" />
+      <LiveSubtitleOverlay v-else-if="isLiveOverlayWindow" />
+      <div v-else class="app-shell" :style="appThemeStyle">
         <header
           class="titlebar"
           data-tauri-drag-region

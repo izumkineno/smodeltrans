@@ -8,6 +8,7 @@ export const WORKSPACE_ROUTE_NAMES = [
   "translate",
   "ocr",
   "ocr-translate",
+  "live-translation",
   "settings",
   "model-monitor",
 ] as const;
@@ -37,6 +38,11 @@ const routes: RouteRecordRaw[] = [
     path: "/ocr-translate",
     name: "ocr-translate",
     component: () => import("./components/OcrTranslationPage.vue"),
+  },
+  {
+    path: "/live-translation",
+    name: "live-translation",
+    component: () => import("./components/LiveTranslationPage.vue"),
   },
   {
     path: "/settings",

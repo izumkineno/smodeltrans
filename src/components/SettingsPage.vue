@@ -64,6 +64,7 @@ const deviceOptions: Array<{ label: string; value: DeviceKind }> = [
   { label: "CPU（仅用于状态检查；Hy 翻译需要 CUDA）", value: "cpu" },
 ];
 
+
 const toast = useMessage();
 
 function setSettingsFeedback(
@@ -283,7 +284,7 @@ function parseStopStrings(): string[] | null {
 async function saveModelSettings() {
   if (!isDesktopRuntime) {
     if (saveSettings(false)) {
-      setSettingsFeedback("warning", "浏览器预览只保存目标语言；模型参数仅在 Tauri 桌面端可保存。");
+      setSettingsFeedback("warning", "浏览器预览只保存翻译设置；模型参数仅在 Tauri 桌面端可保存。");
     } else {
       showWorkspaceToast(toast, "error", settingsMessage.value);
     }
@@ -445,6 +446,7 @@ onMounted(() => {
   }
   void refreshBackendStatus(false);
 });
+
 </script>
 
 <template>
@@ -526,6 +528,7 @@ onMounted(() => {
           </label>
         </div>
       </n-card>
+
 
       <n-card class="settings-card settings-card-wide" :bordered="false">
         <div class="settings-card-heading">

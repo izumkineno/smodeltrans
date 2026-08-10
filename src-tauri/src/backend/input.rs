@@ -39,6 +39,19 @@ impl DecodedImage {
     pub(crate) fn target_language(&self) -> &str {
         &self.target_language
     }
+
+    pub(crate) fn from_rgb_image(
+        canvas: RgbImage,
+        file_name: impl Into<String>,
+        target_language: impl Into<String>,
+    ) -> Self {
+        Self {
+            canvas: Arc::new(canvas),
+            encoded_bytes: Arc::from([]),
+            file_name: file_name.into(),
+            target_language: target_language.into(),
+        }
+    }
 }
 
 pub(crate) fn validate_target_language(value: &str) -> Result<String, BackendFailure> {

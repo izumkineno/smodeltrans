@@ -23,7 +23,9 @@ pub fn run() {
                 config_path,
             );
             state.start_idle_monitor();
+            let live_manager = backend::live::LiveSessionManager::new(state.clone());
             app.manage(state);
+            app.manage(live_manager);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -34,7 +36,16 @@ pub fn run() {
             backend::commands::cancel_translation,
             backend::commands::translate_image,
             backend::commands::translate_text,
-            backend::commands::ocr_image
+            backend::commands::ocr_image,
+            backend::live::list_capture_windows,
+            backend::live::begin_live_selection,
+            backend::live::confirm_live_selection,
+            backend::live::begin_live_roi_update,
+            backend::live::cancel_live_selection,
+            backend::live::get_live_session_status,
+            backend::live::pause_live_session,
+            backend::live::resume_live_session,
+            backend::live::stop_live_session
         ])
         .run(tauri::generate_context!())
         .expect("error while running smodeltrans application");

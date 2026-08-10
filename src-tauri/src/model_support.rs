@@ -56,7 +56,7 @@ pub(crate) struct CancellationToken {
 }
 
 impl CancellationToken {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
         }

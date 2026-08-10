@@ -1,6 +1,6 @@
 use crate::{
     backend::{
-        contracts::{HyPort, OcrOutput, OcrPort, OutputPort, TranslationOutput},
+        contracts::{HyPort, OcrOutput, OcrPort, OutputPort, RegionRecord, TranslationOutput},
         failure::BackendFailure,
         input::DecodedImage,
         settings::{BackendSettings, DeviceKind},
@@ -93,6 +93,27 @@ impl BackendEngine {
         self.unload_translator();
     }
 
+    pub(crate) fn recognize_regions(
+        &mut self,
+        image: &DecodedImage,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<crate::backend::contracts::RegionRecord>, BackendFailure> {
+        cancellation.check()?;
+        self.load_ocr()?;
+        let ocr = self
+            .ocr
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("PP-OCRv5 provider was not initialized"))?;
+        let document = ocr.recognize(image, cancellation)?;
+        cancellation.check()?;
+        if document.regions.len() > crate::backend::input::MAX_REGIONS {
+            return Err(BackendFailure::ocr(
+                "OCR region count exceeds the supported bound",
+            ));
+        }
+        Ok(document.regions)
+    }
+
     pub(crate) fn translate(
         &mut self,
         image: &DecodedImage,
@@ -125,12 +146,43 @@ impl BackendEngine {
         }
 
         report_progress(60, "正在准备 Hy-MT2");
-        self.load_translator(image.target_language())?;
+        self.translate_regions_with_progress(
+            &mut records,
+            image.target_language(),
+            cancellation,
+            &mut report_progress,
+        )?;
+        cancellation.check()?;
+        report_progress(90, "翻译完成，正在生成标注图");
+        let output = self
+            .output
+            .render(image, &records, image.target_language(), cancellation)?;
+        report_progress(100, "翻译完成");
+        Ok(output)
+    }
+
+    pub(crate) fn translate_regions(
+        &mut self,
+        records: &mut [RegionRecord],
+        target_language: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), BackendFailure> {
+        self.translate_regions_with_progress(records, target_language, cancellation, |_, _| {})
+    }
+
+    fn translate_regions_with_progress(
+        &mut self,
+        records: &mut [RegionRecord],
+        target_language: &str,
+        cancellation: &CancellationToken,
+        mut report_progress: impl FnMut(u8, &'static str),
+    ) -> Result<(), BackendFailure> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        cancellation.check()?;
+        self.load_translator(target_language)?;
         report_progress(70, "Hy-MT2 已就绪");
-        let translator = self
-            .hy
-            .as_mut()
-            .ok_or_else(|| BackendFailure::internal("Hy provider was not initialized"))?;
         if !(1..=4).contains(&self.settings.translation_batch_size) {
             return Err(BackendFailure::arguments(
                 "translation batch size must be 1..=4",
@@ -143,6 +195,10 @@ impl BackendEngine {
                 source_text: record.source_text.clone(),
             })
             .collect::<Vec<_>>();
+        let translator = self
+            .hy
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("Hy provider was not initialized"))?;
         let mut translated = Vec::with_capacity(regions.len());
         let total_batches = regions.len().div_ceil(self.settings.translation_batch_size);
         for (batch_index, batch) in regions
@@ -150,15 +206,9 @@ impl BackendEngine {
             .enumerate()
         {
             cancellation.check()?;
-            translated.extend(translator.translate(
-                batch,
-                image.target_language(),
-                cancellation,
-            )?);
-            let progress = 70
-                + (((batch_index + 1) * 20) / total_batches)
-                    .try_into()
-                    .unwrap_or(20);
+            translated.extend(translator.translate(batch, target_language, cancellation)?);
+            let progress =
+                70 + u8::try_from(((batch_index + 1) * 20) / total_batches).unwrap_or(20);
             report_progress(progress, "Hy-MT2 翻译中");
         }
         if translated.len() != records.len() {
@@ -166,7 +216,7 @@ impl BackendEngine {
                 "Hy returned an incomplete region set",
             ));
         }
-        for record in &mut records {
+        for record in records {
             let Some(result) = translated.iter().find(|item| item.order == record.order) else {
                 return Err(BackendFailure::translation(format!(
                     "Hy returned no translation for region {}",
@@ -181,13 +231,7 @@ impl BackendEngine {
             }
             record.translated_text = result.translated_text.clone();
         }
-        cancellation.check()?;
-        report_progress(90, "翻译完成，正在生成标注图");
-        let output = self
-            .output
-            .render(image, &records, image.target_language(), cancellation)?;
-        report_progress(100, "翻译完成");
-        Ok(output)
+        cancellation.check()
     }
 
     pub(crate) fn translate_text(

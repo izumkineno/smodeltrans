@@ -1,0 +1,1682 @@
+pub(crate) mod contracts;
+mod platform;
+mod scheduler;
+
+use self::{
+    contracts::{
+        CaptureWindowInfo, LiveConfig, LiveDebugOutcome, LiveDebugRecord, LiveDebugStage,
+        LiveMetrics, LiveOverlayAttachment, LiveOverlayMode, LiveOverlaySettings,
+        LiveRecognitionMode, LiveRecognitionSettings, LiveRecognitionTrigger, LiveRoi,
+        LiveSessionState, LiveSessionStatus, LiveSubtitle, LiveSubtitleRegion, NormalizedRoi,
+    },
+    scheduler::{
+        BoundedCache, LatestFrameSlot, OwnedFrame, StabilityScheduler, TwoProbeConfirmation,
+        normalize_text, normalized_region_text, normalized_translated_region_text,
+        roi_result_is_current,
+    },
+};
+use super::{
+    commands::{BackendError, BackendState},
+    contracts::RegionRecord,
+    engine::BackendEngine,
+    failure::{BackendFailure, BackendFailureCode},
+    input::{DecodedImage, validate_target_language},
+};
+use crate::model_support::CancellationToken;
+use image::RgbImage;
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, RecvTimeoutError},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tauri::{
+    Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl, WebviewWindowBuilder,
+};
+
+const STATUS_EVENT: &str = "live-status";
+const SUBTITLE_EVENT: &str = "live-subtitle";
+const DEBUG_RECORD_EVENT: &str = "live-debug-record";
+const SELECTOR_LABEL: &str = "live-selector";
+const OVERLAY_LABEL: &str = "live-overlay";
+const OVERLAY_EDGE_THICKNESS: u32 = 168;
+const DEBUG_TEXT_MAX_CHARS: usize = 2_000;
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn trace_live(message: std::fmt::Arguments<'_>) {
+    if cfg!(debug_assertions) || std::env::var_os("SMODELTRANS_TRACE_LIVE").is_some() {
+        eprintln!("[live] {message}");
+    }
+}
+
+fn debug_text(value: &str) -> String {
+    match value.char_indices().nth(DEBUG_TEXT_MAX_CHARS) {
+        Some((index, _)) => format!("{}…", &value[..index]),
+        None => value.to_owned(),
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct LiveSessionManager {
+    backend: BackendState,
+    status: Arc<Mutex<LiveSessionStatus>>,
+    inner: Arc<Mutex<ManagerInner>>,
+}
+
+#[derive(Default)]
+struct ManagerInner {
+    session_id: Option<String>,
+    target_language: Option<String>,
+    overlay_settings: Option<LiveOverlaySettings>,
+    recognition_settings: Option<LiveRecognitionSettings>,
+    selection_previous_state: Option<LiveSessionState>,
+    runtime: Option<SessionRuntime>,
+}
+
+struct SessionRuntime {
+    id: String,
+    config: Arc<Mutex<LiveConfig>>,
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    cancellation: CancellationToken,
+    latest: Arc<LatestFrameSlot>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl LiveSessionManager {
+    pub(crate) fn new(backend: BackendState) -> Self {
+        Self {
+            backend,
+            status: Arc::new(Mutex::new(LiveSessionStatus::default())),
+            inner: Arc::new(Mutex::new(ManagerInner::default())),
+        }
+    }
+
+    fn current_status(&self) -> Result<LiveSessionStatus, BackendFailure> {
+        self.status
+            .lock()
+            .map(|status| status.clone())
+            .map_err(|_| BackendFailure::internal("实时会话状态锁已损坏"))
+    }
+
+    fn collect_finished(&self) -> Result<(), BackendFailure> {
+        let finished = self
+            .inner
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.join.as_ref())
+            .is_some_and(JoinHandle::is_finished);
+        if !finished {
+            return Ok(());
+        }
+        let runtime = self
+            .inner
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?
+            .runtime
+            .take();
+        if let Some(mut runtime) = runtime {
+            if let Some(join) = runtime.join.take() {
+                let _ = join.join();
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_selection(
+        &self,
+        app: &tauri::AppHandle,
+        target_id: String,
+        target_language: String,
+        overlay_settings: LiveOverlaySettings,
+        recognition_settings: LiveRecognitionSettings,
+    ) -> Result<LiveSessionStatus, BackendFailure> {
+        self.collect_finished()?;
+        let target_language = validate_target_language(&target_language)?;
+        let overlay_settings = overlay_settings
+            .validate()
+            .map_err(BackendFailure::arguments)?;
+        let recognition_settings = recognition_settings
+            .validate()
+            .map_err(BackendFailure::arguments)?;
+        let target = target_by_id(&target_id)?;
+        let geometry = platform::target_geometry(&target_id)?;
+        trace_live(format_args!(
+            "selector request target={target_id} language={target_language} mode={:?} trigger={} stability_wait_ms={}",
+            recognition_settings.mode,
+            recognition_settings.trigger_key,
+            recognition_settings.stability_wait_ms
+        ));
+        if self.backend.runs.is_busy()? {
+            return Err(BackendFailure::arguments(
+                "请等待当前图片或文本任务结束后再启动实时翻译",
+            ));
+        }
+        platform::activate_target_window(&target_id)?;
+        trace_live(format_args!("target window activated target={target_id}"));
+        if self
+            .backend
+            .live_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(BackendFailure::arguments("已有实时翻译会话正在运行"));
+        }
+        let session_id = format!(
+            "live-{}-{}",
+            std::process::id(),
+            NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+            if inner.runtime.is_some() {
+                self.backend.live_active.store(false, Ordering::SeqCst);
+                return Err(BackendFailure::arguments("已有实时翻译会话尚未清理"));
+            }
+            inner.session_id = Some(session_id.clone());
+            inner.target_language = Some(target_language);
+            inner.overlay_settings = Some(overlay_settings);
+            inner.recognition_settings = Some(recognition_settings);
+            inner.selection_previous_state = None;
+        }
+        trace_live(format_args!(
+            "selector status published session={session_id}; dispatching selector window"
+        ));
+        let status = LiveSessionStatus {
+            state: LiveSessionState::Selecting,
+            session_id: Some(session_id),
+            target: Some(target),
+            roi: None,
+            message: "请在目标窗口上框选字幕区域。".to_owned(),
+            latest_revision: 0,
+            metrics: LiveMetrics::default(),
+        };
+        replace_status(&self.status, app, status.clone());
+        if let Err(error) = create_selector_window(app, geometry) {
+            trace_live(format_args!("selector setup failed: {error}"));
+            self.reset(app);
+            return Err(error);
+        }
+        Ok(status)
+    }
+
+    fn confirm_selection(
+        &self,
+        app: &tauri::AppHandle,
+        session_id: &str,
+        roi: LiveRoi,
+    ) -> Result<LiveSessionStatus, BackendFailure> {
+        let roi = roi.validate().map_err(BackendFailure::arguments)?;
+        let normalized = roi.normalized().map_err(BackendFailure::arguments)?;
+        let current = self.current_status()?;
+        require_session(&current, session_id)?;
+        if current.state != LiveSessionState::Selecting {
+            return Err(BackendFailure::arguments("当前会话不在区域选择状态"));
+        }
+        let target = current
+            .target
+            .clone()
+            .ok_or_else(|| BackendFailure::internal("实时会话缺少目标窗口"))?;
+        let geometry = platform::target_geometry(&target.id)?;
+        let display_roi = normalized
+            .to_physical(geometry.width, geometry.height)
+            .ok_or_else(|| BackendFailure::arguments("ROI 无法映射到当前目标客户区"))?;
+        platform::activate_target_window(&target.id)?;
+        trace_live(format_args!("target window activated target={}", target.id));
+        let has_runtime = self
+            .inner
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?
+            .runtime
+            .is_some();
+        if has_runtime {
+            let (state, overlay_settings) = {
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+                let state = inner
+                    .selection_previous_state
+                    .take()
+                    .unwrap_or(LiveSessionState::Running);
+                let runtime = inner
+                    .runtime
+                    .as_mut()
+                    .ok_or_else(|| BackendFailure::internal("实时运行时已丢失"))?;
+                let mut config = runtime
+                    .config
+                    .lock()
+                    .map_err(|_| BackendFailure::internal("实时 ROI 锁已损坏"))?;
+                config.roi = normalized;
+                config.roi_version = config.roi_version.saturating_add(1);
+                runtime
+                    .paused
+                    .store(state == LiveSessionState::Paused, Ordering::SeqCst);
+                runtime.latest.clear();
+                runtime.latest.wake();
+                (state, config.overlay_settings)
+            };
+            close_window(app, SELECTOR_LABEL);
+            position_overlay(app, geometry, overlay_settings);
+            return update_status(&self.status, app, |status| {
+                status.state = state;
+                status.roi = Some(display_roi);
+                status.message = if state == LiveSessionState::Paused {
+                    "已更新字幕区域，会话保持暂停。".to_owned()
+                } else {
+                    "已更新字幕区域，实时翻译继续运行。".to_owned()
+                };
+            });
+        }
+        self.start_runtime(app, session_id, target, normalized, display_roi, geometry)
+    }
+
+    fn start_runtime(
+        &self,
+        app: &tauri::AppHandle,
+        session_id: &str,
+        target: CaptureWindowInfo,
+        roi: NormalizedRoi,
+        display_roi: LiveRoi,
+        geometry: platform::TargetGeometry,
+    ) -> Result<LiveSessionStatus, BackendFailure> {
+        let (target_language, overlay_settings, recognition_settings) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+            (
+                inner
+                    .target_language
+                    .clone()
+                    .ok_or_else(|| BackendFailure::internal("实时会话缺少目标语言"))?,
+                inner
+                    .overlay_settings
+                    .ok_or_else(|| BackendFailure::internal("实时会话缺少浮层设置"))?,
+                inner
+                    .recognition_settings
+                    .clone()
+                    .ok_or_else(|| BackendFailure::internal("实时会话缺少识别触发设置"))?,
+            )
+        };
+        create_overlay_window(app, session_id, geometry, overlay_settings)?;
+        let config = Arc::new(Mutex::new(LiveConfig {
+            roi,
+            roi_version: 1,
+            target_language,
+            overlay_settings,
+            recognition_settings,
+        }));
+        let metrics = Arc::new(Mutex::new(LiveMetrics::default()));
+        let latest = Arc::new(LatestFrameSlot::default());
+        let terminal_error = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let cancellation = CancellationToken::new();
+        let runner = SessionLoop {
+            app: app.clone(),
+            backend: self.backend.clone(),
+            status: Arc::clone(&self.status),
+            session_id: session_id.to_owned(),
+            target_id: target.id.clone(),
+            config: Arc::clone(&config),
+            stop: Arc::clone(&stop),
+            paused: Arc::clone(&paused),
+            cancellation: cancellation.clone(),
+            latest: Arc::clone(&latest),
+            terminal_error,
+            metrics,
+        };
+        let join = match thread::Builder::new()
+            .name("smodeltrans-live-session".to_owned())
+            .spawn(move || runner.run())
+        {
+            Ok(join) => join,
+            Err(error) => {
+                let failure =
+                    BackendFailure::internal(format!("无法启动实时翻译工作线程: {error}"));
+                self.fail(app, session_id, target, display_roi, failure.message());
+                return Err(failure);
+            }
+        };
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+            inner.selection_previous_state = None;
+            inner.runtime = Some(SessionRuntime {
+                id: session_id.to_owned(),
+                config,
+                stop,
+                paused,
+                cancellation,
+                latest,
+                join: Some(join),
+            });
+        }
+        close_window(app, SELECTOR_LABEL);
+        update_status(&self.status, app, |status| {
+            status.state = LiveSessionState::Warming;
+            status.target = Some(target);
+            status.roi = Some(display_roi);
+            status.message =
+                "正在连接 Windows Graphics Capture，并预热 PP-OCRv5 与 Hy-MT2 模型。".to_owned();
+        })
+    }
+
+    fn begin_roi_update(
+        &self,
+        app: &tauri::AppHandle,
+        session_id: &str,
+    ) -> Result<LiveSessionStatus, BackendFailure> {
+        let current = self.current_status()?;
+        require_session(&current, session_id)?;
+        if !matches!(
+            current.state,
+            LiveSessionState::Running | LiveSessionState::Paused
+        ) {
+            return Err(BackendFailure::arguments(
+                "仅运行中或暂停的会话可以重新选择区域",
+            ));
+        }
+        let target = current
+            .target
+            .as_ref()
+            .ok_or_else(|| BackendFailure::internal("实时会话缺少目标窗口"))?;
+        let geometry = platform::target_geometry(&target.id)?;
+        platform::activate_target_window(&target.id)?;
+        trace_live(format_args!("target window activated target={}", target.id));
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+            inner.selection_previous_state = Some(current.state);
+            let runtime = inner
+                .runtime
+                .as_mut()
+                .ok_or_else(|| BackendFailure::internal("实时运行时已丢失"))?;
+            runtime.paused.store(true, Ordering::SeqCst);
+            runtime.latest.wake();
+        }
+        let selecting = update_status(&self.status, app, |status| {
+            status.state = LiveSessionState::Selecting;
+            status.message = "请重新框选字幕区域；确认前不会发布新字幕。".to_owned();
+        })?;
+        if let Err(error) = create_selector_window(app, geometry) {
+            let _ = self.cancel_selection(app, session_id);
+            return Err(error);
+        }
+        Ok(selecting)
+    }
+
+    fn cancel_selection(
+        &self,
+        app: &tauri::AppHandle,
+        session_id: &str,
+    ) -> Result<LiveSessionStatus, BackendFailure> {
+        let current = self.current_status()?;
+        require_session(&current, session_id)?;
+        if current.state != LiveSessionState::Selecting {
+            return Err(BackendFailure::arguments("当前会话不在区域选择状态"));
+        }
+        let restored = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+            let restored = inner
+                .selection_previous_state
+                .take()
+                .unwrap_or(LiveSessionState::Idle);
+            if let Some(runtime) = inner.runtime.as_mut() {
+                runtime
+                    .paused
+                    .store(restored == LiveSessionState::Paused, Ordering::SeqCst);
+                runtime.latest.wake();
+            }
+            restored
+        };
+        close_window(app, SELECTOR_LABEL);
+        if restored == LiveSessionState::Idle {
+            return Ok(self.reset(app));
+        }
+        update_status(&self.status, app, |status| {
+            status.state = restored;
+            status.message = if restored == LiveSessionState::Paused {
+                "已取消重新选区，会话保持暂停。".to_owned()
+            } else {
+                "已取消重新选区，实时翻译继续运行。".to_owned()
+            };
+        })
+    }
+
+    fn set_paused(
+        &self,
+        app: &tauri::AppHandle,
+        session_id: &str,
+        paused: bool,
+    ) -> Result<LiveSessionStatus, BackendFailure> {
+        let current = self.current_status()?;
+        require_session(&current, session_id)?;
+        let required = if paused {
+            LiveSessionState::Running
+        } else {
+            LiveSessionState::Paused
+        };
+        if current.state != required {
+            return Err(BackendFailure::arguments(if paused {
+                "仅运行中的会话可以暂停"
+            } else {
+                "仅暂停的会话可以继续"
+            }));
+        }
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+        let runtime = inner
+            .runtime
+            .as_ref()
+            .filter(|runtime| runtime.id == session_id)
+            .ok_or_else(|| BackendFailure::internal("实时运行时已丢失"))?;
+        runtime.paused.store(paused, Ordering::SeqCst);
+        runtime.latest.wake();
+        drop(inner);
+        update_status(&self.status, app, |status| {
+            status.state = if paused {
+                LiveSessionState::Paused
+            } else {
+                LiveSessionState::Running
+            };
+            status.message = if paused {
+                "实时翻译已暂停。".to_owned()
+            } else {
+                "实时翻译继续运行。".to_owned()
+            };
+        })
+    }
+
+    fn stop(
+        &self,
+        app: &tauri::AppHandle,
+        session_id: Option<&str>,
+    ) -> Result<LiveSessionStatus, BackendFailure> {
+        let current = self.current_status()?;
+        if current.state == LiveSessionState::Idle {
+            return Ok(self.reset(app));
+        }
+        if let (Some(requested), Some(active)) = (session_id, current.session_id.as_deref()) {
+            if requested != active {
+                return Ok(current);
+            }
+        }
+        let _ = update_status(&self.status, app, |status| {
+            status.state = LiveSessionState::Stopping;
+            status.message = "正在停止实时翻译并释放捕获资源。".to_owned();
+        });
+        close_window(app, SELECTOR_LABEL);
+        let runtime = self
+            .inner
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?
+            .runtime
+            .take();
+        if let Some(mut runtime) = runtime {
+            runtime.stop.store(true, Ordering::SeqCst);
+            runtime.cancellation.cancel();
+            runtime.latest.wake();
+            if let Some(join) = runtime.join.take() {
+                join.join()
+                    .map_err(|_| BackendFailure::internal("实时翻译工作线程异常退出"))?;
+            }
+        }
+        Ok(self.reset(app))
+    }
+
+    fn fail(
+        &self,
+        app: &tauri::AppHandle,
+        session_id: &str,
+        target: CaptureWindowInfo,
+        roi: LiveRoi,
+        message: &str,
+    ) {
+        self.backend.live_active.store(false, Ordering::SeqCst);
+        close_window(app, SELECTOR_LABEL);
+        close_window(app, OVERLAY_LABEL);
+        replace_status(
+            &self.status,
+            app,
+            LiveSessionStatus {
+                state: LiveSessionState::Error,
+                session_id: Some(session_id.to_owned()),
+                target: Some(target),
+                roi: Some(roi),
+                message: message.to_owned(),
+                latest_revision: 0,
+                metrics: LiveMetrics::default(),
+            },
+        );
+    }
+
+    fn reset(&self, app: &tauri::AppHandle) -> LiveSessionStatus {
+        self.backend.live_active.store(false, Ordering::SeqCst);
+        close_window(app, SELECTOR_LABEL);
+        close_window(app, OVERLAY_LABEL);
+        if let Ok(mut inner) = self.inner.lock() {
+            *inner = ManagerInner::default();
+        }
+        let idle = LiveSessionStatus::default();
+        replace_status(&self.status, app, idle.clone());
+        idle
+    }
+}
+
+struct RecognizedFrame {
+    source_text: String,
+    region_count: u32,
+    regions: Vec<RegionRecord>,
+}
+
+struct SessionLoop {
+    app: tauri::AppHandle,
+    backend: BackendState,
+    status: Arc<Mutex<LiveSessionStatus>>,
+    session_id: String,
+    target_id: String,
+    config: Arc<Mutex<LiveConfig>>,
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    cancellation: CancellationToken,
+    latest: Arc<LatestFrameSlot>,
+    terminal_error: Arc<Mutex<Option<String>>>,
+    metrics: Arc<Mutex<LiveMetrics>>,
+}
+
+impl SessionLoop {
+    fn run(self) {
+        let capture = match self.await_capture_start() {
+            Ok(Some(capture)) => capture,
+            Ok(None) => {
+                self.finish(None, None);
+                return;
+            }
+            Err(error) => {
+                self.finish(None, Some(error.message().to_owned()));
+                return;
+            }
+        };
+        self.run_capture(capture);
+    }
+
+    fn await_capture_start(&self) -> Result<Option<platform::CaptureWorker>, BackendFailure> {
+        let (sender, receiver) =
+            mpsc::sync_channel::<Result<platform::CaptureWorker, BackendFailure>>(1);
+        let target_id = self.target_id.clone();
+        let latest = Arc::clone(&self.latest);
+        let terminal_error = Arc::clone(&self.terminal_error);
+        let config = Arc::clone(&self.config);
+        let metrics = Arc::clone(&self.metrics);
+        thread::Builder::new()
+            .name("smodeltrans-wgc-startup".to_owned())
+            .spawn(move || {
+                let result =
+                    platform::start_capture(&target_id, latest, terminal_error, config, metrics);
+                if let Err(error) = sender.send(result) {
+                    if let Ok(capture) = error.0 {
+                        let _ = capture.stop();
+                    }
+                }
+            })
+            .map_err(|error| {
+                BackendFailure::internal(format!("无法启动窗口捕获初始化线程: {error}"))
+            })?;
+        await_capture_start_result(&self.stop, &receiver)
+    }
+
+    fn run_capture(&self, capture: platform::CaptureWorker) {
+        let mut stability = StabilityScheduler::default();
+        let mut configured_stability_wait_ms = None;
+
+        let mut confirmation = TwoProbeConfirmation::default();
+        let mut cache = BoundedCache::new(128);
+        let mut roi_version = 0;
+        let mut last_frame: Option<OwnedFrame> = None;
+        let mut last_geometry_sync = Instant::now() - Duration::from_secs(1);
+        let mut terminal_message = None;
+        let mut debug_sequence = 0_u64;
+
+        let mut trigger_pending = false;
+        let mut waiting_for_trigger = false;
+        let mut previous_trigger_active = false;
+
+        while !self.stop.load(Ordering::SeqCst) {
+            if let Some(error) = self
+                .terminal_error
+                .lock()
+                .ok()
+                .and_then(|error| error.clone())
+            {
+                terminal_message = Some(error);
+                break;
+            }
+            if self.paused.load(Ordering::SeqCst) {
+                let _ = self.latest.wait_take(Duration::from_millis(100));
+                continue;
+            }
+            let config = match self.config.lock() {
+                Ok(config) => config.clone(),
+                Err(_) => {
+                    terminal_message = Some("实时 ROI 锁已损坏".to_owned());
+                    break;
+                }
+            };
+            if configured_stability_wait_ms != Some(config.recognition_settings.stability_wait_ms) {
+                stability.set_settle_ms(config.recognition_settings.stability_wait_ms);
+                configured_stability_wait_ms = Some(config.recognition_settings.stability_wait_ms);
+            }
+
+            let trigger_active = platform::recognition_is_active(&config.recognition_settings);
+            let trigger_fired = if config.recognition_settings.mode
+                == LiveRecognitionMode::KeyTrigger
+            {
+                let fired = match config.recognition_settings.trigger_event {
+                    LiveRecognitionTrigger::Press => trigger_active && !previous_trigger_active,
+                    LiveRecognitionTrigger::Release => !trigger_active && previous_trigger_active,
+                };
+                previous_trigger_active = trigger_active;
+                fired
+            } else {
+                previous_trigger_active = false;
+                false
+            };
+            if config.recognition_settings.mode == LiveRecognitionMode::KeyTrigger && trigger_fired
+            {
+                trigger_pending = true;
+            }
+            if config.recognition_settings.mode == LiveRecognitionMode::KeyTrigger
+                && !trigger_pending
+            {
+                stability.reset();
+                confirmation.reset();
+                last_frame = None;
+                if !waiting_for_trigger {
+                    waiting_for_trigger = true;
+                    let instruction = match config.recognition_settings.trigger_event {
+                        LiveRecognitionTrigger::Press => {
+                            "已暂停识别，请按下已配置的触发键执行一次 OCR。".to_owned()
+                        }
+                        LiveRecognitionTrigger::Release => {
+                            "已暂停识别，请按下并松开已配置的触发键执行一次 OCR。".to_owned()
+                        }
+                    };
+                    let _ = update_status(&self.status, &self.app, |status| {
+                        status.state = LiveSessionState::Running;
+                        status.message = instruction;
+                        status.metrics = self.metrics_snapshot();
+                    });
+                }
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            if waiting_for_trigger {
+                waiting_for_trigger = false;
+                let _ = update_status(&self.status, &self.app, |status| {
+                    status.state = LiveSessionState::Running;
+                    status.message = "检测到触发键，等待字幕稳定后执行一次 OCR。".to_owned();
+                    status.metrics = self.metrics_snapshot();
+                });
+            }
+            if last_geometry_sync.elapsed() >= Duration::from_millis(500) {
+                match platform::target_geometry(&self.target_id) {
+                    Ok(geometry) => position_overlay(&self.app, geometry, config.overlay_settings),
+                    Err(error) => {
+                        terminal_message = Some(error.message().to_owned());
+                        break;
+                    }
+                }
+                last_geometry_sync = Instant::now();
+            }
+            if config.roi_version != roi_version {
+                roi_version = config.roi_version;
+                stability.reset();
+                confirmation.reset();
+                cache.clear();
+                last_frame = None;
+            }
+            let received = self.latest.wait_take(Duration::from_millis(100));
+            let now_ms = epoch_millis();
+            let triggered_probe = config.recognition_settings.mode
+                == LiveRecognitionMode::KeyTrigger
+                && trigger_pending;
+            let should_probe = if let Some(frame) = received {
+                if frame.roi_version != roi_version {
+                    false
+                } else {
+                    let probe = stability.observe(&frame, now_ms);
+                    last_frame = Some(frame);
+                    probe
+                }
+            } else {
+                stability.tick(now_ms)
+            };
+            if !should_probe {
+                continue;
+            }
+            if triggered_probe {
+                trigger_pending = false;
+            }
+            let Some(frame) = last_frame.as_ref() else {
+                continue;
+            };
+            let frame_version = frame.roi_version;
+            let observed_at_epoch_ms = frame.observed_at_epoch_ms;
+            let ocr_started = Instant::now();
+            let mut recognized = match self.recognize(frame, &config.target_language) {
+                Ok(result) => result,
+                Err(error) if error.code() == BackendFailureCode::Cancelled => break,
+                Err(error) => {
+                    debug_sequence = debug_sequence.saturating_add(1);
+                    self.emit_debug_record(LiveDebugRecord {
+                        session_id: self.session_id.clone(),
+                        sequence: debug_sequence,
+                        stage: LiveDebugStage::Ocr,
+                        outcome: LiveDebugOutcome::Failed,
+                        source_text: String::new(),
+                        translated_text: None,
+                        target_language: config.target_language.clone(),
+                        region_count: 0,
+                        roi_version: frame_version,
+                        duration_ms: elapsed_millis(ocr_started.elapsed()),
+                        cache_hit: false,
+                        message: Some(error.message().to_owned()),
+                        observed_at_epoch_ms,
+                    });
+                    terminal_message = Some(error.message().to_owned());
+                    break;
+                }
+            };
+            let ocr_ms = elapsed_millis(ocr_started.elapsed());
+            self.update_metrics(|metrics| {
+                metrics.ocr_runs = metrics.ocr_runs.saturating_add(1);
+                metrics.last_ocr_ms = ocr_ms;
+            });
+            self.backend.touch_activity();
+            if !self.roi_is_current(frame_version) {
+                continue;
+            }
+            let _ = update_status(&self.status, &self.app, |status| {
+                if status.state == LiveSessionState::Warming {
+                    status.state = LiveSessionState::Running;
+                    status.message = "实时翻译正在运行。".to_owned();
+                }
+                status.metrics = self.metrics_snapshot();
+            });
+            let confirmed_text = if triggered_probe {
+                Some(recognized.source_text.clone())
+            } else {
+                confirmation.observe(recognized.source_text.clone())
+            };
+            debug_sequence = debug_sequence.saturating_add(1);
+            self.emit_debug_record(LiveDebugRecord {
+                session_id: self.session_id.clone(),
+                sequence: debug_sequence,
+                stage: LiveDebugStage::Ocr,
+                outcome: if confirmed_text.is_some() {
+                    LiveDebugOutcome::Confirmed
+                } else {
+                    LiveDebugOutcome::AwaitingConfirmation
+                },
+                source_text: debug_text(&recognized.source_text),
+                translated_text: None,
+                target_language: config.target_language.clone(),
+                region_count: recognized.region_count,
+                roi_version: frame_version,
+                duration_ms: ocr_ms,
+                cache_hit: false,
+                message: None,
+                observed_at_epoch_ms,
+            });
+            let Some(confirmed_text) = confirmed_text else {
+                continue;
+            };
+            let (translated_text, translation_ms, cache_hit, outcome) = match config
+                .overlay_settings
+                .mode
+            {
+                LiveOverlayMode::Subtitle => {
+                    let cache_key = format!("{}\0{}", config.target_language, confirmed_text);
+                    if confirmed_text.is_empty() || recognized.regions.is_empty() {
+                        (
+                            String::new(),
+                            0,
+                            false,
+                            LiveDebugOutcome::SkippedEmptySource,
+                        )
+                    } else if let Some(cached) = cache.get(&cache_key) {
+                        self.update_metrics(|metrics| {
+                            metrics.cache_hits = metrics.cache_hits.saturating_add(1);
+                        });
+                        (cached, 0, true, LiveDebugOutcome::CacheHit)
+                    } else {
+                        let translation_started = Instant::now();
+                        let translated = match self
+                            .translate_regions(&mut recognized.regions, &config.target_language)
+                        {
+                            Ok(()) => normalized_translated_region_text(&recognized.regions),
+                            Err(error) if error.code() == BackendFailureCode::Cancelled => {
+                                break;
+                            }
+                            Err(error) => {
+                                debug_sequence = debug_sequence.saturating_add(1);
+                                self.emit_debug_record(LiveDebugRecord {
+                                    session_id: self.session_id.clone(),
+                                    sequence: debug_sequence,
+                                    stage: LiveDebugStage::Translation,
+                                    outcome: LiveDebugOutcome::Failed,
+                                    source_text: debug_text(&confirmed_text),
+                                    translated_text: None,
+                                    target_language: config.target_language.clone(),
+                                    region_count: recognized.region_count,
+                                    roi_version: frame_version,
+                                    duration_ms: elapsed_millis(translation_started.elapsed()),
+                                    cache_hit: false,
+                                    message: Some(error.message().to_owned()),
+                                    observed_at_epoch_ms,
+                                });
+                                terminal_message = Some(error.message().to_owned());
+                                break;
+                            }
+                        };
+                        let translation_ms = elapsed_millis(translation_started.elapsed());
+                        self.update_metrics(|metrics| {
+                            metrics.translation_runs = metrics.translation_runs.saturating_add(1);
+                            metrics.last_translation_ms = translation_ms;
+                        });
+                        cache.insert(cache_key, translated.clone());
+                        (
+                            translated,
+                            translation_ms,
+                            false,
+                            LiveDebugOutcome::Completed,
+                        )
+                    }
+                }
+                LiveOverlayMode::RegionReplace => {
+                    if recognized.regions.is_empty() {
+                        (
+                            String::new(),
+                            0,
+                            false,
+                            LiveDebugOutcome::SkippedEmptySource,
+                        )
+                    } else {
+                        let translation_started = Instant::now();
+                        match self
+                            .translate_regions(&mut recognized.regions, &config.target_language)
+                        {
+                            Ok(()) => {}
+                            Err(error) if error.code() == BackendFailureCode::Cancelled => {
+                                break;
+                            }
+                            Err(error) => {
+                                debug_sequence = debug_sequence.saturating_add(1);
+                                self.emit_debug_record(LiveDebugRecord {
+                                    session_id: self.session_id.clone(),
+                                    sequence: debug_sequence,
+                                    stage: LiveDebugStage::Translation,
+                                    outcome: LiveDebugOutcome::Failed,
+                                    source_text: debug_text(&confirmed_text),
+                                    translated_text: None,
+                                    target_language: config.target_language.clone(),
+                                    region_count: recognized.region_count,
+                                    roi_version: frame_version,
+                                    duration_ms: elapsed_millis(translation_started.elapsed()),
+                                    cache_hit: false,
+                                    message: Some(error.message().to_owned()),
+                                    observed_at_epoch_ms,
+                                });
+                                terminal_message = Some(error.message().to_owned());
+                                break;
+                            }
+                        }
+                        let translation_ms = elapsed_millis(translation_started.elapsed());
+                        self.update_metrics(|metrics| {
+                            metrics.translation_runs = metrics.translation_runs.saturating_add(1);
+                            metrics.last_translation_ms = translation_ms;
+                        });
+                        (
+                            normalized_translated_region_text(&recognized.regions),
+                            translation_ms,
+                            false,
+                            LiveDebugOutcome::Completed,
+                        )
+                    }
+                }
+            };
+            debug_sequence = debug_sequence.saturating_add(1);
+            self.emit_debug_record(LiveDebugRecord {
+                session_id: self.session_id.clone(),
+                sequence: debug_sequence,
+                stage: LiveDebugStage::Translation,
+                outcome,
+                source_text: debug_text(&confirmed_text),
+                translated_text: Some(debug_text(&translated_text)),
+                target_language: config.target_language.clone(),
+                region_count: recognized.region_count,
+                roi_version: frame_version,
+                duration_ms: translation_ms,
+                cache_hit,
+                message: None,
+                observed_at_epoch_ms,
+            });
+            if !self.roi_is_current(frame_version) {
+                continue;
+            }
+            stability.mark_confirmed();
+            let revision = self
+                .status
+                .lock()
+                .map(|status| status.latest_revision.saturating_add(1))
+                .unwrap_or(1);
+            self.update_metrics(|metrics| {
+                metrics.subtitle_publishes = metrics.subtitle_publishes.saturating_add(1);
+            });
+            let _ = self.app.emit(
+                SUBTITLE_EVENT,
+                LiveSubtitle {
+                    session_id: self.session_id.clone(),
+                    revision,
+                    source_text: confirmed_text,
+                    translated_text,
+                    roi: frame.roi,
+                    regions: if config.overlay_settings.mode == LiveOverlayMode::RegionReplace {
+                        recognized
+                            .regions
+                            .iter()
+                            .map(|region| LiveSubtitleRegion {
+                                quad: region.quad_points,
+                                source_text: region.source_text.clone(),
+                                translated_text: region.translated_text.clone(),
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                    observed_at_epoch_ms: frame.observed_at_epoch_ms,
+                },
+            );
+            let _ = update_status(&self.status, &self.app, |status| {
+                status.state = LiveSessionState::Running;
+                status.latest_revision = revision;
+                status.metrics = self.metrics_snapshot();
+                status.message = format!("字幕已更新，OCR {ocr_ms} ms。");
+            });
+        }
+        self.finish(Some(capture), terminal_message);
+    }
+
+    fn finish(&self, capture: Option<platform::CaptureWorker>, terminal_message: Option<String>) {
+        let final_metrics = self.metrics_snapshot();
+        if let Some(capture) = capture {
+            let _ = capture.stop();
+        }
+        close_window(&self.app, SELECTOR_LABEL);
+        close_window(&self.app, OVERLAY_LABEL);
+        self.backend.live_active.store(false, Ordering::SeqCst);
+        if !self.stop.load(Ordering::SeqCst) {
+            let message = terminal_message.unwrap_or_else(|| "窗口捕获意外停止。".to_owned());
+            let _ = update_status(&self.status, &self.app, |status| {
+                status.state = LiveSessionState::Error;
+                status.message = message;
+                status.metrics = final_metrics;
+            });
+        }
+    }
+
+    fn roi_is_current(&self, version: u64) -> bool {
+        self.config
+            .lock()
+            .map(|config| roi_result_is_current(version, config.roi_version))
+            .unwrap_or(false)
+    }
+
+    fn metrics_snapshot(&self) -> LiveMetrics {
+        self.metrics
+            .lock()
+            .map(|metrics| metrics.clone())
+            .unwrap_or_default()
+    }
+
+    fn update_metrics(&self, update: impl FnOnce(&mut LiveMetrics)) {
+        if let Ok(mut metrics) = self.metrics.lock() {
+            update(&mut metrics);
+        }
+    }
+
+    fn emit_debug_record(&self, record: LiveDebugRecord) {
+        let _ = self.app.emit(DEBUG_RECORD_EVENT, record);
+    }
+
+    fn recognize(
+        &self,
+        frame: &OwnedFrame,
+        target_language: &str,
+    ) -> Result<RecognizedFrame, BackendFailure> {
+        self.cancellation.check()?;
+        let image = RgbImage::from_raw(frame.width, frame.height, frame.rgb.clone())
+            .ok_or_else(|| BackendFailure::internal("实时捕获帧缓冲区无效"))?;
+        let decoded = DecodedImage::from_rgb_image(image, "live-frame", target_language);
+        let settings = self
+            .backend
+            .settings
+            .lock()
+            .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
+            .clone()
+            .map_err(BackendFailure::arguments)?;
+        let mut engine = self
+            .backend
+            .engine
+            .lock()
+            .map_err(|_| BackendFailure::internal("模型引擎锁已损坏"))?;
+        if engine.is_none() {
+            *engine = Some(BackendEngine::new(settings)?);
+        }
+        let engine = engine
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
+        let regions = engine.recognize_regions(&decoded, &self.cancellation)?;
+        let region_count = u32::try_from(regions.len()).unwrap_or(u32::MAX);
+        let source_text = normalized_region_text(&regions);
+        let states = engine.model_states();
+        self.backend.set_model_states(states.0, states.1);
+        Ok(RecognizedFrame {
+            source_text,
+            region_count,
+            regions,
+        })
+    }
+
+    fn translate(&self, source: &str, target_language: &str) -> Result<String, BackendFailure> {
+        self.cancellation.check()?;
+        let settings = self
+            .backend
+            .settings
+            .lock()
+            .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
+            .clone()
+            .map_err(BackendFailure::arguments)?;
+        let mut engine = self
+            .backend
+            .engine
+            .lock()
+            .map_err(|_| BackendFailure::internal("模型引擎锁已损坏"))?;
+        if engine.is_none() {
+            *engine = Some(BackendEngine::new(settings)?);
+        }
+        let engine = engine
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
+        let result = engine.translate_text(source, target_language, &self.cancellation, |_, _| {});
+        let states = engine.model_states();
+        self.backend.set_model_states(states.0, states.1);
+        self.backend.touch_activity();
+        result.map(|text| normalize_text(&text))
+    }
+
+    fn translate_regions(
+        &self,
+        regions: &mut [RegionRecord],
+        target_language: &str,
+    ) -> Result<(), BackendFailure> {
+        self.cancellation.check()?;
+        let settings = self
+            .backend
+            .settings
+            .lock()
+            .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
+            .clone()
+            .map_err(BackendFailure::arguments)?;
+        let mut engine = self
+            .backend
+            .engine
+            .lock()
+            .map_err(|_| BackendFailure::internal("模型引擎锁已损坏"))?;
+        if engine.is_none() {
+            *engine = Some(BackendEngine::new(settings)?);
+        }
+        let engine = engine
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
+        let result = engine.translate_regions(regions, target_language, &self.cancellation);
+        let states = engine.model_states();
+        self.backend.set_model_states(states.0, states.1);
+        self.backend.touch_activity();
+        result
+    }
+}
+
+fn await_capture_start_result<T>(
+    stop: &AtomicBool,
+    receiver: &mpsc::Receiver<Result<T, BackendFailure>>,
+) -> Result<Option<T>, BackendFailure> {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => return result.map(Some),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(BackendFailure::internal(
+                    "Windows Graphics Capture 启动线程意外退出",
+                ));
+            }
+        }
+    }
+}
+
+fn target_by_id(target_id: &str) -> Result<CaptureWindowInfo, BackendFailure> {
+    platform::list_target_windows()?
+        .into_iter()
+        .find(|target| target.id == target_id)
+        .ok_or_else(|| BackendFailure::arguments("目标窗口已关闭或不再可捕获"))
+}
+
+fn require_session(status: &LiveSessionStatus, session_id: &str) -> Result<(), BackendFailure> {
+    if status.session_id.as_deref() != Some(session_id) {
+        return Err(BackendFailure::arguments("实时会话标识已过期"));
+    }
+    Ok(())
+}
+
+fn replace_status(
+    shared: &Arc<Mutex<LiveSessionStatus>>,
+    app: &tauri::AppHandle,
+    status: LiveSessionStatus,
+) {
+    if let Ok(mut current) = shared.lock() {
+        *current = status.clone();
+    }
+    let _ = app.emit(STATUS_EVENT, status);
+}
+
+fn update_status(
+    shared: &Arc<Mutex<LiveSessionStatus>>,
+    app: &tauri::AppHandle,
+    update: impl FnOnce(&mut LiveSessionStatus),
+) -> Result<LiveSessionStatus, BackendFailure> {
+    let snapshot = {
+        let mut status = shared
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时会话状态锁已损坏"))?;
+        update(&mut status);
+        status.clone()
+    };
+    let _ = app.emit(STATUS_EVENT, snapshot.clone());
+    Ok(snapshot)
+}
+
+fn elapsed_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn overlay_bounds(
+    geometry: platform::TargetGeometry,
+    settings: LiveOverlaySettings,
+) -> (i32, i32, u32, u32) {
+    if settings.mode == LiveOverlayMode::RegionReplace {
+        return (geometry.x, geometry.y, geometry.width, geometry.height);
+    }
+    let offset = i32::try_from(settings.offset).unwrap_or(i32::MAX);
+    match settings.attachment {
+        LiveOverlayAttachment::Top => {
+            let height = OVERLAY_EDGE_THICKNESS.min(geometry.height);
+            (
+                geometry.x,
+                geometry
+                    .y
+                    .saturating_sub(i32::try_from(height).unwrap_or(i32::MAX))
+                    .saturating_sub(offset),
+                geometry.width,
+                height,
+            )
+        }
+        LiveOverlayAttachment::Bottom => {
+            let height = OVERLAY_EDGE_THICKNESS.min(geometry.height);
+            (
+                geometry.x,
+                geometry
+                    .y
+                    .saturating_add(i32::try_from(geometry.height).unwrap_or(i32::MAX))
+                    .saturating_add(offset),
+                geometry.width,
+                height,
+            )
+        }
+        LiveOverlayAttachment::Left => {
+            let width = OVERLAY_EDGE_THICKNESS.min(geometry.width);
+            (
+                geometry
+                    .x
+                    .saturating_sub(i32::try_from(width).unwrap_or(i32::MAX))
+                    .saturating_sub(offset),
+                geometry.y,
+                width,
+                geometry.height,
+            )
+        }
+        LiveOverlayAttachment::Right => {
+            let width = OVERLAY_EDGE_THICKNESS.min(geometry.width);
+            (
+                geometry
+                    .x
+                    .saturating_add(i32::try_from(geometry.width).unwrap_or(i32::MAX))
+                    .saturating_add(offset),
+                geometry.y,
+                width,
+                geometry.height,
+            )
+        }
+    }
+}
+
+fn create_overlay_window(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    geometry: platform::TargetGeometry,
+    settings: LiveOverlaySettings,
+) -> Result<(), BackendFailure> {
+    let app = app.clone();
+    let window_app = app.clone();
+    let session_id = session_id.to_owned();
+    run_window_operation_on_main_thread(app, move || {
+        close_window_now(&window_app, OVERLAY_LABEL);
+        let (x, y, width, height) = overlay_bounds(geometry, settings);
+        let source_visibility = if settings.show_source { "1" } else { "0" };
+        let url = WebviewUrl::App(
+            format!(
+                "index.html?liveSessionId={session_id}&liveOverlayMode={}&showSource={source_visibility}",
+                settings.mode_query_value(),
+            )
+            .into(),
+        );
+        let window = WebviewWindowBuilder::new(&window_app, OVERLAY_LABEL, url)
+            .title("smodeltrans 实时字幕")
+            .decorations(false)
+            .transparent(true)
+            .shadow(false)
+            .always_on_top(true)
+            .focusable(false)
+            .skip_taskbar(true)
+            .resizable(false)
+            // Bounds are applied as physical pixels below. Logical builder
+            // bounds are incorrect on a display whose scale factor is not 1.
+            .visible(false)
+            .build()
+            .map_err(|error| BackendFailure::internal(format!("创建实时字幕窗口失败: {error}")))?;
+        window
+            .set_position(PhysicalPosition::new(x, y))
+            .map_err(|error| {
+                BackendFailure::internal(format!("设置实时字幕窗口位置失败: {error}"))
+            })?;
+        window
+            .set_size(PhysicalSize::new(width, height))
+            .map_err(|error| {
+                BackendFailure::internal(format!("设置实时字幕窗口尺寸失败: {error}"))
+            })?;
+        window
+            .set_ignore_cursor_events(true)
+            .map_err(|error| BackendFailure::internal(format!("启用字幕鼠标穿透失败: {error}")))?;
+        window
+            .show()
+            .map_err(|error| BackendFailure::internal(format!("显示实时字幕窗口失败: {error}")))?;
+        Ok(())
+    })
+}
+
+fn set_selector_window_bounds(
+    window: &tauri::WebviewWindow,
+    geometry: platform::TargetGeometry,
+) -> Result<(), BackendFailure> {
+    window
+        .set_position(PhysicalPosition::new(geometry.x, geometry.y))
+        .map_err(|error| {
+            BackendFailure::internal(format!("设置字幕区域选择器位置失败: {error}"))
+        })?;
+    window
+        .set_size(PhysicalSize::new(geometry.width, geometry.height))
+        .map_err(|error| {
+            BackendFailure::internal(format!("设置字幕区域选择器尺寸失败: {error}"))
+        })?;
+    Ok(())
+}
+
+fn create_selector_window(
+    app: &tauri::AppHandle,
+    geometry: platform::TargetGeometry,
+) -> Result<(), BackendFailure> {
+    trace_live(format_args!(
+        "selector window dispatch requested bounds={}x{}+{},{}",
+        geometry.width, geometry.height, geometry.x, geometry.y
+    ));
+    let app = app.clone();
+    let window_app = app.clone();
+    run_window_operation_on_main_thread(app, move || {
+        trace_live(format_args!(
+            "selector window operation entered Tauri main thread"
+        ));
+        close_window_now(&window_app, SELECTOR_LABEL);
+        trace_live(format_args!("selector window builder started"));
+        let window = WebviewWindowBuilder::new(
+            &window_app,
+            SELECTOR_LABEL,
+            WebviewUrl::App("index.html".into()),
+        )
+        .title("选择实时字幕区域")
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        // Apply physical client bounds before showing the selector.
+        .visible(false)
+        .build()
+        .map_err(|error| {
+            trace_live(format_args!("selector window build failed: {error}"));
+            BackendFailure::internal(format!("创建字幕区域选择器失败: {error}"))
+        })?;
+        set_selector_window_bounds(&window, geometry)?;
+        trace_live(format_args!("selector native window created"));
+        window.show().map_err(|error| {
+            BackendFailure::internal(format!("显示字幕区域选择器失败: {error}"))
+        })?;
+        let _ = window.set_focus();
+        trace_live(format_args!("selector window ready"));
+        Ok(())
+    })
+}
+
+fn position_overlay(
+    app: &tauri::AppHandle,
+    geometry: platform::TargetGeometry,
+    settings: LiveOverlaySettings,
+) {
+    let app = app.clone();
+    let window_app = app.clone();
+    let _ = run_window_operation_on_main_thread(app, move || {
+        let Some(window) = window_app.get_webview_window(OVERLAY_LABEL) else {
+            return Ok(());
+        };
+        let (x, y, width, height) = overlay_bounds(geometry, settings);
+        let _ = window.set_position(PhysicalPosition::new(x, y));
+        let _ = window.set_size(PhysicalSize::new(width, height));
+        Ok(())
+    });
+}
+
+fn close_window(app: &tauri::AppHandle, label: &str) {
+    let app = app.clone();
+    let label = label.to_owned();
+    let _ = run_window_operation_on_main_thread(app.clone(), move || {
+        close_window_now(&app, &label);
+        Ok(())
+    });
+}
+
+fn close_window_now(app: &tauri::AppHandle, label: &str) {
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.close();
+    }
+}
+
+fn run_window_operation_on_main_thread<F>(
+    app: tauri::AppHandle,
+    operation: F,
+) -> Result<(), BackendFailure>
+where
+    F: FnOnce() -> Result<(), BackendFailure> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        let _ = sender.send(operation());
+    })
+    .map_err(|error| BackendFailure::internal(format!("调度实时窗口操作失败: {error}")))?;
+    receiver
+        .recv()
+        .map_err(|error| BackendFailure::internal(format!("实时窗口主线程操作意外退出: {error}")))?
+}
+
+async fn run_live_operation<T, F>(operation: F) -> Result<T, BackendError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, BackendFailure> + Send + 'static,
+{
+    let result = tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|error| {
+            BackendFailure::internal(format!("实时会话命令工作线程意外退出: {error}"))
+        });
+    result.and_then(|result| result).map_err(BackendError::from)
+}
+
+#[tauri::command]
+pub(crate) async fn begin_live_selection(
+    app: tauri::AppHandle,
+    target_id: String,
+    target_language: String,
+    overlay_settings: LiveOverlaySettings,
+    recognition_settings: LiveRecognitionSettings,
+    manager: State<'_, LiveSessionManager>,
+) -> Result<LiveSessionStatus, BackendError> {
+    trace_live(format_args!(
+        "begin_live_selection received target={target_id} language={target_language}"
+    ));
+    let manager = manager.inner().clone();
+    run_live_operation(move || {
+        manager.begin_selection(
+            &app,
+            target_id,
+            target_language,
+            overlay_settings,
+            recognition_settings,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn confirm_live_selection(
+    app: tauri::AppHandle,
+    session_id: String,
+    roi: LiveRoi,
+    manager: State<'_, LiveSessionManager>,
+) -> Result<LiveSessionStatus, BackendError> {
+    let manager = manager.inner().clone();
+    run_live_operation(move || manager.confirm_selection(&app, &session_id, roi)).await
+}
+
+#[tauri::command]
+pub(crate) async fn begin_live_roi_update(
+    app: tauri::AppHandle,
+    session_id: String,
+    manager: State<'_, LiveSessionManager>,
+) -> Result<LiveSessionStatus, BackendError> {
+    let manager = manager.inner().clone();
+    run_live_operation(move || manager.begin_roi_update(&app, &session_id)).await
+}
+
+#[tauri::command]
+pub(crate) async fn cancel_live_selection(
+    app: tauri::AppHandle,
+    session_id: String,
+    manager: State<'_, LiveSessionManager>,
+) -> Result<LiveSessionStatus, BackendError> {
+    let manager = manager.inner().clone();
+    run_live_operation(move || manager.cancel_selection(&app, &session_id)).await
+}
+
+#[tauri::command]
+pub(crate) async fn pause_live_session(
+    app: tauri::AppHandle,
+    session_id: String,
+    manager: State<'_, LiveSessionManager>,
+) -> Result<LiveSessionStatus, BackendError> {
+    let manager = manager.inner().clone();
+    run_live_operation(move || manager.set_paused(&app, &session_id, true)).await
+}
+
+#[tauri::command]
+pub(crate) async fn resume_live_session(
+    app: tauri::AppHandle,
+    session_id: String,
+    manager: State<'_, LiveSessionManager>,
+) -> Result<LiveSessionStatus, BackendError> {
+    let manager = manager.inner().clone();
+    run_live_operation(move || manager.set_paused(&app, &session_id, false)).await
+}
+
+#[tauri::command]
+pub(crate) async fn stop_live_session(
+    app: tauri::AppHandle,
+    session_id: Option<String>,
+    manager: State<'_, LiveSessionManager>,
+) -> Result<LiveSessionStatus, BackendError> {
+    let manager = manager.inner().clone();
+    run_live_operation(move || manager.stop(&app, session_id.as_deref())).await
+}
+
+#[tauri::command]
+pub(crate) fn list_capture_windows() -> Result<Vec<CaptureWindowInfo>, BackendError> {
+    platform::list_target_windows().map_err(Into::into)
+}
+
+#[tauri::command]
+pub(crate) fn get_live_session_status(
+    manager: State<'_, LiveSessionManager>,
+) -> Result<LiveSessionStatus, BackendError> {
+    manager.collect_finished()?;
+    manager.current_status().map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        await_capture_start_result,
+        contracts::{LiveOverlayAttachment, LiveOverlayMode, LiveOverlaySettings},
+        overlay_bounds,
+        platform::TargetGeometry,
+    };
+    use std::sync::{atomic::AtomicBool, mpsc};
+
+    #[test]
+    fn capture_start_wait_returns_the_worker_result() {
+        let stop = AtomicBool::new(false);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(Ok("capture-ready"))
+            .expect("send startup result");
+
+        let result = await_capture_start_result(&stop, &receiver)
+            .expect("receive startup result")
+            .expect("capture worker result");
+
+        assert_eq!(result, "capture-ready");
+    }
+
+    #[test]
+    fn capture_start_wait_exits_when_the_session_stops() {
+        let stop = AtomicBool::new(true);
+        let (_sender, receiver) = mpsc::sync_channel::<Result<(), super::BackendFailure>>(1);
+
+        assert!(
+            await_capture_start_result(&stop, &receiver)
+                .expect("stopped session is not a capture error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn overlay_bounds_attach_subtitle_to_each_requested_edge() {
+        let geometry = TargetGeometry {
+            x: 100,
+            y: 200,
+            width: 800,
+            height: 600,
+        };
+        let settings = LiveOverlaySettings {
+            offset: 25,
+            ..LiveOverlaySettings::default()
+        };
+
+        assert_eq!(overlay_bounds(geometry, settings), (100, 825, 800, 168));
+        assert_eq!(
+            overlay_bounds(
+                geometry,
+                LiveOverlaySettings {
+                    attachment: LiveOverlayAttachment::Top,
+                    ..settings
+                },
+            ),
+            (100, 7, 800, 168),
+        );
+        assert_eq!(
+            overlay_bounds(
+                geometry,
+                LiveOverlaySettings {
+                    attachment: LiveOverlayAttachment::Left,
+                    ..settings
+                },
+            ),
+            (-93, 200, 168, 600),
+        );
+        assert_eq!(
+            overlay_bounds(
+                geometry,
+                LiveOverlaySettings {
+                    attachment: LiveOverlayAttachment::Right,
+                    ..settings
+                },
+            ),
+            (925, 200, 168, 600),
+        );
+    }
+
+    #[test]
+    fn region_replace_overlay_matches_the_target_client_area() {
+        let geometry = TargetGeometry {
+            x: 100,
+            y: 200,
+            width: 800,
+            height: 600,
+        };
+        let settings = LiveOverlaySettings {
+            mode: LiveOverlayMode::RegionReplace,
+            attachment: LiveOverlayAttachment::Left,
+            offset: 2_048,
+            show_source: false,
+        };
+
+        assert_eq!(overlay_bounds(geometry, settings), (100, 200, 800, 600));
+    }
+}

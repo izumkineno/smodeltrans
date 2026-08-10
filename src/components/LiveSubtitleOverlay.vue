@@ -1,0 +1,213 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import {
+  getLiveSessionStatus,
+  listenLiveStatus,
+  listenLiveSubtitle,
+  resolveLiveSubtitleRegionStyle,
+  shouldApplyLiveSubtitle,
+} from "../services/live-translation-provider";
+import type {
+  LiveSessionState,
+  LiveSubtitle,
+  LiveSubtitleRegion,
+} from "../services/live-translation-provider";
+
+const query = new URLSearchParams(window.location.search);
+const sessionId = query.get("liveSessionId") ?? undefined;
+const isRegionReplace = query.get("liveOverlayMode") === "region_replace";
+const showSource = query.get("showSource") !== "0";
+const subtitle = ref<LiveSubtitle>();
+const state = ref<LiveSessionState>("warming");
+let lastRevision = -1;
+let listenersActive = true;
+const unlisteners: UnlistenFn[] = [];
+
+const visible = computed(
+  () =>
+    state.value === "warming" ||
+    (isRegionReplace
+      ? (subtitle.value?.regions.length ?? 0) > 0
+      : !!subtitle.value?.translatedText.trim()),
+);
+
+function applySubtitle(next: LiveSubtitle): void {
+  if (!shouldApplyLiveSubtitle(next, sessionId, lastRevision)) {
+    return;
+  }
+  lastRevision = next.revision;
+  subtitle.value = next.translatedText.trim() || next.sourceText.trim() ? next : undefined;
+}
+
+function regionStyle(region: LiveSubtitleRegion): Record<string, string> {
+  const roi = subtitle.value?.roi;
+  return roi ? resolveLiveSubtitleRegionStyle(region, roi) : {};
+}
+
+async function initialize(): Promise<void> {
+  const registered = await Promise.all([
+    listenLiveSubtitle(applySubtitle),
+    listenLiveStatus((status) => {
+      if (!sessionId || status.sessionId === sessionId || status.state === "idle") {
+        state.value = status.state;
+      }
+    }),
+  ]);
+  if (!listenersActive) {
+    registered.forEach((unlisten) => unlisten());
+    return;
+  }
+  unlisteners.push(...registered);
+  const status = await getLiveSessionStatus();
+  if (!sessionId || status.sessionId === sessionId || status.state === "idle") {
+    state.value = status.state;
+  }
+}
+
+onMounted(() => {
+  void initialize().catch(() => {
+    state.value = "error";
+  });
+});
+
+onBeforeUnmount(() => {
+  listenersActive = false;
+  unlisteners.splice(0).forEach((unlisten) => unlisten());
+});
+</script>
+
+<template>
+  <main
+    class="subtitle-overlay"
+    :class="{ 'subtitle-overlay-region-replace': isRegionReplace }"
+    aria-live="polite"
+    aria-atomic="true"
+  >
+    <div v-if="visible && state === 'warming'" class="subtitle-panel subtitle-panel-warming">
+      <p class="translated-text">正在连接窗口捕获…</p>
+    </div>
+    <div v-else-if="visible && isRegionReplace" class="region-replace-layer">
+      <article
+        v-for="region in subtitle?.regions ?? []"
+        :key="`${region.quad[0][0]}-${region.quad[0][1]}-${region.sourceText}`"
+        class="region-replace-item"
+        :style="regionStyle(region)"
+      >
+        <p v-if="showSource" class="region-source-text">{{ region.sourceText }}</p>
+        <p class="region-translated-text">{{ region.translatedText }}</p>
+      </article>
+    </div>
+    <div v-else-if="visible" class="subtitle-panel">
+      <p class="translated-text">{{ subtitle?.translatedText }}</p>
+      <p v-if="showSource && subtitle?.sourceText" class="source-text">{{ subtitle.sourceText }}</p>
+    </div>
+  </main>
+</template>
+
+<style>
+:root,
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent !important;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.subtitle-overlay {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 12px clamp(18px, 4vw, 72px) 18px;
+  pointer-events: none;
+  user-select: none;
+}
+
+.subtitle-overlay-region-replace {
+  display: block;
+  padding: 0;
+}
+
+.subtitle-panel {
+  width: min(1100px, 100%);
+  padding: 11px 20px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  color: #ffffff;
+  background: rgba(6, 12, 24, 0.82);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.34);
+  text-align: center;
+  backdrop-filter: blur(10px);
+}
+
+.subtitle-panel-warming {
+  color: rgba(226, 232, 240, 0.9);
+  background: rgba(6, 12, 24, 0.7);
+}
+
+.translated-text,
+.source-text,
+.region-source-text,
+.region-translated-text {
+  margin: 0;
+  overflow-wrap: anywhere;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+
+.translated-text,
+.source-text {
+  white-space: pre-line;
+}
+
+.translated-text {
+  font: 600 clamp(18px, 2.2vw, 28px) / 1.35 "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+  letter-spacing: 0.01em;
+}
+
+.source-text {
+  margin-top: 5px;
+  color: rgba(226, 232, 240, 0.82);
+  font: 400 clamp(11px, 1.25vw, 15px) / 1.35 "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+}
+
+.region-replace-layer {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.region-replace-item {
+  position: absolute;
+  display: flex;
+  min-width: 1%;
+  min-height: 1%;
+  flex-direction: column;
+  justify-content: center;
+  overflow: hidden;
+  padding: 3px 5px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 3px;
+  color: #ffffff;
+  background: rgba(6, 12, 24, 0.82);
+  text-align: center;
+}
+
+.region-source-text {
+  margin-bottom: 2px;
+  color: rgba(226, 232, 240, 0.82);
+  font: 400 clamp(9px, 1vw, 13px) / 1.2 "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+}
+
+.region-translated-text {
+  font: 600 clamp(12px, 1.6vw, 24px) / 1.2 "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+}
+</style>

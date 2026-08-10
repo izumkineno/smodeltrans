@@ -13,8 +13,8 @@ pub type QuadI = [[i32; 2]; 4];
 pub type QuadF = [[f64; 2]; 4];
 
 const DETECTOR_LONGEST_SIDE: u32 = 960;
+const DETECTOR_STRIDE: u32 = 32;
 const EPSILON: f64 = 1e-9;
-
 /// The one application-owned detector resize and its inverse coordinate scales.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DetectorProfile {
@@ -23,7 +23,6 @@ pub struct DetectorProfile {
     pub detector_width: u32,
     pub detector_height: u32,
 }
-
 impl DetectorProfile {
     pub fn for_image(original_width: u32, original_height: u32) -> Result<Self> {
         ensure!(
@@ -31,28 +30,23 @@ impl DetectorProfile {
             "image dimensions must be positive"
         );
         let longest = original_width.max(original_height);
-        if longest <= DETECTOR_LONGEST_SIDE {
-            return Ok(Self {
-                original_width,
-                original_height,
-                detector_width: original_width,
-                detector_height: original_height,
-            });
-        }
-
-        // Integer half-up rounding is deterministic and never enlarges the
-        // shorter axis beyond the aspect-ratio-preserving result.
-        let scale_num = u64::from(DETECTOR_LONGEST_SIDE);
-        let scale_den = u64::from(longest);
-        let round = |value: u32| -> u32 {
-            (((u64::from(value) * scale_num) + scale_den / 2) / scale_den).max(1) as u32
+        let scale = if longest > DETECTOR_LONGEST_SIDE {
+            f64::from(DETECTOR_LONGEST_SIDE) / f64::from(longest)
+        } else {
+            1.0
         };
-        let detector_width = round(original_width);
-        let detector_height = round(original_height);
-        ensure!(
-            detector_width <= original_width && detector_height <= original_height,
-            "detector resize unexpectedly enlarged the source image"
-        );
+        // PPOCRV5ServerDetImageProcessor rounds each input axis to the nearest
+        // model stride before inference. Matching that geometry avoids an
+        // unsupported detector shape for short subtitle bands.
+        let scale_axis = |value: u32| (f64::from(value) * scale) as u32;
+        let round_to_stride = |value: u32| {
+            ((f64::from(value) / f64::from(DETECTOR_STRIDE))
+                .round_ties_even()
+                .max(1.0) as u32)
+                .saturating_mul(DETECTOR_STRIDE)
+        };
+        let detector_width = round_to_stride(scale_axis(original_width));
+        let detector_height = round_to_stride(scale_axis(original_height));
         Ok(Self {
             original_width,
             original_height,
@@ -494,15 +488,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detector_resize_never_enlarges() {
+    fn detector_resize_matches_transformers_stride_rounding() {
+        let subtitle_profile = DetectorProfile::for_image(400, 100).unwrap();
         assert_eq!(
-            DetectorProfile::for_image(640, 480).unwrap().detector_width,
-            640
+            (
+                subtitle_profile.detector_width,
+                subtitle_profile.detector_height
+            ),
+            (384, 96)
         );
-        let profile = DetectorProfile::for_image(1920, 1080).unwrap();
+        let scaled_profile = DetectorProfile::for_image(1920, 1080).unwrap();
         assert_eq!(
-            (profile.detector_width, profile.detector_height),
-            (960, 540)
+            (
+                scaled_profile.detector_width,
+                scaled_profile.detector_height
+            ),
+            (960, 544)
         );
     }
 

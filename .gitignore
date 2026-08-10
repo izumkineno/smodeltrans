@@ -25,3 +25,7 @@ dist-ssr
 
 # Local Candle model assets
 /models/
+
+.omc
+.omx
+tmp

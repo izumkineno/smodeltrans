@@ -14,7 +14,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -28,6 +31,7 @@ pub(crate) struct BackendState {
     pub(crate) runtime: Arc<Mutex<RuntimeMetrics>>,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) runs: RunRegistry,
+    pub(crate) live_active: Arc<AtomicBool>,
 }
 
 impl BackendState {
@@ -55,6 +59,7 @@ impl BackendState {
             runtime: Arc::new(Mutex::new(RuntimeMetrics::default())),
             config_path,
             runs: RunRegistry::default(),
+            live_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -63,9 +68,13 @@ impl BackendState {
         let engine = Arc::clone(&self.engine);
         let last_activity = Arc::clone(&self.last_activity);
         let runtime = Arc::clone(&self.runtime);
+        let live_active = Arc::clone(&self.live_active);
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(5));
+                if live_active.load(Ordering::SeqCst) {
+                    continue;
+                }
                 let idle_minutes = settings
                     .lock()
                     .ok()
@@ -113,13 +122,13 @@ impl BackendState {
         });
     }
 
-    fn touch_activity(&self) {
+    pub(crate) fn touch_activity(&self) {
         if let Ok(mut last_activity) = self.last_activity.lock() {
             *last_activity = Instant::now();
         }
     }
 
-    fn set_model_states(&self, ocr_loaded: bool, translator_loaded: bool) {
+    pub(crate) fn set_model_states(&self, ocr_loaded: bool, translator_loaded: bool) {
         if let Ok(mut runtime) = self.runtime.lock() {
             runtime.set_model_states(ocr_loaded, translator_loaded);
         }
@@ -143,7 +152,7 @@ impl BackendState {
             .lock()
             .map_err(|_| BackendFailure::internal("后端活动时间锁已损坏"))?
             .elapsed();
-        let busy = self.runs.is_busy()?;
+        let busy = self.runs.is_busy()? || self.live_active.load(Ordering::SeqCst);
         let runtime = self
             .runtime
             .lock()
@@ -398,6 +407,15 @@ fn record_request_result<T>(
     state.record_request(operation, started_at.elapsed(), success, message);
 }
 
+fn ensure_live_inactive(state: &BackendState) -> Result<(), BackendFailure> {
+    if state.live_active.load(Ordering::SeqCst) {
+        return Err(BackendFailure::arguments(
+            "实时翻译正在运行，请先停止实时会话",
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) fn get_backend_status(
     state: State<'_, BackendState>,
@@ -417,6 +435,7 @@ pub(crate) fn update_backend_settings(
     request: BackendSettingsUpdate,
     state: State<'_, BackendState>,
 ) -> Result<BackendStatus, BackendError> {
+    ensure_live_inactive(state.inner())?;
     let current = state
         .settings
         .lock()
@@ -469,6 +488,7 @@ pub(crate) async fn control_model(
     request: ModelControlRequest,
     state: State<'_, BackendState>,
 ) -> Result<ModelRuntimeStatus, BackendError> {
+    ensure_live_inactive(state.inner())?;
     let target = ModelTarget::parse(request.model.trim())?;
     let action = ModelAction::parse(request.action.trim())?;
     let operation = format!("{} {}", action.label(), target.label());
@@ -555,6 +575,7 @@ pub(crate) async fn translate_image(
     request: TranslateImageRequest,
     state: State<'_, BackendState>,
 ) -> Result<TranslationResponse, BackendError> {
+    ensure_live_inactive(state.inner())?;
     let started_at = Instant::now();
     let run_id = RunId::from_optional(request.request_id.as_deref())?;
     let lease = state.runs.register(run_id.clone())?;
@@ -595,6 +616,7 @@ pub(crate) async fn translate_text(
     request: TranslateTextRequest,
     state: State<'_, BackendState>,
 ) -> Result<TextTranslationResponse, BackendError> {
+    ensure_live_inactive(state.inner())?;
     let started_at = Instant::now();
     let run_id = RunId::from_optional(request.request_id.as_deref())?;
     let lease = state.runs.register(run_id.clone())?;
@@ -636,6 +658,7 @@ pub(crate) async fn ocr_image(
     request: OcrImageRequest,
     state: State<'_, BackendState>,
 ) -> Result<OcrResponse, BackendError> {
+    ensure_live_inactive(state.inner())?;
     let started_at = Instant::now();
     let run_id = RunId::from_optional(request.request_id.as_deref())?;
     let lease = state.runs.register(run_id.clone())?;
