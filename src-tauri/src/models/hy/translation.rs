@@ -112,11 +112,32 @@ impl HyTranslator {
         generation: &GenerationConfig,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<String>, usize)> {
-        ensure!(!jobs.is_empty(), "translation batch must not be empty");
-        let prompt = apply_prompt_presets(
-            build_translation_batch_prompt(jobs, target_language)?,
+        self.translate_structured_batch_with_context(
+            jobs,
+            target_language,
             prompt,
-        );
+            generation,
+            cancellation,
+            false,
+        )
+    }
+
+    fn translate_structured_batch_with_context(
+        &mut self,
+        jobs: &[TranslationRegion],
+        target_language: &str,
+        prompt: &PromptConfig,
+        generation: &GenerationConfig,
+        cancellation: &CancellationToken,
+        contextual: bool,
+    ) -> Result<(Vec<String>, usize)> {
+        ensure!(!jobs.is_empty(), "translation batch must not be empty");
+        let batch_prompt = if contextual {
+            build_contextual_translation_batch_prompt(jobs, target_language)?
+        } else {
+            build_translation_batch_prompt(jobs, target_language)?
+        };
+        let prompt = apply_prompt_presets(batch_prompt, prompt);
         let mut output = String::new();
         let result = self.session.respond(
             &prompt,
@@ -171,14 +192,21 @@ impl HyTranslator {
         }
         Ok(translated_text)
     }
-}
-
-impl HyPort for HyTranslator {
-    fn translate(
+    pub(crate) fn translate_contextual(
         &mut self,
         regions: &[TranslationRegion],
         target_language: &str,
         cancellation: &CancellationToken,
+    ) -> std::result::Result<Vec<TranslatedRegion>, BackendFailure> {
+        self.translate_structured_regions(regions, target_language, cancellation, true)
+    }
+
+    fn translate_structured_regions(
+        &mut self,
+        regions: &[TranslationRegion],
+        target_language: &str,
+        cancellation: &CancellationToken,
+        contextual: bool,
     ) -> std::result::Result<Vec<TranslatedRegion>, BackendFailure> {
         cancellation.check()?;
         if regions.is_empty() {
@@ -191,13 +219,24 @@ impl HyPort for HyTranslator {
         }
         let generation = self.generation.clone();
         let prompt = self.prompt.clone();
-        let batch_result = self.translate_structured_batch(
-            regions,
-            target_language,
-            &prompt,
-            &generation,
-            cancellation,
-        );
+        let batch_result = if contextual {
+            self.translate_structured_batch_with_context(
+                regions,
+                target_language,
+                &prompt,
+                &generation,
+                cancellation,
+                true,
+            )
+        } else {
+            self.translate_structured_batch(
+                regions,
+                target_language,
+                &prompt,
+                &generation,
+                cancellation,
+            )
+        };
         let (mut texts, _) = match batch_result {
             Ok(result) => result,
             Err(_error) => {
@@ -252,6 +291,17 @@ impl HyPort for HyTranslator {
                 translated_text,
             })
             .collect())
+    }
+}
+
+impl HyPort for HyTranslator {
+    fn translate(
+        &mut self,
+        regions: &[TranslationRegion],
+        target_language: &str,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<Vec<TranslatedRegion>, BackendFailure> {
+        self.translate_structured_regions(regions, target_language, cancellation, false)
     }
 
     fn loaded(&self) -> bool {
@@ -404,6 +454,32 @@ fn build_translation_batch_prompt(
     ))
 }
 
+fn build_contextual_translation_batch_prompt(
+    jobs: &[TranslationRegion],
+    target_language: &str,
+) -> Result<String> {
+    ensure!(!jobs.is_empty(), "translation batch must not be empty");
+    let input_regions = jobs
+        .iter()
+        .map(|job| StructuredTranslationInputRegion {
+            order: job.order,
+            source_text: job.source_text.as_str(),
+        })
+        .collect::<Vec<_>>();
+    let input_json = serde_json::to_string_pretty(&input_regions)
+        .context("serialize contextual translation payload")?;
+    Ok(format!(
+        "Translate the following OCR regions into {}.\n\
+         The regions are one visual reading sequence; a region boundary can split a sentence.\n\
+         Use surrounding regions as context, but return one natural translation for every input region.\n\
+         Return JSON only and do not add markdown fences or commentary.\n\
+         Output a JSON array where each item has order and translated_text fields.\n\
+         Preserve input order, do not omit regions, and do not merge output items.\n\
+         Input JSON:\n{input_json}",
+        target_language.trim()
+    ))
+}
+
 fn extract_json_payload(text: &str, start: usize) -> Option<&str> {
     let mut depth = 0usize;
     let mut in_string = false;
@@ -494,8 +570,8 @@ fn parse_translation_output(output: &str, jobs: &[TranslationRegion]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        TranslationRegion, apply_prompt_presets, build_translation_batch_prompt,
-        build_translation_prompt, parse_translation_output,
+        TranslationRegion, apply_prompt_presets, build_contextual_translation_batch_prompt,
+        build_translation_batch_prompt, build_translation_prompt, parse_translation_output,
     };
     use crate::model_config::PromptConfig;
 
@@ -538,6 +614,25 @@ mod tests {
         assert!(prompt.contains(r#""source_text": "beta\nline""#));
         assert!(prompt.contains("Output a JSON array where each item has order"));
         assert!(prompt.contains("translated_text"));
+    }
+
+    #[test]
+    fn contextual_batch_prompt_preserves_sentence_context_without_merging_outputs() {
+        let jobs = vec![
+            TranslationRegion {
+                order: 1,
+                source_text: "How can I help".to_owned(),
+            },
+            TranslationRegion {
+                order: 2,
+                source_text: "with this mission?".to_owned(),
+            },
+        ];
+        let prompt = build_contextual_translation_batch_prompt(&jobs, "Chinese").unwrap();
+        assert!(prompt.contains("one visual reading sequence"));
+        assert!(prompt.contains("can split a sentence"));
+        assert!(prompt.contains("do not merge output items"));
+        assert!(prompt.contains(r#""source_text": "with this mission?""#));
     }
 
     #[test]

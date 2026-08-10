@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     backend::{
-        contracts::{OcrDocument, OcrPort},
+        contracts::{OcrDocument, OcrPort, RegionRecord},
         failure::BackendFailure,
         input::DecodedImage,
     },
@@ -71,6 +71,30 @@ impl PpOcrV5Provider {
             region_parallelism,
         })
     }
+
+    pub(crate) fn recognize_quad(
+        &mut self,
+        image: &DecodedImage,
+        quad: QuadI,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<Option<RegionRecord>, BackendFailure> {
+        cancellation.check()?;
+        let mut records = recognize_regions_with_retry(
+            image.canvas(),
+            &[quad],
+            &self.recognizer,
+            &self.characters,
+            &self.device,
+            1,
+            cancellation,
+        )
+        .map_err(|error| BackendFailure::ocr(format!("recognize OCR region: {error:#}")))?
+        .into_iter()
+        .map(PpOcrRegionRecord::into_contract)
+        .collect::<Vec<_>>();
+        cancellation.check()?;
+        Ok(records.pop())
+    }
 }
 
 impl OcrPort for PpOcrV5Provider {
@@ -99,7 +123,7 @@ impl OcrPort for PpOcrV5Provider {
                 regions: Vec::new(),
             });
         }
-        let records = recognize_regions(
+        let records = recognize_regions_with_retry(
             canvas,
             &quads,
             &self.recognizer,
@@ -865,14 +889,132 @@ fn recognize_regions(
 
     finalize_recognition_records(records)
 }
+
+fn recognize_regions_with_retry(
+    image: &RgbImage,
+    quads: &[QuadI],
+    recognizer: &PpOcrV5Recognizer,
+    characters: &[String],
+    device: &Device,
+    region_parallelism: usize,
+    cancellation: &CancellationToken,
+) -> Result<Vec<PpOcrRegionRecord>> {
+    let mut records = recognize_regions(
+        image,
+        quads,
+        recognizer,
+        characters,
+        device,
+        region_parallelism,
+        cancellation,
+    )?;
+    let retry_targets = records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| recognition_text_needs_retry(&record.source_text))
+        .map(|(record_index, record)| (record_index, recognition_retry_quad(record.quad_points)))
+        .filter(|(record_index, retry_quad)| records[*record_index].quad_points != *retry_quad)
+        .collect::<Vec<_>>();
+    if retry_targets.is_empty() {
+        return Ok(records);
+    }
+    let retry_quads = retry_targets
+        .iter()
+        .map(|(_, quad)| *quad)
+        .collect::<Vec<_>>();
+    let retries = recognize_regions(
+        image,
+        &retry_quads,
+        recognizer,
+        characters,
+        device,
+        region_parallelism.min(retry_quads.len()).max(1),
+        cancellation,
+    )?;
+    for mut retry in retries {
+        let retry_index = retry.order.saturating_sub(1) as usize;
+        let Some((record_index, _)) = retry_targets.get(retry_index) else {
+            continue;
+        };
+        let original = &records[*record_index];
+        if retry_improves_recognition(&original.source_text, &retry.source_text) {
+            retry.order = original.order;
+            records[*record_index] = retry;
+        }
+    }
+    Ok(records)
+}
+
+fn recognition_retry_quad(quad: QuadI) -> QuadI {
+    let interpolate = |from: [i32; 2], to: [i32; 2]| {
+        let coordinate =
+            |from: i32, to: i32| ((i64::from(from) * 8 + i64::from(to) + 4) / 9) as i32;
+        [coordinate(from[0], to[0]), coordinate(from[1], to[1])]
+    };
+    [
+        interpolate(quad[0], quad[3]),
+        interpolate(quad[1], quad[2]),
+        interpolate(quad[2], quad[1]),
+        interpolate(quad[3], quad[0]),
+    ]
+}
+
+fn recognition_text_needs_retry(text: &str) -> bool {
+    let mut frequencies = [0usize; 26];
+    let mut ascii_letters = 0usize;
+    let mut longest_run = 0usize;
+    let mut current_run = 0usize;
+    let mut previous = None;
+    let mut has_whitespace = false;
+    for character in text.chars() {
+        has_whitespace |= character.is_whitespace();
+        if !character.is_ascii_alphabetic() {
+            previous = None;
+            current_run = 0;
+            continue;
+        }
+        let character = character.to_ascii_lowercase();
+        frequencies[(character as u8 - b'a') as usize] += 1;
+        ascii_letters += 1;
+        if previous == Some(character) {
+            current_run += 1;
+        } else {
+            previous = Some(character);
+            current_run = 1;
+        }
+        longest_run = longest_run.max(current_run);
+    }
+    if ascii_letters < 4 {
+        return false;
+    }
+    let dominant = frequencies.into_iter().max().unwrap_or(0);
+    dominant.saturating_mul(5) >= ascii_letters.saturating_mul(3)
+        || longest_run >= 3
+            && (dominant.saturating_mul(5) >= ascii_letters.saturating_mul(2)
+                || !has_whitespace && ascii_letters >= 14)
+}
+
+fn retry_improves_recognition(original: &str, candidate: &str) -> bool {
+    let meaningful_count = |text: &str| {
+        text.chars()
+            .filter(|character| character.is_alphanumeric())
+            .count()
+    };
+    let original_count = meaningful_count(original);
+    let candidate_count = meaningful_count(candidate);
+    candidate_count > 0
+        && !recognition_text_needs_retry(candidate)
+        && candidate_count.saturating_mul(3) >= original_count.saturating_mul(2)
+}
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodedRecognizer, DecodedToken, DetectorProfile, RecognitionJob, RecognizerOutput,
-        character_records, clip_detector_quad, component_quad, decode_recognizer,
+        DecodedRecognizer, DecodedToken, DetectorProfile, OcrPort, PpOcrV5Provider, RecognitionJob,
+        RecognizerOutput, character_records, clip_detector_quad, component_quad, decode_recognizer,
         decode_recognizer_batch, detector_contours, detector_tensor, filled_quad_score,
-        finalize_recognition_records, recognition_tensor, recognized_region_record,
-        recognizer_resize_width, unclipped_quad,
+        finalize_recognition_records, recognition_retry_quad, recognition_tensor,
+        recognition_text_needs_retry, recognized_region_record, recognizer_resize_width,
+        retry_improves_recognition, unclipped_quad,
     };
     use candle_core::{Device, Tensor};
     use image::{Rgb, RgbImage};
@@ -929,6 +1071,38 @@ mod tests {
         assert_eq!(recognizer_resize_width(10, 10).unwrap(), 48);
         assert_eq!(recognizer_resize_width(101, 10).unwrap(), 484);
         assert_eq!(recognizer_resize_width(667, 100).unwrap(), 320);
+    }
+
+    #[test]
+    fn decorative_frame_retry_insets_only_the_vertical_edges() {
+        assert_eq!(
+            recognition_retry_quad([[0, 0], [470, 0], [470, 36], [0, 36]]),
+            [[0, 4], [470, 4], [470, 32], [0, 32]]
+        );
+    }
+
+    #[test]
+    fn repeated_letter_noise_triggers_a_bounded_retry() {
+        for text in ["eeeee", "eere", "cereree eee", "Newspaperhalaaanaaa"] {
+            assert!(
+                recognition_text_needs_retry(text),
+                "{text:?} should request a retry"
+            );
+        }
+        for text in ["Newspaper headlines", "committee", "Mad scientist"] {
+            assert!(
+                !recognition_text_needs_retry(text),
+                "{text:?} should remain unchanged"
+            );
+        }
+        assert!(retry_improves_recognition(
+            "Newspaperhalaaanaaa",
+            "Newspaper headlines"
+        ));
+        assert!(!retry_improves_recognition(
+            "Newspaperhalaaanaaa",
+            "Newspaper"
+        ));
     }
 
     #[test]
@@ -1108,5 +1282,174 @@ mod tests {
         assert_eq!(records[0].quad_points[2], [41, 30]);
         assert_eq!(records[1].quad_points[0], [41, 10]);
         assert_eq!(records[1].quad_points[2], [90, 30]);
+    }
+
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[test]
+    #[ignore = "requires staged PP-OCRv5 assets and a supported CUDA device"]
+    fn cuda_live_ocr_fixtures_recognize_headline_text() {
+        assert_eq!(
+            std::env::var("SMODELTRANS_RUN_CUDA_E2E").as_deref(),
+            Ok("1"),
+            "set SMODELTRANS_RUN_CUDA_E2E=1 to run the native CUDA fixture"
+        );
+        let manifest_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_root = manifest_root.join("..").join("models").join("ppocrv5");
+        let device = Device::new_cuda(0).expect("CUDA device");
+        let mut provider = PpOcrV5Provider::load(
+            &model_root.join("detector"),
+            &model_root.join("recognizer"),
+            &device,
+            4,
+        )
+        .expect("PP-OCRv5 provider");
+        let cancellation = super::CancellationToken::new_for_test();
+
+        let newspaper_image =
+            image::open(manifest_root.join("tests/fixtures/ppocrv5/newspaper-headlines.png"))
+                .expect("newspaper fixture")
+                .to_rgb8();
+        let newspaper = super::DecodedImage::from_rgb_image(
+            newspaper_image,
+            "newspaper-headlines.png",
+            "English",
+        );
+        let newspaper_text = provider
+            .recognize(&newspaper, &cancellation)
+            .expect("newspaper OCR fixture")
+            .regions
+            .into_iter()
+            .map(|region| region.source_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "Newspaper headlines",
+            "Adoptions wanted! How to help the..",
+            "Mad scientist on the loose! Townsfolks..",
+            "A Tale of Two Cities: Maids,",
+        ] {
+            assert!(
+                newspaper_text
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case(expected)),
+                "missing {expected:?} in:\n{newspaper_text}"
+            );
+        }
+        let rescued_header = provider
+            .recognize_quad(
+                &newspaper,
+                [[0, 0], [470, 0], [470, 36], [0, 36]],
+                &cancellation,
+            )
+            .expect("recognize framed headline")
+            .expect("framed headline text");
+        assert_eq!(rescued_header.source_text, "Newspaper headlines");
+
+        let dialogue_image =
+            image::open(manifest_root.join("tests/fixtures/ppocrv5/headline-dialogue.png"))
+                .expect("dialogue fixture")
+                .to_rgb8();
+        let dialogue =
+            super::DecodedImage::from_rgb_image(dialogue_image, "headline-dialogue.png", "English");
+        let dialogue_text = provider
+            .recognize(&dialogue, &cancellation)
+            .expect("dialogue OCR fixture")
+            .regions
+            .into_iter()
+            .map(|region| region.source_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            dialogue_text
+                .lines()
+                .any(|line| line == "That's the only problem you have with this headline?!?!"),
+            "recognized text:\n{dialogue_text}"
+        );
+    }
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[test]
+    #[ignore = "requires staged PP-OCRv5 assets and a supported CUDA device"]
+    fn cuda_italic_dialogue_fixture() {
+        assert_eq!(
+            std::env::var("SMODELTRANS_RUN_CUDA_E2E").as_deref(),
+            Ok("1"),
+            "set SMODELTRANS_RUN_CUDA_E2E=1 to run the native CUDA fixture"
+        );
+        let manifest_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_root = manifest_root.join("..").join("models").join("ppocrv5");
+        let device = Device::new_cuda(0).expect("CUDA device");
+        let mut provider = PpOcrV5Provider::load(
+            &model_root.join("detector"),
+            &model_root.join("recognizer"),
+            &device,
+            4,
+        )
+        .expect("PP-OCRv5 provider");
+        let cancellation = super::CancellationToken::new_for_test();
+        let image = image::open(manifest_root.join("tests/fixtures/ppocrv5/italic-dialogue.png"))
+            .expect("italic dialogue fixture")
+            .to_rgb8();
+        let decoded = super::DecodedImage::from_rgb_image(image, "italic-dialogue.png", "English");
+        let text = provider
+            .recognize(&decoded, &cancellation)
+            .expect("italic dialogue OCR fixture")
+            .regions
+            .into_iter()
+            .map(|region| region.source_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            text.lines().any(|line| line
+                .eq_ignore_ascii_case("That's the only problem you have with this headline?!?!")),
+            "recognized text:\n{text}"
+        );
+    }
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    #[test]
+    #[ignore = "requires staged PP-OCRv5 assets and a supported CUDA device"]
+    fn cuda_low_contrast_multiline_newspaper_fixture() {
+        assert_eq!(
+            std::env::var("SMODELTRANS_RUN_CUDA_E2E").as_deref(),
+            Ok("1"),
+            "set SMODELTRANS_RUN_CUDA_E2E=1 to run the native CUDA fixture"
+        );
+        let manifest_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_root = manifest_root.join("..").join("models").join("ppocrv5");
+        let device = Device::new_cuda(0).expect("CUDA device");
+        let mut provider = PpOcrV5Provider::load(
+            &model_root.join("detector"),
+            &model_root.join("recognizer"),
+            &device,
+            4,
+        )
+        .expect("PP-OCRv5 provider");
+        let cancellation = super::CancellationToken::new_for_test();
+        let image =
+            image::open(manifest_root.join("tests/fixtures/ppocrv5/low-contrast-newspaper.png"))
+                .expect("low-contrast newspaper fixture")
+                .to_rgb8();
+        let decoded =
+            super::DecodedImage::from_rgb_image(image, "low-contrast-newspaper.png", "English");
+        let text = provider
+            .recognize(&decoded, &cancellation)
+            .expect("low-contrast newspaper OCR fixture")
+            .regions
+            .into_iter()
+            .map(|region| region.source_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+        println!("{text}");
+
+        for expected in [
+            "mad scientist on the loose",
+            "cantamille afraid to leave their",
+            "homes after local loon escapes prison",
+            "scantily-clad",
+            "accomplice",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
     }
 }

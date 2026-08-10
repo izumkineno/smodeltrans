@@ -71,6 +71,8 @@ pub(crate) struct LiveOverlaySettings {
     pub(crate) attachment: LiveOverlayAttachment,
     pub(crate) offset: u32,
     pub(crate) show_source: bool,
+    #[serde(default)]
+    pub(crate) show_region_boxes: bool,
 }
 
 impl Default for LiveOverlaySettings {
@@ -80,6 +82,7 @@ impl Default for LiveOverlaySettings {
             attachment: LiveOverlayAttachment::Bottom,
             offset: 0,
             show_source: true,
+            show_region_boxes: false,
         }
     }
 }
@@ -136,6 +139,10 @@ fn default_stability_wait_ms() -> u64 {
     DEFAULT_STABILITY_WAIT_MS
 }
 
+fn default_text_grouping_enabled() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LiveRecognitionSettings {
@@ -144,6 +151,8 @@ pub(crate) struct LiveRecognitionSettings {
     pub(crate) trigger_event: LiveRecognitionTrigger,
     #[serde(default = "default_stability_wait_ms")]
     pub(crate) stability_wait_ms: u64,
+    #[serde(default = "default_text_grouping_enabled")]
+    pub(crate) text_grouping_enabled: bool,
 }
 
 impl Default for LiveRecognitionSettings {
@@ -153,6 +162,7 @@ impl Default for LiveRecognitionSettings {
             trigger_key: "F8".to_owned(),
             trigger_event: LiveRecognitionTrigger::Press,
             stability_wait_ms: DEFAULT_STABILITY_WAIT_MS,
+            text_grouping_enabled: default_text_grouping_enabled(),
         }
     }
 }
@@ -321,10 +331,19 @@ impl Default for LiveSessionStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LiveSubtitleRegionBounds {
+    pub(crate) left: u32,
+    pub(crate) top: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LiveSubtitleRegion {
-    pub(crate) quad: [[i32; 2]; 4],
+    pub(crate) bounds: LiveSubtitleRegionBounds,
     pub(crate) source_text: String,
     pub(crate) translated_text: String,
 }
@@ -518,6 +537,7 @@ mod tests {
             trigger_key: " space ".to_owned(),
             trigger_event: LiveRecognitionTrigger::Release,
             stability_wait_ms: DEFAULT_STABILITY_WAIT_MS,
+            ..LiveRecognitionSettings::default()
         }
         .validate()
         .expect("key trigger");
@@ -536,6 +556,7 @@ mod tests {
             trigger_key: "F8".to_owned(),
             trigger_event: LiveRecognitionTrigger::Press,
             stability_wait_ms: MAX_STABILITY_WAIT_MS + 1,
+            ..LiveRecognitionSettings::default()
         };
         assert!(settings.validate().is_err());
     }
@@ -547,6 +568,7 @@ mod tests {
             trigger_key: "vk:65|KeyA".to_owned(),
             trigger_event: LiveRecognitionTrigger::Press,
             stability_wait_ms: DEFAULT_STABILITY_WAIT_MS,
+            ..LiveRecognitionSettings::default()
         }
         .validate()
         .expect("recorded virtual key");
@@ -557,6 +579,7 @@ mod tests {
             trigger_key: "KeyA".to_owned(),
             trigger_event: LiveRecognitionTrigger::Press,
             stability_wait_ms: DEFAULT_STABILITY_WAIT_MS,
+            ..LiveRecognitionSettings::default()
         }
         .validate()
         .expect("legacy browser key code");
@@ -567,6 +590,7 @@ mod tests {
             trigger_key: "vk:121".to_owned(),
             trigger_event: LiveRecognitionTrigger::Press,
             stability_wait_ms: DEFAULT_STABILITY_WAIT_MS,
+            ..LiveRecognitionSettings::default()
         }
         .validate()
         .expect("virtual key without display label");
@@ -581,6 +605,7 @@ mod tests {
                 trigger_key: trigger_key.to_owned(),
                 trigger_event: LiveRecognitionTrigger::Press,
                 stability_wait_ms: DEFAULT_STABILITY_WAIT_MS,
+                ..LiveRecognitionSettings::default()
             };
             assert!(
                 settings.validate().is_ok(),
@@ -596,6 +621,7 @@ mod tests {
                 trigger_key: trigger_key.to_owned(),
                 trigger_event: LiveRecognitionTrigger::Press,
                 stability_wait_ms: DEFAULT_STABILITY_WAIT_MS,
+                ..LiveRecognitionSettings::default()
             };
             assert!(
                 settings.validate().is_err(),

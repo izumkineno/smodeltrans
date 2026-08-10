@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   LIVE_DEBUG_RECORD_EVENT,
+  LIVE_REGION_BOX_VISIBILITY_EVENT,
   LIVE_STATUS_EVENT,
   LIVE_SUBTITLE_EVENT,
   beginLiveRoiUpdate,
@@ -10,11 +11,14 @@ import {
   getLiveSessionStatus,
   listCaptureWindows,
   listenLiveDebugRecord,
+  listenLiveRegionBoxesVisible,
   listenLiveStatus,
   listenLiveSubtitle,
   pauseLiveSession,
-  resolveLiveSubtitleRegionStyle,
+  groupLiveSubtitleRegions,
+  resolveLiveSubtitleRegionVerticalAnchor,
   resumeLiveSession,
+  setLiveRegionBoxesVisible,
   shouldApplyLiveSubtitle,
   stopLiveSession,
 } from "./live-translation-provider";
@@ -51,6 +55,7 @@ const overlaySettings: LiveOverlaySettings = {
   attachment: "bottom",
   offset: 24,
   showSource: false,
+  showRegionBoxes: true,
 };
 
 const recognitionSettings: LiveRecognitionSettings = {
@@ -58,6 +63,7 @@ const recognitionSettings: LiveRecognitionSettings = {
   triggerKey: "F8",
   triggerEvent: "release",
   stabilityWaitMs: 800,
+  textGroupingEnabled: true,
 };
 
 const status: LiveSessionStatus = {
@@ -195,6 +201,29 @@ describe("live translation command adapter", () => {
     expect(receivedSubtitles).toEqual([subtitle]);
     expect(receivedDebugRecords).toEqual([debugRecord]);
   });
+
+  test("broadcasts and listens for region box visibility", async () => {
+    const emitted: Array<{ event: string; payload?: unknown }> = [];
+    const emitFn = async <T>(event: string, payload?: T): Promise<void> => {
+      emitted.push({ event, payload });
+    };
+    const received: boolean[] = [];
+    const listenFn = async <T>(
+      event: string,
+      handler: (event: { event: string; id: number; payload: T }) => void,
+    ): Promise<() => void> => {
+      handler({ event, id: 1, payload: true as T });
+      return () => {};
+    };
+
+    await setLiveRegionBoxesVisible(true, emitFn);
+    await listenLiveRegionBoxesVisible((visible) => received.push(visible), listenFn);
+
+    expect(emitted).toEqual([
+      { event: LIVE_REGION_BOX_VISIBILITY_EVENT, payload: true },
+    ]);
+    expect(received).toEqual([true]);
+  });
 });
 
 describe("live subtitle revision filtering", () => {
@@ -220,57 +249,89 @@ describe("live subtitle revision filtering", () => {
   });
 });
 
-describe("live subtitle region styles", () => {
-  const roi: LiveRoi = {
-    x: 100,
-    y: 700,
-    width: 900,
-    height: 220,
-    clientWidth: 1920,
-    clientHeight: 1080,
-  };
-  const region: LiveSubtitleRegion = {
-    quad: [
-      [10, 20],
-      [210, 20],
-      [210, 80],
-      [10, 80],
-    ],
-    sourceText: "字幕",
-    translatedText: "Subtitle",
-  };
+describe("live subtitle region flow groups", () => {
+  function region(
+    left: number,
+    top: number,
+    width: number,
+    height: number,
+    sourceText: string,
+  ): LiveSubtitleRegion {
+    return {
+      bounds: { left, top, width, height },
+      sourceText,
+      translatedText: `译文-${sourceText}`,
+    };
+  }
 
-  test("maps OCR coordinates to a fixed region box", () => {
-    const style = resolveLiveSubtitleRegionStyle(region, roi);
+  test("puts horizontally overlapping regions in one vertical flow", () => {
+    const groups = groupLiveSubtitleRegions([
+      region(40, 0, 360, 24, "first"),
+      region(40, 0, 360, 24, "second"),
+      region(40, 0, 360, 24, "third"),
+      region(40, 0, 360, 24, "fourth"),
+    ]);
 
-    expect(Number.parseFloat(style.left)).toBeCloseTo(5.7291666667, 8);
-    expect(Number.parseFloat(style.top)).toBeCloseTo(66.6666666667, 8);
-    expect(Number.parseFloat(style.width)).toBeCloseTo(10.4166666667, 8);
-    expect(Number.parseFloat(style.height)).toBeCloseTo(5.5555555556, 8);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].items.map((item) => item.index)).toEqual([0, 1, 2, 3]);
+    expect(groups[0].items.map((item) => item.gapAbove)).toEqual([0, 4, 4, 4]);
   });
 
-  test("clamps regions to the overlay and rejects invalid ROI sizes", () => {
-    const outsideRegion: LiveSubtitleRegion = {
-      ...region,
-      quad: [
-        [-1000, -1000],
-        [2500, -1000],
-        [2500, 1000],
-        [-1000, 1000],
-      ],
-    };
+  test("keeps non-overlapping horizontal columns independent", () => {
+    const groups = groupLiveSubtitleRegions([
+      region(20, 30, 180, 24, "left-1"),
+      region(30, 70, 160, 24, "left-2"),
+      region(240, 40, 140, 24, "right"),
+    ]);
 
-    expect(resolveLiveSubtitleRegionStyle(outsideRegion, roi)).toEqual({
-      left: "0%",
-      top: "0%",
-      width: "100%",
-      height: "100%",
+    expect(groups).toHaveLength(2);
+    expect(groups[0].items.map((item) => item.index)).toEqual([0, 1]);
+    expect(groups[1].items.map((item) => item.index)).toEqual([2]);
+  });
+
+  test("preserves source gaps inside one nearby text block", () => {
+    const groups = groupLiveSubtitleRegions([
+      region(20, 10, 180, 20, "first"),
+      region(20, 38, 180, 20, "second"),
+      region(20, 70, 180, 20, "third"),
+    ]);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0].items.map((item) => item.gapAbove)).toEqual([0, 8, 12]);
+  });
+
+  test("separates a distant bottom dialogue and anchors it to the bottom edge", () => {
+    const groups = groupLiveSubtitleRegions([
+      region(20, 10, 180, 20, "menu-1"),
+      region(20, 38, 180, 20, "menu-2"),
+      region(20, 500, 180, 60, "bottom-dialogue"),
+    ]);
+
+    expect(groups).toHaveLength(2);
+    expect(groups[0].items.map((item) => item.region.sourceText)).toEqual([
+      "menu-1",
+      "menu-2",
+    ]);
+    expect(groups[1].items[0].region.sourceText).toBe("bottom-dialogue");
+    expect(resolveLiveSubtitleRegionVerticalAnchor(groups[0], 600)).toEqual({
+      edge: "top",
+      offset: 10,
+    });
+    expect(resolveLiveSubtitleRegionVerticalAnchor(groups[1], 600)).toEqual({
+      edge: "bottom",
+      offset: 40,
     });
   });
-  test("rejects invalid ROI sizes", () => {
-    expect(
-      resolveLiveSubtitleRegionStyle(region, { ...roi, clientWidth: 0 }),
-    ).toEqual({});
-  });
 
+  test("drops invalid or degenerate bounds", () => {
+    const groups = groupLiveSubtitleRegions([
+      region(20, 10, 0, 20, "zero-width"),
+      region(Number.NaN, 10, 20, 20, "nan"),
+      region(40, 50, 100, 24, "valid"),
+    ]);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0].items).toHaveLength(1);
+    expect(groups[0].items[0].region.sourceText).toBe("valid");
+  });
 });

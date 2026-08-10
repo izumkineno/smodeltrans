@@ -114,6 +114,21 @@ impl BackendEngine {
         Ok(document.regions)
     }
 
+    pub(crate) fn recognize_region(
+        &mut self,
+        image: &DecodedImage,
+        quad: [[i32; 2]; 4],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<RegionRecord>, BackendFailure> {
+        cancellation.check()?;
+        self.load_ocr()?;
+        let ocr = self
+            .ocr
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("PP-OCRv5 provider was not initialized"))?;
+        ocr.recognize_quad(image, quad, cancellation)
+    }
+
     pub(crate) fn translate(
         &mut self,
         image: &DecodedImage,
@@ -150,6 +165,7 @@ impl BackendEngine {
             &mut records,
             image.target_language(),
             cancellation,
+            false,
             &mut report_progress,
         )?;
         cancellation.check()?;
@@ -167,7 +183,28 @@ impl BackendEngine {
         target_language: &str,
         cancellation: &CancellationToken,
     ) -> Result<(), BackendFailure> {
-        self.translate_regions_with_progress(records, target_language, cancellation, |_, _| {})
+        self.translate_regions_with_progress(
+            records,
+            target_language,
+            cancellation,
+            false,
+            |_, _| {},
+        )
+    }
+
+    pub(crate) fn translate_live_regions(
+        &mut self,
+        records: &mut [RegionRecord],
+        target_language: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), BackendFailure> {
+        self.translate_regions_with_progress(
+            records,
+            target_language,
+            cancellation,
+            true,
+            |_, _| {},
+        )
     }
 
     fn translate_regions_with_progress(
@@ -175,6 +212,7 @@ impl BackendEngine {
         records: &mut [RegionRecord],
         target_language: &str,
         cancellation: &CancellationToken,
+        contextual: bool,
         mut report_progress: impl FnMut(u8, &'static str),
     ) -> Result<(), BackendFailure> {
         if records.is_empty() {
@@ -205,8 +243,11 @@ impl BackendEngine {
             .chunks(self.settings.translation_batch_size)
             .enumerate()
         {
-            cancellation.check()?;
-            translated.extend(translator.translate(batch, target_language, cancellation)?);
+            translated.extend(if contextual {
+                translator.translate_contextual(batch, target_language, cancellation)?
+            } else {
+                translator.translate(batch, target_language, cancellation)?
+            });
             let progress =
                 70 + u8::try_from(((batch_index + 1) * 20) / total_batches).unwrap_or(20);
             report_progress(progress, "Hy-MT2 翻译中");

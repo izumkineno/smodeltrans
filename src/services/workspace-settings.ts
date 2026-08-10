@@ -22,6 +22,7 @@ export const liveOverlaySettings = ref<LiveOverlaySettings>({
   attachment: "bottom",
   offset: 0,
   showSource: true,
+  showRegionBoxes: false,
 });
 
 export const liveRecognitionSettings = ref<LiveRecognitionSettings>({
@@ -29,7 +30,7 @@ export const liveRecognitionSettings = ref<LiveRecognitionSettings>({
   triggerKey: "F8",
   triggerEvent: "press",
   stabilityWaitMs: DEFAULT_LIVE_STABILITY_WAIT_MS,
-
+  textGroupingEnabled: true,
 });
 
 let persistedTargetLanguageLoaded = false;
@@ -99,7 +100,7 @@ export function loadPersistedLiveOverlaySettings(): string | null {
       return "实时浮层设置无效，将使用默认值。";
     }
     const value = parsed as Partial<LiveOverlaySettings>;
-    const { mode, attachment, offset, showSource } = value;
+    const { mode, attachment, offset, showSource, showRegionBoxes } = value;
     if (
       (mode !== "subtitle" && mode !== "region_replace") ||
       (attachment !== "top" &&
@@ -110,11 +111,18 @@ export function loadPersistedLiveOverlaySettings(): string | null {
       offset === undefined ||
       offset < 0 ||
       offset > 2048 ||
-      typeof showSource !== "boolean"
+      typeof showSource !== "boolean" ||
+      (showRegionBoxes !== undefined && typeof showRegionBoxes !== "boolean")
     ) {
       return "实时浮层设置无效，将使用默认值。";
     }
-    liveOverlaySettings.value = { mode, attachment, offset, showSource };
+    liveOverlaySettings.value = {
+      mode,
+      attachment,
+      offset,
+      showSource,
+      showRegionBoxes: showRegionBoxes ?? false,
+    };
     return null;
   } catch {
     return "无法读取实时浮层设置，将使用默认值。";
@@ -179,6 +187,7 @@ export function loadPersistedLiveRecognitionSettings(): string | null {
       triggerKey?: unknown;
       triggerEvent?: string;
       stabilityWaitMs?: unknown;
+      textGroupingEnabled?: unknown;
     };
     const mode = value.mode === "hold_key" ? "key_trigger" : value.mode;
     const triggerEvent = value.triggerEvent ?? "press";
@@ -187,11 +196,14 @@ export function loadPersistedLiveRecognitionSettings(): string | null {
       value.stabilityWaitMs === undefined
         ? DEFAULT_LIVE_STABILITY_WAIT_MS
         : normalizePersistedLiveStabilityWaitMs(value.stabilityWaitMs);
+    const textGroupingEnabled =
+      value.textGroupingEnabled === undefined ? true : value.textGroupingEnabled;
     if (
       (mode !== "automatic" && mode !== "key_trigger") ||
       (triggerEvent !== "press" && triggerEvent !== "release") ||
       !triggerKey ||
-      stabilityWaitMs === null
+      stabilityWaitMs === null ||
+      typeof textGroupingEnabled !== "boolean"
     ) {
       return "实时识别触发设置无效，将使用默认值。";
     }
@@ -200,6 +212,7 @@ export function loadPersistedLiveRecognitionSettings(): string | null {
       triggerKey,
       triggerEvent,
       stabilityWaitMs,
+      textGroupingEnabled,
     };
     return null;
   } catch {

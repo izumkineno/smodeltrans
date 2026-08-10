@@ -1,10 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import type { EventCallback, UnlistenFn } from "@tauri-apps/api/event";
 
 export const LIVE_STATUS_EVENT = "live-status";
 export const LIVE_SUBTITLE_EVENT = "live-subtitle";
 export const LIVE_DEBUG_RECORD_EVENT = "live-debug-record";
+export const LIVE_REGION_BOX_VISIBILITY_EVENT = "live-region-box-visibility";
 
 export interface CaptureWindowInfo {
   id: string;
@@ -63,6 +64,7 @@ export interface LiveOverlaySettings {
   attachment: LiveOverlayAttachment;
   offset: number;
   showSource: boolean;
+  showRegionBoxes: boolean;
 }
 
 export type LiveRecognitionMode = "automatic" | "key_trigger";
@@ -74,12 +76,41 @@ export interface LiveRecognitionSettings {
   triggerKey: string;
   triggerEvent: LiveRecognitionTrigger;
   stabilityWaitMs: number;
+  textGroupingEnabled: boolean;
 }
 
 export interface LiveSubtitleRegion {
-  quad: [[number, number], [number, number], [number, number], [number, number]];
+  bounds: {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  };
   sourceText: string;
   translatedText: string;
+}
+
+export interface LiveSubtitleRegionFlowItem {
+  id: string;
+  index: number;
+  region: LiveSubtitleRegion;
+  leftOffset: number;
+  width: number;
+  gapAbove: number;
+}
+
+export interface LiveSubtitleRegionFlowGroup {
+  id: string;
+  left: number;
+  top: number;
+  bottom: number;
+  width: number;
+  items: LiveSubtitleRegionFlowItem[];
+}
+
+export interface LiveSubtitleRegionVerticalAnchor {
+  edge: "top" | "bottom";
+  offset: number;
 }
 
 export interface LiveSubtitle {
@@ -120,6 +151,7 @@ export interface LiveDebugRecord {
 
 type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 type ListenFn = <T>(event: string, handler: EventCallback<T>) => Promise<UnlistenFn>;
+type EmitFn = <T>(event: string, payload?: T) => Promise<void>;
 
 export function listCaptureWindows(invokeFn: InvokeFn = invoke): Promise<CaptureWindowInfo[]> {
   return invokeFn<CaptureWindowInfo[]>("list_capture_windows");
@@ -203,6 +235,22 @@ export function listenLiveSubtitle(
 ): Promise<UnlistenFn> {
   return listenFn<LiveSubtitle>(LIVE_SUBTITLE_EVENT, (event) => handler(event.payload));
 }
+export function setLiveRegionBoxesVisible(
+  visible: boolean,
+  emitFn: EmitFn = emit,
+): Promise<void> {
+  return emitFn<boolean>(LIVE_REGION_BOX_VISIBILITY_EVENT, visible);
+}
+
+export function listenLiveRegionBoxesVisible(
+  handler: (visible: boolean) => void,
+  listenFn: ListenFn = listen,
+): Promise<UnlistenFn> {
+  return listenFn<boolean>(LIVE_REGION_BOX_VISIBILITY_EVENT, (event) =>
+    handler(event.payload),
+  );
+}
+
 
 export function listenLiveDebugRecord(
   handler: (record: LiveDebugRecord) => void,
@@ -222,30 +270,119 @@ export function shouldApplyLiveSubtitle(
     subtitle.revision >= lastAppliedRevision
   );
 }
-export function resolveLiveSubtitleRegionStyle(
-  region: LiveSubtitleRegion,
-  roi: LiveRoi,
-): Record<string, string> {
-  if (
-    roi.clientWidth <= 0 ||
-    roi.clientHeight <= 0 ||
-    region.quad.some(([x, y]) => !Number.isFinite(x) || !Number.isFinite(y))
-  ) {
-    return {};
+export function groupLiveSubtitleRegions(
+  regions: LiveSubtitleRegion[],
+): LiveSubtitleRegionFlowGroup[] {
+  const prepared = regions
+    .map((region, index) => ({
+      region,
+      index,
+      left: region.bounds.left,
+      top: region.bounds.top,
+      right: region.bounds.left + region.bounds.width,
+      bottom: region.bounds.top + region.bounds.height,
+    }))
+    .filter(
+      ({ left, top, right, bottom }) =>
+        [left, top, right, bottom].every(Number.isFinite) &&
+        right > left &&
+        bottom > top,
+    )
+    .sort(
+      (left, right) =>
+        left.left - right.left || left.top - right.top || left.index - right.index,
+    );
+  const columns: Array<{
+    right: number;
+    items: typeof prepared;
+  }> = [];
+  for (const item of prepared) {
+    const column = columns[columns.length - 1];
+    if (!column || item.left >= column.right) {
+      columns.push({ right: item.right, items: [item] });
+      continue;
+    }
+    column.items.push(item);
+    column.right = Math.max(column.right, item.right);
   }
-  const horizontal = region.quad.map(([x]) => x);
-  const vertical = region.quad.map(([, y]) => y);
-  const clamp = (value: number, maximum: number): number =>
-    Math.max(0, Math.min(maximum, value));
-  const left = clamp(roi.x + Math.min(...horizontal), roi.clientWidth);
-  const top = clamp(roi.y + Math.min(...vertical), roi.clientHeight);
-  const right = clamp(roi.x + Math.max(...horizontal), roi.clientWidth);
-  const bottom = clamp(roi.y + Math.max(...vertical), roi.clientHeight);
-  const height = Math.max(1, ((bottom - top) / roi.clientHeight) * 100);
-  return {
-    left: `${(left / roi.clientWidth) * 100}%`,
-    top: `${(top / roi.clientHeight) * 100}%`,
-    width: `${Math.max(1, ((right - left) / roi.clientWidth) * 100)}%`,
-    height: `${height}%`,
-  };
+
+  const blocks: Array<typeof prepared> = [];
+  for (const column of columns) {
+    const ordered = column.items.sort(
+      (left, right) =>
+        left.top - right.top || left.left - right.left || left.index - right.index,
+    );
+    let block: typeof prepared = [];
+    let blockBottom = Number.NEGATIVE_INFINITY;
+    let blockLineHeight = 0;
+    for (const item of ordered) {
+      const itemHeight = item.bottom - item.top;
+      const gap = item.top - blockBottom;
+      const splitThreshold = Math.max(24, Math.max(blockLineHeight, itemHeight) * 1.5);
+      if (block.length > 0 && gap > splitThreshold) {
+        blocks.push(block);
+        block = [];
+        blockBottom = Number.NEGATIVE_INFINITY;
+        blockLineHeight = 0;
+      }
+      block.push(item);
+      blockBottom = Math.max(blockBottom, item.bottom);
+      blockLineHeight = Math.max(blockLineHeight, itemHeight);
+    }
+    if (block.length > 0) {
+      blocks.push(block);
+    }
+  }
+
+  return blocks.map((block, groupIndex) => {
+    const left = Math.min(...block.map((item) => item.left));
+    const right = Math.max(...block.map((item) => item.right));
+    const top = Math.min(...block.map((item) => item.top));
+    const bottom = Math.max(...block.map((item) => item.bottom));
+    let previousBottom: number | undefined;
+    const items = block.map((item) => {
+      const gapAbove =
+        previousBottom === undefined ? 0 : Math.max(4, item.top - previousBottom);
+      previousBottom =
+        previousBottom === undefined
+          ? item.bottom
+          : Math.max(previousBottom, item.bottom);
+      return {
+        id: `${item.index}-${item.left}-${item.top}-${item.region.sourceText}`,
+        index: item.index,
+        region: item.region,
+        leftOffset: item.left - left,
+        width: item.right - item.left,
+        gapAbove,
+      };
+    });
+    return {
+      id: `group-${groupIndex}-${left}-${top}`,
+      left,
+      top,
+      bottom,
+      width: right - left,
+      items,
+    };
+  });
+}
+
+export function resolveLiveSubtitleRegionVerticalAnchor(
+  group: LiveSubtitleRegionFlowGroup,
+  clientHeight: number,
+): LiveSubtitleRegionVerticalAnchor | undefined {
+  if (
+    !Number.isFinite(clientHeight) ||
+    clientHeight <= 0 ||
+    !Number.isFinite(group.top) ||
+    !Number.isFinite(group.bottom) ||
+    group.bottom <= group.top
+  ) {
+    return undefined;
+  }
+  const top = Math.max(0, Math.min(clientHeight, group.top));
+  const bottom = Math.max(top, Math.min(clientHeight, group.bottom));
+  return top + bottom <= clientHeight
+    ? { edge: "top", offset: top }
+    : { edge: "bottom", offset: clientHeight - bottom };
 }

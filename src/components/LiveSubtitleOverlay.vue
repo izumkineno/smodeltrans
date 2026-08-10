@@ -3,21 +3,26 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   getLiveSessionStatus,
+  groupLiveSubtitleRegions,
+  resolveLiveSubtitleRegionVerticalAnchor,
+  listenLiveRegionBoxesVisible,
   listenLiveStatus,
   listenLiveSubtitle,
-  resolveLiveSubtitleRegionStyle,
   shouldApplyLiveSubtitle,
 } from "../services/live-translation-provider";
 import type {
+  LiveRoi,
   LiveSessionState,
   LiveSubtitle,
-  LiveSubtitleRegion,
+  LiveSubtitleRegionFlowGroup,
+  LiveSubtitleRegionFlowItem,
 } from "../services/live-translation-provider";
 
 const query = new URLSearchParams(window.location.search);
 const sessionId = query.get("liveSessionId") ?? undefined;
 const isRegionReplace = query.get("liveOverlayMode") === "region_replace";
 const showSource = query.get("showSource") !== "0";
+const showRegionBoxes = ref(query.get("showRegionBoxes") === "1");
 const subtitle = ref<LiveSubtitle>();
 const state = ref<LiveSessionState>("warming");
 let lastRevision = -1;
@@ -31,6 +36,55 @@ const visible = computed(
       ? (subtitle.value?.regions.length ?? 0) > 0
       : !!subtitle.value?.translatedText.trim()),
 );
+const regionGroups = computed(() =>
+  groupLiveSubtitleRegions(subtitle.value?.regions ?? []),
+);
+
+function percent(value: number, total: number): string {
+  return `${(value / total) * 100}%`;
+}
+
+function regionGroupStyle(
+  group: LiveSubtitleRegionFlowGroup,
+): Record<string, string> {
+  const roi = subtitle.value?.roi;
+  if (!roi || roi.clientWidth <= 0 || roi.clientHeight <= 0) {
+    return {};
+  }
+  const anchor = resolveLiveSubtitleRegionVerticalAnchor(group, roi.clientHeight);
+  if (!anchor) {
+    return {};
+  }
+  const style: Record<string, string> = {
+    left: percent(group.left, roi.clientWidth),
+    width: percent(group.width, roi.clientWidth),
+  };
+  style[anchor.edge] = percent(anchor.offset, roi.clientHeight);
+  return style;
+}
+
+function regionItemStyle(
+  item: LiveSubtitleRegionFlowItem,
+  group: LiveSubtitleRegionFlowGroup,
+  roi: LiveRoi | undefined,
+): Record<string, string> {
+  if (!roi || roi.clientHeight <= 0 || group.width <= 0) {
+    return {};
+  }
+  return {
+    width: percent(item.width, group.width),
+    minHeight: `${(item.region.bounds.height / roi.clientHeight) * 100}vh`,
+    marginTop: `${(item.gapAbove / roi.clientHeight) * 100}vh`,
+    marginLeft: percent(item.leftOffset, group.width),
+  };
+}
+
+function regionDebugLabel(
+  item: LiveSubtitleRegionFlowItem,
+  groupIndex: number,
+): string {
+  return `${item.index + 1} · y=${item.region.bounds.top} · 块=${groupIndex + 1}`;
+}
 
 function applySubtitle(next: LiveSubtitle): void {
   if (!shouldApplyLiveSubtitle(next, sessionId, lastRevision)) {
@@ -40,11 +94,6 @@ function applySubtitle(next: LiveSubtitle): void {
   subtitle.value = next.translatedText.trim() || next.sourceText.trim() ? next : undefined;
 }
 
-function regionStyle(region: LiveSubtitleRegion): Record<string, string> {
-  const roi = subtitle.value?.roi;
-  return roi ? resolveLiveSubtitleRegionStyle(region, roi) : {};
-}
-
 async function initialize(): Promise<void> {
   const registered = await Promise.all([
     listenLiveSubtitle(applySubtitle),
@@ -52,6 +101,9 @@ async function initialize(): Promise<void> {
       if (!sessionId || status.sessionId === sessionId || status.state === "idle") {
         state.value = status.state;
       }
+    }),
+    listenLiveRegionBoxesVisible((visible) => {
+      showRegionBoxes.value = visible;
     }),
   ]);
   if (!listenersActive) {
@@ -71,6 +123,8 @@ onMounted(() => {
   });
 });
 
+
+
 onBeforeUnmount(() => {
   listenersActive = false;
   unlisteners.splice(0).forEach((unlisten) => unlisten());
@@ -88,15 +142,24 @@ onBeforeUnmount(() => {
       <p class="translated-text">正在连接窗口捕获…</p>
     </div>
     <div v-else-if="visible && isRegionReplace" class="region-replace-layer">
-      <article
-        v-for="region in subtitle?.regions ?? []"
-        :key="`${region.quad[0][0]}-${region.quad[0][1]}-${region.sourceText}`"
-        class="region-replace-item"
-        :style="regionStyle(region)"
+      <section
+        v-for="(group, groupIndex) in regionGroups"
+        :key="group.id"
+        class="region-replace-group"
+        :style="regionGroupStyle(group)"
       >
-        <p v-if="showSource" class="region-source-text">{{ region.sourceText }}</p>
-        <p class="region-translated-text">{{ region.translatedText }}</p>
-      </article>
+        <article
+          v-for="item in group.items"
+          :key="item.id"
+          :class="{ 'region-replace-item-debug': showRegionBoxes }"
+          :data-region-debug="showRegionBoxes ? regionDebugLabel(item, groupIndex) : undefined"
+          class="region-replace-item"
+          :style="regionItemStyle(item, group, subtitle?.roi)"
+        >
+          <p v-if="showSource" class="region-source-text">{{ item.region.sourceText }}</p>
+          <p class="region-translated-text">{{ item.region.translatedText }}</p>
+        </article>
+      </section>
     </div>
     <div v-else-if="visible" class="subtitle-panel">
       <p class="translated-text">{{ subtitle?.translatedText }}</p>
@@ -185,11 +248,19 @@ body,
   height: 100%;
 }
 
-.region-replace-item {
+.region-replace-group {
   position: absolute;
   display: flex;
   min-width: 1%;
-  min-height: 1%;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.region-replace-item {
+  position: relative;
+  display: flex;
+  min-width: 1%;
+  flex: 0 0 auto;
   flex-direction: column;
   justify-content: center;
   overflow: hidden;
@@ -199,6 +270,25 @@ body,
   color: #ffffff;
   background: rgba(6, 12, 24, 0.82);
   text-align: center;
+}
+
+.region-replace-item-debug {
+  outline: 2px solid #00e5ff;
+  outline-offset: -2px;
+  background: rgba(0, 76, 112, 0.72);
+}
+
+.region-replace-item-debug::before {
+  position: absolute;
+  top: 0;
+  left: 0;
+  min-width: 16px;
+  padding: 1px 4px;
+  color: #001018;
+  background: #00e5ff;
+  content: attr(data-region-debug);
+  font: 700 10px/1.4 "Segoe UI", sans-serif;
+  text-shadow: none;
 }
 
 .region-source-text {

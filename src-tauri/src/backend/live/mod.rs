@@ -7,12 +7,13 @@ use self::{
         CaptureWindowInfo, LiveConfig, LiveDebugOutcome, LiveDebugRecord, LiveDebugStage,
         LiveMetrics, LiveOverlayAttachment, LiveOverlayMode, LiveOverlaySettings,
         LiveRecognitionMode, LiveRecognitionSettings, LiveRecognitionTrigger, LiveRoi,
-        LiveSessionState, LiveSessionStatus, LiveSubtitle, LiveSubtitleRegion, NormalizedRoi,
+        LiveSessionState, LiveSessionStatus, LiveSubtitle, LiveSubtitleRegion,
+        LiveSubtitleRegionBounds, NormalizedRoi,
     },
     scheduler::{
         BoundedCache, LatestFrameSlot, OwnedFrame, StabilityScheduler, TwoProbeConfirmation,
-        normalize_text, normalized_region_text, normalized_translated_region_text,
-        roi_result_is_current,
+        finalize_live_regions, normalize_text, normalized_live_region_text,
+        normalized_live_translated_region_text, plan_live_ocr_groups, roi_result_is_current,
     },
 };
 use super::{
@@ -870,34 +871,33 @@ impl SessionLoop {
                         (cached, 0, true, LiveDebugOutcome::CacheHit)
                     } else {
                         let translation_started = Instant::now();
-                        let translated = match self
-                            .translate_regions(&mut recognized.regions, &config.target_language)
-                        {
-                            Ok(()) => normalized_translated_region_text(&recognized.regions),
-                            Err(error) if error.code() == BackendFailureCode::Cancelled => {
-                                break;
-                            }
-                            Err(error) => {
-                                debug_sequence = debug_sequence.saturating_add(1);
-                                self.emit_debug_record(LiveDebugRecord {
-                                    session_id: self.session_id.clone(),
-                                    sequence: debug_sequence,
-                                    stage: LiveDebugStage::Translation,
-                                    outcome: LiveDebugOutcome::Failed,
-                                    source_text: debug_text(&confirmed_text),
-                                    translated_text: None,
-                                    target_language: config.target_language.clone(),
-                                    region_count: recognized.region_count,
-                                    roi_version: frame_version,
-                                    duration_ms: elapsed_millis(translation_started.elapsed()),
-                                    cache_hit: false,
-                                    message: Some(error.message().to_owned()),
-                                    observed_at_epoch_ms,
-                                });
-                                terminal_message = Some(error.message().to_owned());
-                                break;
-                            }
-                        };
+                        let translated =
+                            match self.translate(&confirmed_text, &config.target_language) {
+                                Ok(translated) => translated,
+                                Err(error) if error.code() == BackendFailureCode::Cancelled => {
+                                    break;
+                                }
+                                Err(error) => {
+                                    debug_sequence = debug_sequence.saturating_add(1);
+                                    self.emit_debug_record(LiveDebugRecord {
+                                        session_id: self.session_id.clone(),
+                                        sequence: debug_sequence,
+                                        stage: LiveDebugStage::Translation,
+                                        outcome: LiveDebugOutcome::Failed,
+                                        source_text: debug_text(&confirmed_text),
+                                        translated_text: None,
+                                        target_language: config.target_language.clone(),
+                                        region_count: recognized.region_count,
+                                        roi_version: frame_version,
+                                        duration_ms: elapsed_millis(translation_started.elapsed()),
+                                        cache_hit: false,
+                                        message: Some(error.message().to_owned()),
+                                        observed_at_epoch_ms,
+                                    });
+                                    terminal_message = Some(error.message().to_owned());
+                                    break;
+                                }
+                            };
                         let translation_ms = elapsed_millis(translation_started.elapsed());
                         self.update_metrics(|metrics| {
                             metrics.translation_runs = metrics.translation_runs.saturating_add(1);
@@ -922,9 +922,10 @@ impl SessionLoop {
                         )
                     } else {
                         let translation_started = Instant::now();
-                        match self
-                            .translate_regions(&mut recognized.regions, &config.target_language)
-                        {
+                        match self.translate_live_regions(
+                            &mut recognized.regions,
+                            &config.target_language,
+                        ) {
                             Ok(()) => {}
                             Err(error) if error.code() == BackendFailureCode::Cancelled => {
                                 break;
@@ -956,7 +957,7 @@ impl SessionLoop {
                             metrics.last_translation_ms = translation_ms;
                         });
                         (
-                            normalized_translated_region_text(&recognized.regions),
+                            normalized_live_translated_region_text(&recognized.regions),
                             translation_ms,
                             false,
                             LiveDebugOutcome::Completed,
@@ -1004,11 +1005,7 @@ impl SessionLoop {
                         recognized
                             .regions
                             .iter()
-                            .map(|region| LiveSubtitleRegion {
-                                quad: region.quad_points,
-                                source_text: region.source_text.clone(),
-                                translated_text: region.translated_text.clone(),
-                            })
+                            .filter_map(|region| live_subtitle_region(region, frame.roi))
                             .collect()
                     } else {
                         Vec::new()
@@ -1084,6 +1081,12 @@ impl SessionLoop {
             .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
             .clone()
             .map_err(BackendFailure::arguments)?;
+        let text_grouping_enabled = self
+            .config
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时配置锁已损坏"))?
+            .recognition_settings
+            .text_grouping_enabled;
         let mut engine = self
             .backend
             .engine
@@ -1095,9 +1098,17 @@ impl SessionLoop {
         let engine = engine
             .as_mut()
             .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
-        let regions = engine.recognize_regions(&decoded, &self.cancellation)?;
+        let detected = engine.recognize_regions(&decoded, &self.cancellation)?;
+        let detected_count = detected.len();
+        let mut regions =
+            self.refine_live_regions(engine, &decoded, detected, text_grouping_enabled);
+        finalize_live_regions(&mut regions);
+        trace_live(format_args!(
+            "OCR regions detected={detected_count} finalized={} text_grouping_enabled={text_grouping_enabled}",
+            regions.len()
+        ));
         let region_count = u32::try_from(regions.len()).unwrap_or(u32::MAX);
-        let source_text = normalized_region_text(&regions);
+        let source_text = normalized_live_region_text(&regions);
         let states = engine.model_states();
         self.backend.set_model_states(states.0, states.1);
         Ok(RecognizedFrame {
@@ -1105,6 +1116,54 @@ impl SessionLoop {
             region_count,
             regions,
         })
+    }
+
+    fn refine_live_regions(
+        &self,
+        engine: &mut BackendEngine,
+        image: &DecodedImage,
+        detected: Vec<RegionRecord>,
+        text_grouping_enabled: bool,
+    ) -> Vec<RegionRecord> {
+        if !text_grouping_enabled {
+            return detected;
+        }
+        let mut refined = Vec::with_capacity(detected.len());
+        for group in plan_live_ocr_groups(detected) {
+            if !group.should_re_recognize() {
+                refined.extend(group.into_regions());
+                continue;
+            }
+            let fallback_text = group.source_text();
+            let merged = match engine.recognize_region(image, group.quad(), &self.cancellation) {
+                Ok(Some(region)) if re_recognized_text_is_usable(&region, &fallback_text) => region,
+                Ok(Some(region)) => {
+                    trace_live(format_args!(
+                        "rejecting short merged OCR result source={} fallback={}",
+                        debug_text(&region.source_text),
+                        debug_text(&fallback_text)
+                    ));
+                    group.into_merged_region(fallback_text)
+                }
+                Ok(None) => {
+                    trace_live(format_args!(
+                        "merged OCR returned no text; using joined fragments source={}",
+                        debug_text(&fallback_text)
+                    ));
+                    group.into_merged_region(fallback_text)
+                }
+                Err(error) => {
+                    trace_live(format_args!(
+                        "merged OCR failed; using joined fragments error={} source={}",
+                        error.message(),
+                        debug_text(&fallback_text)
+                    ));
+                    group.into_merged_region(fallback_text)
+                }
+            };
+            refined.push(merged);
+        }
+        refined
     }
 
     fn translate(&self, source: &str, target_language: &str) -> Result<String, BackendFailure> {
@@ -1134,7 +1193,7 @@ impl SessionLoop {
         result.map(|text| normalize_text(&text))
     }
 
-    fn translate_regions(
+    fn translate_live_regions(
         &self,
         regions: &mut [RegionRecord],
         target_language: &str,
@@ -1158,12 +1217,47 @@ impl SessionLoop {
         let engine = engine
             .as_mut()
             .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
-        let result = engine.translate_regions(regions, target_language, &self.cancellation);
+        let result = engine.translate_live_regions(regions, target_language, &self.cancellation);
         let states = engine.model_states();
         self.backend.set_model_states(states.0, states.1);
         self.backend.touch_activity();
         result
     }
+}
+
+fn live_subtitle_region(region: &RegionRecord, roi: LiveRoi) -> Option<LiveSubtitleRegion> {
+    let local_left = region.quad_points.iter().map(|point| point[0]).min()?;
+    let local_top = region.quad_points.iter().map(|point| point[1]).min()?;
+    let local_right = region.quad_points.iter().map(|point| point[0]).max()?;
+    let local_bottom = region.quad_points.iter().map(|point| point[1]).max()?;
+    let client_width = i64::from(roi.client_width);
+    let client_height = i64::from(roi.client_height);
+    let left = (i64::from(roi.x) + i64::from(local_left)).clamp(0, client_width);
+    let top = (i64::from(roi.y) + i64::from(local_top)).clamp(0, client_height);
+    let right = (i64::from(roi.x) + i64::from(local_right)).clamp(0, client_width);
+    let bottom = (i64::from(roi.y) + i64::from(local_bottom)).clamp(0, client_height);
+    (right > left && bottom > top).then(|| LiveSubtitleRegion {
+        bounds: LiveSubtitleRegionBounds {
+            left: left as u32,
+            top: top as u32,
+            width: (right - left) as u32,
+            height: (bottom - top) as u32,
+        },
+        source_text: region.source_text.clone(),
+        translated_text: region.translated_text.clone(),
+    })
+}
+
+fn re_recognized_text_is_usable(region: &RegionRecord, fallback_text: &str) -> bool {
+    let candidate_len = normalize_text(&region.source_text)
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count();
+    let fallback_len = normalize_text(fallback_text)
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count();
+    candidate_len > 0 && candidate_len.saturating_mul(3) >= fallback_len.saturating_mul(2)
 }
 
 fn await_capture_start_result<T>(
@@ -1300,6 +1394,15 @@ fn overlay_bounds(
     }
 }
 
+fn overlay_url_path(session_id: &str, settings: LiveOverlaySettings) -> String {
+    let source_visibility = if settings.show_source { "1" } else { "0" };
+    let region_box_visibility = if settings.show_region_boxes { "1" } else { "0" };
+    format!(
+        "index.html?liveSessionId={session_id}&liveOverlayMode={}&showSource={source_visibility}&showRegionBoxes={region_box_visibility}",
+        settings.mode_query_value(),
+    )
+}
+
 fn create_overlay_window(
     app: &tauri::AppHandle,
     session_id: &str,
@@ -1312,14 +1415,7 @@ fn create_overlay_window(
     run_window_operation_on_main_thread(app, move || {
         close_window_now(&window_app, OVERLAY_LABEL);
         let (x, y, width, height) = overlay_bounds(geometry, settings);
-        let source_visibility = if settings.show_source { "1" } else { "0" };
-        let url = WebviewUrl::App(
-            format!(
-                "index.html?liveSessionId={session_id}&liveOverlayMode={}&showSource={source_visibility}",
-                settings.mode_query_value(),
-            )
-            .into(),
-        );
+        let url = WebviewUrl::App(overlay_url_path(&session_id, settings).into());
         let window = WebviewWindowBuilder::new(&window_app, OVERLAY_LABEL, url)
             .title("smodeltrans 实时字幕")
             .decorations(false)
@@ -1583,10 +1679,11 @@ pub(crate) fn get_live_session_status(
 mod tests {
     use super::{
         await_capture_start_result,
-        contracts::{LiveOverlayAttachment, LiveOverlayMode, LiveOverlaySettings},
-        overlay_bounds,
+        contracts::{LiveOverlayAttachment, LiveOverlayMode, LiveOverlaySettings, LiveRoi},
+        live_subtitle_region, overlay_bounds, overlay_url_path,
         platform::TargetGeometry,
     };
+    use crate::backend::contracts::RegionRecord;
     use std::sync::{atomic::AtomicBool, mpsc};
 
     #[test]
@@ -1675,8 +1772,52 @@ mod tests {
             attachment: LiveOverlayAttachment::Left,
             offset: 2_048,
             show_source: false,
+            show_region_boxes: false,
         };
 
         assert_eq!(overlay_bounds(geometry, settings), (100, 200, 800, 600));
+    }
+
+    #[test]
+    fn overlay_url_carries_region_box_visibility() {
+        let settings = LiveOverlaySettings {
+            mode: LiveOverlayMode::RegionReplace,
+            show_source: false,
+            show_region_boxes: true,
+            ..LiveOverlaySettings::default()
+        };
+
+        assert_eq!(
+            overlay_url_path("live-42", settings),
+            "index.html?liveSessionId=live-42&liveOverlayMode=region_replace&showSource=0&showRegionBoxes=1"
+        );
+    }
+    #[test]
+    fn live_subtitle_regions_use_distinct_client_space_vertical_bounds() {
+        let roi = LiveRoi {
+            x: 40,
+            y: 50,
+            width: 400,
+            height: 180,
+            client_width: 800,
+            client_height: 600,
+        };
+        let first =
+            RegionRecord::untranslated(1, [[10, 20], [210, 20], [210, 50], [10, 50]], "First line");
+        let second = RegionRecord::untranslated(
+            2,
+            [[20, 80], [220, 80], [220, 110], [20, 110]],
+            "Second line",
+        );
+
+        let first = live_subtitle_region(&first, roi).expect("first live subtitle region");
+        let second = live_subtitle_region(&second, roi).expect("second live subtitle region");
+
+        assert_eq!(first.bounds.left, 50);
+        assert_eq!(first.bounds.top, 70);
+        assert_eq!(first.bounds.width, 200);
+        assert_eq!(first.bounds.height, 30);
+        assert_eq!(second.bounds.top, 130);
+        assert_eq!(second.bounds.top - first.bounds.top, 60);
     }
 }

@@ -25,6 +25,7 @@ import {
   pauseLiveSession,
   resumeLiveSession,
   stopLiveSession,
+  setLiveRegionBoxesVisible,
 } from "../services/live-translation-provider";
 import type {
   CaptureWindowInfo,
@@ -404,6 +405,25 @@ function saveLiveOverlayPreferences(): void {
   }
   showWorkspaceToast(toast, "success", "实时显示设置已保存，下次开始抓取时生效。");
 }
+async function toggleLiveRegionBoxes(): Promise<void> {
+  const visible = !liveOverlaySettings.value.showRegionBoxes;
+  liveOverlaySettings.value.showRegionBoxes = visible;
+  const persistError = savePersistedLiveOverlaySettings();
+  if (isDesktopRuntime) {
+    try {
+      await setLiveRegionBoxesVisible(visible);
+    } catch (error) {
+      setCommandError(error);
+      return;
+    }
+  }
+  if (persistError) {
+    showWorkspaceToast(toast, "warning", persistError);
+    return;
+  }
+  showWorkspaceToast(toast, "success", visible ? "已显示译文框体。" : "已隐藏译文框体。");
+}
+
 
 function saveLiveRecognitionPreferences(): void {
   const persistError = savePersistedLiveRecognitionSettings();
@@ -681,7 +701,7 @@ onBeforeUnmount(cleanupPage);
           <span class="step-index">03</span>
           <div>
             <h3>实时显示设置</h3>
-            <p>配置字幕浮层的位置、显示模式与是否保留 OCR 原文。</p>
+            <p>配置字幕浮层的位置、显示模式、OCR 原文与译文框体调试。</p>
           </div>
         </div>
         <n-button secondary size="small" @click="saveLiveOverlayPreferences">
@@ -725,12 +745,24 @@ onBeforeUnmount(cleanupPage);
             <template #unchecked>隐藏</template>
           </n-switch>
         </label>
+        <label v-if="liveOverlaySettings.mode === 'region_replace'" class="live-field">
+          <span>译文框体调试</span>
+          <n-button
+            :type="liveOverlaySettings.showRegionBoxes ? 'primary' : 'default'"
+            secondary
+            @click="toggleLiveRegionBoxes"
+          >
+            {{ liveOverlaySettings.showRegionBoxes ? "隐藏译文框体" : "显示译文框体" }}
+          </n-button>
+        </label>
       </div>
 
       <n-alert v-if="liveOverlaySettings.mode === 'region_replace'" type="info" :show-icon="true">
         坐标替换模式固定覆盖目标客户区；贴附边与外侧偏移仅用于字幕框模式。
       </n-alert>
-      <p class="live-settings-note">显示设置会保存到本机，并在下一次开始抓取字幕时应用。</p>
+      <p class="live-settings-note">
+        译文框体按钮会立即同步到当前浮层；其他显示设置在下一次开始抓取字幕时应用。
+      </p>
     </n-card>
 
     <n-card class="live-card live-recognition-card" :bordered="false">
@@ -739,8 +771,8 @@ onBeforeUnmount(cleanupPage);
           <span class="step-index">04</span>
           <div>
             <h3>识别与稳定</h3>
-            <p>选择识别方式，并设置字幕停止变化后等待多久再开始 OCR。</p>
-          </div>
+            <p>选择识别方式、稳定等待，以及相邻 OCR 文本的处理策略。</p>
+        </div>
         </div>
         <n-button
           secondary
@@ -773,6 +805,17 @@ onBeforeUnmount(cleanupPage);
             :disabled="hasActiveSession"
             aria-label="OCR 字幕稳定等待"
           />
+        </label>
+        <label class="live-field">
+          <span>合并相邻文本</span>
+          <n-switch
+            v-model:value="liveRecognitionSettings.textGroupingEnabled"
+            :disabled="hasActiveSession"
+            aria-label="合并实时 OCR 相邻文本"
+          >
+            <template #checked>开启</template>
+            <template #unchecked>关闭</template>
+          </n-switch>
         </label>
         <div v-if="liveRecognitionSettings.mode === 'key_trigger'" class="live-field">
           <span>触发按键</span>
@@ -821,6 +864,11 @@ onBeforeUnmount(cleanupPage);
           自动模式会根据 ROI 画面变化，等待字幕连续稳定
           {{ liveRecognitionSettings.stabilityWaitMs }} ms 后再执行 OCR 与翻译；字幕逐字出现时可调大该数值。
         </template>
+        {{
+          liveRecognitionSettings.textGroupingEnabled
+            ? " 同一视觉行的 OCR 碎片会先合并重识别；重识别失败时仍保留合并文本，字幕模式会将完整内容一次翻译。"
+            : " 相邻文本将保持原始 OCR 区域，不做合并重识别。"
+        }}
       </n-alert>
     </n-card>
 
