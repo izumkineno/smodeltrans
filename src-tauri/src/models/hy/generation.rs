@@ -57,7 +57,8 @@ pub(super) fn generate(
     model: &HySession,
     state: &mut HyGenerationState,
     position: &mut usize,
-    prompt: &str,
+    system_prompt: &str,
+    user_prompt: &str,
     config: &GenerationConfig,
     mut on_chunk: impl FnMut(&str) -> Result<()>,
     cancellation: &CancellationToken,
@@ -75,7 +76,7 @@ pub(super) fn generate(
     }
 
     model.prepare_penalty_state(state, *position, config)?;
-    let (mut logits, prompt_ids) = model.prefill(state, prompt, *position)?;
+    let (mut logits, prompt_ids) = model.prefill(state, system_prompt, user_prompt, *position)?;
     *position = position
         .checked_add(prompt_ids.len())
         .ok_or_else(|| anyhow!("generation position overflowed usize"))?;

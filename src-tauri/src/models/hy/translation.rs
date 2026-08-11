@@ -28,6 +28,7 @@ pub(crate) struct HyTranslator {
     session: HySessionDriver,
     generation: GenerationConfig,
     prompt: PromptConfig,
+    warmed_up: bool,
 }
 pub(crate) fn load(
     model_path: &Path,
@@ -57,6 +58,7 @@ pub(crate) fn load_with_config(
         session: HySessionDriver::new(&assets.model, device, memory)?,
         generation,
         prompt,
+        warmed_up: false,
     })
 }
 
@@ -76,6 +78,7 @@ pub(crate) fn load_port(
             session,
             generation,
             prompt,
+            warmed_up: false,
         })
         .map_err(|error| {
             let message = error.to_string();
@@ -88,19 +91,47 @@ pub(crate) fn load_port(
 }
 
 impl HyTranslator {
+    pub(crate) fn warm_up(&mut self, cancellation: &CancellationToken) -> Result<()> {
+        if self.warmed_up {
+            return Ok(());
+        }
+        let mut generation = self.generation.clone();
+        generation.max_new_tokens = 1;
+        let result = self
+            .session
+            .respond("", "Warm up.", &generation, |_| Ok(()), cancellation);
+        result?;
+        cancellation
+            .check()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        self.warmed_up = true;
+        Ok(())
+    }
+
     /// Translate plain neutral text using the Hy translation prompt contract.
     pub(crate) fn translate_text(
         &mut self,
         text: &str,
         target_language: &str,
         prompt: &PromptConfig,
+        supplemental_prompt: &str,
         generation: &GenerationConfig,
         cancellation: &CancellationToken,
         on_chunk: impl FnMut(&str) -> Result<()>,
     ) -> Result<HyGenerationResult> {
-        let prompt = apply_prompt_presets(build_translation_prompt(text, target_language), prompt);
-        self.session
-            .respond(&prompt, generation, on_chunk, cancellation)
+        self.warmed_up = true;
+        let user_prompt = apply_user_prompt_preset(
+            build_translation_prompt(text, target_language),
+            prompt,
+            supplemental_prompt,
+        );
+        self.session.respond(
+            prompt.system.trim(),
+            &user_prompt,
+            generation,
+            on_chunk,
+            cancellation,
+        )
     }
 
     /// Translate one neutral structured batch and return texts in input order.
@@ -111,6 +142,7 @@ impl HyTranslator {
         prompt: &PromptConfig,
         generation: &GenerationConfig,
         cancellation: &CancellationToken,
+        supplemental_prompt: &str,
     ) -> Result<(Vec<String>, usize)> {
         self.translate_structured_batch_with_context(
             jobs,
@@ -118,6 +150,7 @@ impl HyTranslator {
             prompt,
             generation,
             cancellation,
+            supplemental_prompt,
             false,
         )
     }
@@ -129,6 +162,7 @@ impl HyTranslator {
         prompt: &PromptConfig,
         generation: &GenerationConfig,
         cancellation: &CancellationToken,
+        supplemental_prompt: &str,
         contextual: bool,
     ) -> Result<(Vec<String>, usize)> {
         ensure!(!jobs.is_empty(), "translation batch must not be empty");
@@ -137,10 +171,11 @@ impl HyTranslator {
         } else {
             build_translation_batch_prompt(jobs, target_language)?
         };
-        let prompt = apply_prompt_presets(batch_prompt, prompt);
+        let user_prompt = apply_user_prompt_preset(batch_prompt, prompt, supplemental_prompt);
         let mut output = String::new();
         let result = self.session.respond(
-            &prompt,
+            prompt.system.trim(),
+            &user_prompt,
             generation,
             |chunk| {
                 output.push_str(chunk);
@@ -159,6 +194,7 @@ impl HyTranslator {
         region: &TranslationRegion,
         target_language: &str,
         prompt: &PromptConfig,
+        supplemental_prompt: &str,
         generation: &GenerationConfig,
         cancellation: &CancellationToken,
     ) -> std::result::Result<String, BackendFailure> {
@@ -167,6 +203,7 @@ impl HyTranslator {
                 &region.source_text,
                 target_language,
                 prompt,
+                supplemental_prompt,
                 generation,
                 cancellation,
                 |_| Ok(()),
@@ -183,8 +220,8 @@ impl HyTranslator {
         if matches!(result.stop_reason, HyStopReason::Cancelled) {
             return Err(BackendFailure::cancelled("Hy translation was cancelled"));
         }
-        let translated_text = result.text.trim().to_owned();
-        if translated_text.is_empty() {
+        let translated_text = result.text;
+        if translated_text.trim().is_empty() {
             return Err(BackendFailure::translation(format!(
                 "Hy returned empty translation for region {}",
                 region.order
@@ -192,13 +229,36 @@ impl HyTranslator {
         }
         Ok(translated_text)
     }
-    pub(crate) fn translate_contextual(
+    pub(crate) fn translate_with_supplemental_prompt(
         &mut self,
         regions: &[TranslationRegion],
         target_language: &str,
+        supplemental_prompt: &str,
         cancellation: &CancellationToken,
     ) -> std::result::Result<Vec<TranslatedRegion>, BackendFailure> {
-        self.translate_structured_regions(regions, target_language, cancellation, true)
+        self.translate_structured_regions(
+            regions,
+            target_language,
+            cancellation,
+            supplemental_prompt,
+            false,
+        )
+    }
+
+    pub(crate) fn translate_contextual_with_supplemental_prompt(
+        &mut self,
+        regions: &[TranslationRegion],
+        target_language: &str,
+        supplemental_prompt: &str,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<Vec<TranslatedRegion>, BackendFailure> {
+        self.translate_structured_regions(
+            regions,
+            target_language,
+            cancellation,
+            supplemental_prompt,
+            true,
+        )
     }
 
     fn translate_structured_regions(
@@ -206,6 +266,7 @@ impl HyTranslator {
         regions: &[TranslationRegion],
         target_language: &str,
         cancellation: &CancellationToken,
+        supplemental_prompt: &str,
         contextual: bool,
     ) -> std::result::Result<Vec<TranslatedRegion>, BackendFailure> {
         cancellation.check()?;
@@ -217,6 +278,7 @@ impl HyTranslator {
                 "target language must not be empty",
             ));
         }
+        self.warmed_up = true;
         let generation = self.generation.clone();
         let prompt = self.prompt.clone();
         let batch_result = if contextual {
@@ -226,6 +288,7 @@ impl HyTranslator {
                 &prompt,
                 &generation,
                 cancellation,
+                supplemental_prompt,
                 true,
             )
         } else {
@@ -235,6 +298,7 @@ impl HyTranslator {
                 &prompt,
                 &generation,
                 cancellation,
+                supplemental_prompt,
             )
         };
         let (mut texts, _) = match batch_result {
@@ -249,6 +313,7 @@ impl HyTranslator {
                         region,
                         target_language,
                         &prompt,
+                        supplemental_prompt,
                         &generation,
                         cancellation,
                     )?);
@@ -277,6 +342,7 @@ impl HyTranslator {
                     region,
                     target_language,
                     &prompt,
+                    supplemental_prompt,
                     &generation,
                     cancellation,
                 )?;
@@ -301,7 +367,7 @@ impl HyPort for HyTranslator {
         target_language: &str,
         cancellation: &CancellationToken,
     ) -> std::result::Result<Vec<TranslatedRegion>, BackendFailure> {
-        self.translate_structured_regions(regions, target_language, cancellation, false)
+        self.translate_structured_regions(regions, target_language, cancellation, "", false)
     }
 
     fn loaded(&self) -> bool {
@@ -322,28 +388,34 @@ pub(crate) fn build_translation_prompt(text: &str, target_language: &str) -> Str
     prompt
 }
 
-fn apply_prompt_presets(base_prompt: String, prompt: &PromptConfig) -> String {
+fn apply_user_prompt_preset(
+    base_prompt: String,
+    prompt: &PromptConfig,
+    supplemental_prompt: &str,
+) -> String {
     let user = prompt.user.trim();
-    let system = prompt.system.trim();
-    if user.is_empty() && system.is_empty() {
+    let supplemental_prompt = supplemental_prompt.trim();
+    if user.is_empty() && supplemental_prompt.is_empty() {
         return base_prompt;
     }
 
-    let mut output = String::with_capacity(
-        base_prompt.len()
-            + user.len()
-            + system.len()
-            + if user.is_empty() { 0 } else { 2 }
-            + if system.is_empty() { 0 } else { 2 },
-    );
-    if !system.is_empty() {
-        output.push_str(system);
-        output.push_str("\n\n");
+    let prefix_len = user.len()
+        + supplemental_prompt.len()
+        + 2 * usize::from(!user.is_empty() && !supplemental_prompt.is_empty());
+    let separator_len = usize::from(!user.is_empty() || !supplemental_prompt.is_empty()) * 2;
+    let mut output = String::with_capacity(prefix_len + separator_len + base_prompt.len());
+    let mut has_prefix = false;
+    for prefix in [user, supplemental_prompt] {
+        if prefix.is_empty() {
+            continue;
+        }
+        if has_prefix {
+            output.push_str("\n\n");
+        }
+        output.push_str(prefix);
+        has_prefix = true;
     }
-    if !user.is_empty() {
-        output.push_str(user);
-        output.push_str("\n\n");
-    }
+    output.push_str("\n\n");
     output.push_str(&base_prompt);
     output
 }
@@ -561,16 +633,13 @@ fn parse_translation_output(output: &str, jobs: &[TranslationRegion]) -> Result<
         translated_texts.len(),
         jobs.len()
     );
-    Ok(translated_texts
-        .into_iter()
-        .map(|translated_text| translated_text.trim().to_owned())
-        .collect())
+    Ok(translated_texts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        TranslationRegion, apply_prompt_presets, build_contextual_translation_batch_prompt,
+        TranslationRegion, apply_user_prompt_preset, build_contextual_translation_batch_prompt,
         build_translation_batch_prompt, build_translation_prompt, parse_translation_output,
     };
     use crate::model_config::PromptConfig;
@@ -584,15 +653,32 @@ mod tests {
     }
 
     #[test]
-    fn prompt_presets_prepend_system_and_user_context() {
+    fn user_prompt_preset_stays_in_user_content() {
         let prompt = PromptConfig {
             system: "Return concise JSON.".to_owned(),
             user: "Preserve product names.".to_owned(),
         };
 
         assert_eq!(
-            apply_prompt_presets(build_translation_prompt("alpha", "English"), &prompt),
-            "Return concise JSON.\n\nPreserve product names.\n\nTranslate the following text into English. Output only the translation: alpha"
+            apply_user_prompt_preset(build_translation_prompt("alpha", "English"), &prompt, ""),
+            "Preserve product names.\n\nTranslate the following text into English. Output only the translation: alpha"
+        );
+    }
+
+    #[test]
+    fn supplemental_prompt_stays_in_user_content_after_user_preset() {
+        let prompt = PromptConfig {
+            system: "System instruction.".to_owned(),
+            user: "Preserve product names.".to_owned(),
+        };
+
+        assert_eq!(
+            apply_user_prompt_preset(
+                build_translation_prompt("alpha", "English"),
+                &prompt,
+                "Keep dialogue punctuation.",
+            ),
+            "Preserve product names.\n\nKeep dialogue punctuation.\n\nTranslate the following text into English. Output only the translation: alpha"
         );
     }
 
@@ -651,6 +737,19 @@ mod tests {
         assert_eq!(
             parse_translation_output(output, &jobs).unwrap(),
             vec!["A".to_owned(), "B".to_owned()]
+        );
+    }
+    #[test]
+    fn parse_translation_output_preserves_region_whitespace() {
+        let jobs = vec![TranslationRegion {
+            order: 1,
+            source_text: "alpha".to_owned(),
+        }];
+        let output = r#"[{"order":1,"translated_text":"  第一\n行  "}]"#;
+
+        assert_eq!(
+            parse_translation_output(output, &jobs).unwrap(),
+            vec!["  第一\n行  ".to_owned()]
         );
     }
     #[test]

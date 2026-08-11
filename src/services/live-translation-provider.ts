@@ -28,12 +28,16 @@ export interface LiveRoi {
 export interface LiveMetrics {
   framesCaptured: number;
   framesDropped: number;
+  framesSkippedUnchanged: number;
   ocrRuns: number;
   translationRuns: number;
-  cacheHits: number;
   subtitlePublishes: number;
   lastOcrMs: number;
   lastTranslationMs: number;
+  gpuName: string;
+  gpuTotalMemoryMib: number;
+  gpuFreeMemoryMib: number;
+  gpuExecutionMode: string;
 }
 
 export type LiveSessionState =
@@ -76,7 +80,14 @@ export interface LiveRecognitionSettings {
   triggerKey: string;
   triggerEvent: LiveRecognitionTrigger;
   stabilityWaitMs: number;
+  keyTriggerTimeoutMs: number;
   textGroupingEnabled: boolean;
+}
+
+export const LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS = 4_096;
+
+export interface LiveTranslationSettings {
+  supplementalPrompt: string;
 }
 
 export interface LiveSubtitleRegion {
@@ -120,15 +131,14 @@ export interface LiveSubtitle {
   translatedText: string;
   roi: LiveRoi;
   regions: LiveSubtitleRegion[];
+  isStreaming: boolean;
   observedAtEpochMs: number;
 }
 
 export type LiveDebugStage = "ocr" | "translation";
 
 export type LiveDebugOutcome =
-  | "awaiting_confirmation"
   | "confirmed"
-  | "cache_hit"
   | "completed"
   | "skipped_empty_source"
   | "failed";
@@ -144,7 +154,6 @@ export interface LiveDebugRecord {
   regionCount: number;
   roiVersion: number;
   durationMs: number;
-  cacheHit: boolean;
   message?: string;
   observedAtEpochMs: number;
 }
@@ -162,6 +171,7 @@ export function beginLiveSelection(
   targetLanguage: string,
   overlaySettings: LiveOverlaySettings,
   recognitionSettings: LiveRecognitionSettings,
+  translationSettings: LiveTranslationSettings,
   invokeFn: InvokeFn = invoke,
 ): Promise<LiveSessionStatus> {
   return invokeFn<LiveSessionStatus>("begin_live_selection", {
@@ -169,6 +179,7 @@ export function beginLiveSelection(
     targetLanguage,
     overlaySettings,
     recognitionSettings,
+    translationSettings,
   });
 }
 
@@ -179,6 +190,7 @@ export function confirmLiveSelection(
 ): Promise<LiveSessionStatus> {
   return invokeFn<LiveSessionStatus>("confirm_live_selection", { sessionId, roi });
 }
+
 
 export function beginLiveRoiUpdate(
   sessionId: string,
@@ -216,6 +228,12 @@ export function stopLiveSession(
     "stop_live_session",
     sessionId === undefined ? {} : { sessionId },
   );
+}
+export function interruptLiveTranslation(
+  sessionId: string,
+  invokeFn: InvokeFn = invoke,
+): Promise<LiveSessionStatus> {
+  return invokeFn<LiveSessionStatus>("interrupt_live_translation", { sessionId });
 }
 
 export function getLiveSessionStatus(invokeFn: InvokeFn = invoke): Promise<LiveSessionStatus> {

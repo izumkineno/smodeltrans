@@ -776,10 +776,16 @@ fn translate_text_blocking(
         let engine = engine
             .as_mut()
             .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
-        let result =
-            engine.translate_text(&text, &target_language, cancellation, |progress, stage| {
+        let result = engine.translate_text(
+            &text,
+            &target_language,
+            "",
+            cancellation,
+            |progress, stage| {
                 emit_translation_progress(app, run_id, progress, stage);
-            });
+            },
+            |_| {},
+        );
         (result, engine.model_states())
     };
     state.set_model_states(ocr_loaded, translator_loaded);

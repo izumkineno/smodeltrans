@@ -1,3 +1,15 @@
+# Agent 执行前置要求
+
+1. 所有 agent、子 agent 和自动化任务在执行任何操作前，必须先读取并遵守仓库根目录 `AGENT.md`；未读取本文件不得继续。
+2. 本文件规则适用于分析、编辑、编译、运行、测试、提交及验证全过程。
+
+## `candle-flash-attn` 强制禁止事项
+
+1. 严禁重新编译 `candle-flash-attn`。不得执行或组合任何会导致其重新编译的命令，包括 `cargo build`、`cargo check`、`cargo test`、`cargo run` 以及清理后构建。必须复用现有构建产物；否则会造成超长编译时间和超大的编译空间占用。
+2. 严禁新建工程、临时工程、独立目录或 worktree，用于 `candle-flash-attn` 相关的编译或运行。
+3. 严禁修改任何可能使 `candle-flash-attn` 失效并触发重新编译的编译条件或构建输入，包括但不限于 Cargo features、依赖版本、patch、profile、target 配置、CUDA/编译器参数、环境变量、build script 和相关配置文件。
+4. 仅允许只读检查现有配置与复用现有构建产物。若任务必须重新编译或调整上述编译条件，agent 必须停止相关操作并明确报告，不得自行执行。
+
 # 提交信息规范
 
 ## 强制要求

@@ -2,15 +2,16 @@ use super::contracts::DEFAULT_STABILITY_WAIT_MS;
 use crate::backend::contracts::RegionRecord;
 
 use std::{
-    collections::VecDeque,
     sync::{Condvar, Mutex},
     time::Duration,
 };
 
-const SIGNATURE_COLUMNS: usize = 24;
-const SIGNATURE_ROWS: usize = 14;
-const CHANGE_THRESHOLD: f32 = 0.035;
-const PROBE_INTERVAL_MS: u64 = 250;
+const SIGNATURE_COLUMNS: usize = 48;
+const SIGNATURE_ROWS: usize = 28;
+const SIGNATURE_SIZE: usize = SIGNATURE_COLUMNS * SIGNATURE_ROWS;
+const MEAN_CHANGE_THRESHOLD: f32 = 0.012;
+const CELL_CHANGE_THRESHOLD: u8 = 18;
+const CHANGED_CELL_RATIO: f32 = 0.02;
 #[derive(Debug)]
 pub(super) struct OwnedFrame {
     pub(super) width: u32,
@@ -59,9 +60,9 @@ impl LatestFrameSlot {
 #[derive(Debug)]
 pub(super) struct StabilityScheduler {
     settle_ms: u64,
-    signature: Vec<u8>,
+    signature: Option<[u8; SIGNATURE_SIZE]>,
     stable_since_ms: Option<u64>,
-    last_probe_ms: Option<u64>,
+    stable_observations: u8,
     suppressed_until_change: bool,
 }
 
@@ -75,9 +76,9 @@ impl StabilityScheduler {
     pub(super) fn new(settle_ms: u64) -> Self {
         Self {
             settle_ms,
-            signature: Vec::new(),
+            signature: None,
             stable_since_ms: None,
-            last_probe_ms: None,
+            stable_observations: 0,
             suppressed_until_change: false,
         }
     }
@@ -91,18 +92,24 @@ impl StabilityScheduler {
     }
 
     pub(super) fn observe(&mut self, frame: &OwnedFrame, now_ms: u64) -> bool {
-        let signature = luminance_signature(frame);
-        if self.signature.is_empty() {
-            self.signature = signature;
-            self.stable_since_ms = Some(now_ms);
+        let Some(signature) = luminance_signature(frame) else {
+            self.reset();
             return false;
-        }
-        let changed = signature_difference(&self.signature, &signature) > CHANGE_THRESHOLD;
-        self.signature = signature;
+        };
+        let Some(previous) = self.signature.as_ref() else {
+            self.signature = Some(signature);
+            self.stable_since_ms = Some(now_ms);
+            self.stable_observations = 1;
+            return false;
+        };
+        let changed = signatures_differ(previous, &signature);
+        self.signature = Some(signature);
         if changed {
             self.stable_since_ms = Some(now_ms);
+            self.stable_observations = 1;
             self.suppressed_until_change = false;
-            self.last_probe_ms = None;
+        } else {
+            self.stable_observations = self.stable_observations.saturating_add(1);
         }
         self.should_probe(now_ms)
     }
@@ -111,22 +118,13 @@ impl StabilityScheduler {
         self.should_probe(now_ms)
     }
 
-    pub(super) fn mark_confirmed(&mut self) {
-        self.suppressed_until_change = true;
-    }
-
     pub(super) fn reset(&mut self) {
         let settle_ms = self.settle_ms;
         *self = Self::new(settle_ms);
     }
 
     fn should_probe(&mut self, now_ms: u64) -> bool {
-        if self.suppressed_until_change || self.signature.is_empty() {
-            return false;
-        }
-        if self
-            .last_probe_ms
-            .is_some_and(|last| now_ms.saturating_sub(last) < PROBE_INTERVAL_MS)
+        if self.suppressed_until_change || self.signature.is_none() || self.stable_observations < 2
         {
             return false;
         }
@@ -134,7 +132,7 @@ impl StabilityScheduler {
             .stable_since_ms
             .is_some_and(|since| now_ms.saturating_sub(since) >= self.settle_ms);
         if settled {
-            self.last_probe_ms = Some(now_ms);
+            self.suppressed_until_change = true;
             true
         } else {
             false
@@ -142,64 +140,43 @@ impl StabilityScheduler {
     }
 }
 
-fn luminance_signature(frame: &OwnedFrame) -> Vec<u8> {
-    if frame.width == 0 || frame.height == 0 || frame.rgb.len() < 3 {
-        return Vec::new();
+fn luminance_signature(frame: &OwnedFrame) -> Option<[u8; SIGNATURE_SIZE]> {
+    let width = usize::try_from(frame.width).ok()?;
+    let height = usize::try_from(frame.height).ok()?;
+    let expected_len = width.checked_mul(height)?.checked_mul(3)?;
+    if width == 0 || height == 0 || frame.rgb.len() < expected_len {
+        return None;
     }
-    let mut signature = Vec::with_capacity(SIGNATURE_COLUMNS * SIGNATURE_ROWS);
+    let mut signature = [0_u8; SIGNATURE_SIZE];
     for row in 0..SIGNATURE_ROWS {
-        let y = ((row * frame.height as usize) / SIGNATURE_ROWS)
-            .min(frame.height.saturating_sub(1) as usize);
+        let y = ((row * height) / SIGNATURE_ROWS).min(height - 1);
         for column in 0..SIGNATURE_COLUMNS {
-            let x = ((column * frame.width as usize) / SIGNATURE_COLUMNS)
-                .min(frame.width.saturating_sub(1) as usize);
-            let offset = (y * frame.width as usize + x) * 3;
+            let x = ((column * width) / SIGNATURE_COLUMNS).min(width - 1);
+            let offset = (y * width + x) * 3;
             let red = u32::from(frame.rgb[offset]);
             let green = u32::from(frame.rgb[offset + 1]);
             let blue = u32::from(frame.rgb[offset + 2]);
-            signature.push(((red * 77 + green * 150 + blue * 29) >> 8) as u8);
+            signature[row * SIGNATURE_COLUMNS + column] =
+                ((red * 77 + green * 150 + blue * 29) >> 8) as u8;
         }
     }
-    signature
+    Some(signature)
 }
 
-fn signature_difference(left: &[u8], right: &[u8]) -> f32 {
+fn signatures_differ(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() || left.is_empty() {
-        return 1.0;
+        return true;
     }
-    let difference = left
-        .iter()
-        .zip(right)
-        .map(|(left, right)| u64::from(left.abs_diff(*right)))
-        .sum::<u64>();
-    difference as f32 / (left.len() as f32 * 255.0)
-}
-
-#[derive(Debug, Default)]
-pub(super) struct TwoProbeConfirmation {
-    candidate: Option<String>,
-    hits: u8,
-    accepted: Option<String>,
-}
-
-impl TwoProbeConfirmation {
-    pub(super) fn observe(&mut self, text: String) -> Option<String> {
-        if self.candidate.as_deref() == Some(text.as_str()) {
-            self.hits = self.hits.saturating_add(1);
-        } else {
-            self.candidate = Some(text.clone());
-            self.hits = 1;
-        }
-        if self.hits < 2 || self.accepted.as_deref() == Some(text.as_str()) {
-            return None;
-        }
-        self.accepted = Some(text.clone());
-        Some(text)
+    let mut difference = 0_u64;
+    let mut changed_cells = 0_usize;
+    for (&left, &right) in left.iter().zip(right) {
+        let cell_difference = left.abs_diff(right);
+        difference += u64::from(cell_difference);
+        changed_cells += usize::from(cell_difference >= CELL_CHANGE_THRESHOLD);
     }
-
-    pub(super) fn reset(&mut self) {
-        *self = Self::default();
-    }
+    let mean_difference = difference as f32 / (left.len() as f32 * 255.0);
+    let changed_ratio = changed_cells as f32 / left.len() as f32;
+    mean_difference > MEAN_CHANGE_THRESHOLD || changed_ratio > CHANGED_CELL_RATIO
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -348,7 +325,29 @@ pub(super) struct LiveOcrGroup {
 
 impl LiveOcrGroup {
     pub(super) fn should_re_recognize(&self) -> bool {
-        self.regions.len() > 1
+        const SEVERE_FRAGMENT_COUNT: usize = 6;
+        const SHORT_FRAGMENT_CHARACTER_LIMIT: usize = 2;
+
+        let fragment_count = self.regions.len();
+        if fragment_count >= SEVERE_FRAGMENT_COUNT {
+            return true;
+        }
+        if fragment_count < 3 {
+            return false;
+        }
+        let short_fragments = self
+            .regions
+            .iter()
+            .filter(|region| {
+                region
+                    .source_text
+                    .chars()
+                    .filter(|character| character.is_alphanumeric())
+                    .count()
+                    <= SHORT_FRAGMENT_CHARACTER_LIMIT
+            })
+            .count();
+        short_fragments.saturating_mul(2) >= fragment_count
     }
 
     pub(super) fn quad(&self) -> [[i32; 2]; 4] {
@@ -363,6 +362,7 @@ impl LiveOcrGroup {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn into_regions(self) -> Vec<RegionRecord> {
         self.regions
     }
@@ -499,7 +499,7 @@ pub(super) fn plan_live_ocr_groups(regions: Vec<RegionRecord>) -> Vec<LiveOcrGro
             record.source_text = normalize_text(&record.source_text);
             record.translated_text.clear();
             let bounds = TextBounds::from_quad(record.quad_points)?;
-            (!record.source_text.is_empty()).then_some(PreparedRegion {
+            has_translatable_character(&record.source_text).then_some(PreparedRegion {
                 original_order: record.order,
                 record,
                 bounds,
@@ -572,7 +572,7 @@ pub(super) fn plan_live_ocr_groups(regions: Vec<RegionRecord>) -> Vec<LiveOcrGro
 pub(super) fn finalize_live_regions(regions: &mut Vec<RegionRecord>) {
     regions.retain_mut(|region| {
         region.source_text = normalize_text(&region.source_text);
-        !region.source_text.is_empty()
+        has_translatable_character(&region.source_text)
     });
     for (index, region) in regions.iter_mut().enumerate() {
         region.order = u32::try_from(index + 1).unwrap_or(u32::MAX);
@@ -631,10 +631,10 @@ pub(super) fn normalized_region_text(regions: &[RegionRecord]) -> String {
         .join("\n")
 }
 
-pub(super) fn normalized_translated_region_text(regions: &[RegionRecord]) -> String {
-    ordered_regions(regions)
+pub(super) fn live_translated_region_text(regions: &[RegionRecord]) -> String {
+    ordered_live_regions(regions)
         .into_iter()
-        .map(|region| normalize_text(&region.translated_text))
+        .map(|region| region.translated_text.as_str())
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
@@ -644,15 +644,6 @@ pub(super) fn normalized_live_region_text(regions: &[RegionRecord]) -> String {
     ordered_live_regions(regions)
         .into_iter()
         .map(|region| normalize_text(&region.source_text))
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-pub(super) fn normalized_live_translated_region_text(regions: &[RegionRecord]) -> String {
-    ordered_live_regions(regions)
-        .into_iter()
-        .map(|region| normalize_text(&region.translated_text))
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
@@ -698,53 +689,8 @@ pub(super) fn normalize_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-#[derive(Debug)]
-pub(super) struct BoundedCache {
-    capacity: usize,
-    entries: VecDeque<(String, String)>,
-}
-
-impl BoundedCache {
-    pub(super) fn new(capacity: usize) -> Self {
-        Self {
-            capacity: capacity.max(1),
-            entries: VecDeque::with_capacity(capacity.max(1)),
-        }
-    }
-
-    pub(super) fn get(&mut self, key: &str) -> Option<String> {
-        let index = self
-            .entries
-            .iter()
-            .position(|(candidate, _)| candidate == key)?;
-        let entry = self.entries.remove(index)?;
-        let value = entry.1.clone();
-        self.entries.push_back(entry);
-        Some(value)
-    }
-
-    pub(super) fn insert(&mut self, key: String, value: String) {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|(candidate, _)| candidate == &key)
-        {
-            self.entries.remove(index);
-        }
-        self.entries.push_back((key, value));
-        while self.entries.len() > self.capacity {
-            self.entries.pop_front();
-        }
-    }
-
-    pub(super) fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
+fn has_translatable_character(value: &str) -> bool {
+    value.chars().any(char::is_alphabetic)
 }
 
 pub(super) const fn roi_result_is_current(result_version: u64, current_version: u64) -> bool {
@@ -754,9 +700,9 @@ pub(super) const fn roi_result_is_current(result_version: u64, current_version: 
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCache, LatestFrameSlot, OwnedFrame, StabilityScheduler, TwoProbeConfirmation,
-        finalize_live_regions, normalized_live_region_text, normalized_region_text,
-        normalized_translated_region_text, plan_live_ocr_groups, roi_result_is_current,
+        LatestFrameSlot, OwnedFrame, StabilityScheduler, finalize_live_regions,
+        live_translated_region_text, normalized_live_region_text, normalized_region_text,
+        plan_live_ocr_groups, roi_result_is_current,
     };
     use crate::backend::contracts::RegionRecord;
     use crate::backend::live::contracts::LiveRoi;
@@ -792,26 +738,31 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_settles_and_confirmation_requires_two_identical_hits() {
-        let mut scheduler = StabilityScheduler::default();
+    fn scheduler_processes_one_stable_frame_and_reuses_it_until_change() {
+        let mut scheduler = StabilityScheduler::new(300);
         assert!(!scheduler.observe(&frame(20, 1), 0));
-        assert!(scheduler.tick(300));
-        let mut confirmation = TwoProbeConfirmation::default();
-        assert!(confirmation.observe("hello".to_owned()).is_none());
-        assert_eq!(
-            confirmation.observe("hello".to_owned()),
-            Some("hello".to_owned())
+        assert!(
+            !scheduler.tick(300),
+            "one frame is not continuous stability"
         );
-        scheduler.mark_confirmed();
+        assert!(scheduler.observe(&frame(20, 1), 300));
         assert!(!scheduler.tick(2_000));
-        assert!(!scheduler.observe(&frame(240, 1), 2_001));
-        assert!(scheduler.tick(2_301));
+        assert!(!scheduler.observe(&frame(20, 1), 2_001));
+        assert!(!scheduler.tick(2_500));
+        assert!(!scheduler.observe(&frame(240, 1), 2_501));
+        assert!(
+            !scheduler.tick(2_801),
+            "changed frame needs a matching successor"
+        );
+        assert!(scheduler.observe(&frame(240, 1), 2_801));
+        assert!(!scheduler.tick(4_000));
     }
 
     #[test]
     fn scheduler_waits_for_the_configured_stability_window() {
         let mut scheduler = StabilityScheduler::new(800);
         assert!(!scheduler.observe(&frame(20, 1), 0));
+        assert!(!scheduler.observe(&frame(20, 1), 400));
         assert!(!scheduler.tick(799));
         assert!(scheduler.tick(800));
     }
@@ -820,9 +771,29 @@ mod tests {
     fn scheduler_restarts_wait_after_a_visual_change_without_forcing_ocr() {
         let mut scheduler = StabilityScheduler::new(500);
         assert!(!scheduler.observe(&frame(20, 1), 0));
+        assert!(!scheduler.observe(&frame(20, 1), 250));
         assert!(!scheduler.observe(&frame(240, 1), 400));
         assert!(!scheduler.tick(899));
-        assert!(scheduler.tick(900));
+        assert!(scheduler.observe(&frame(240, 1), 900));
+    }
+
+    #[test]
+    fn scheduler_detects_a_localized_change_after_reusing_a_frame() {
+        let mut scheduler = StabilityScheduler::new(300);
+        let original = frame(20, 1);
+        assert!(!scheduler.observe(&original, 0));
+        assert!(scheduler.observe(&original, 300));
+
+        let mut changed = frame(20, 1);
+        for y in 4..10 {
+            for x in 8..16 {
+                let offset = (y * changed.width as usize + x) * 3;
+                changed.rgb[offset..offset + 3].fill(240);
+            }
+        }
+        assert!(!scheduler.observe(&changed, 400));
+        assert!(!scheduler.tick(700));
+        assert!(scheduler.observe(&changed, 700));
     }
 
     #[test]
@@ -839,19 +810,19 @@ mod tests {
     }
 
     #[test]
-    fn translated_region_text_preserves_one_line_per_region() {
+    fn live_translated_region_text_preserves_model_whitespace() {
         let mut regions = vec![
             RegionRecord::untranslated(1, [[60, 50], [90, 50], [90, 70], [60, 70]], "third"),
             RegionRecord::untranslated(2, [[50, 10], [90, 10], [90, 30], [50, 30]], "second"),
             RegionRecord::untranslated(3, [[5, 10], [40, 10], [40, 30], [5, 30]], "first"),
         ];
-        regions[0].translated_text = "第三 行".to_owned();
+        regions[0].translated_text = "第三  行\n下一行  ".to_owned();
         regions[1].translated_text = "第二".to_owned();
-        regions[2].translated_text = "第一\n行".to_owned();
+        regions[2].translated_text = " 第一\n行 ".to_owned();
 
         assert_eq!(
-            normalized_translated_region_text(&regions),
-            "第一 行\n第二\n第三 行"
+            live_translated_region_text(&regions),
+            "第三  行\n下一行  \n第二\n 第一\n行 "
         );
     }
 
@@ -875,9 +846,52 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Hello world", "next line", "unrelated"]
         );
-        assert!(groups[0].should_re_recognize());
+        assert!(!groups[0].should_re_recognize());
         assert!(!groups[1].should_re_recognize());
         assert!(!groups[2].should_re_recognize());
+    }
+
+    #[test]
+    fn live_grouping_re_recognizes_only_severely_fragmented_lines() {
+        let groups = plan_live_ocr_groups(
+            ["A", "very", "broken", "subtitle", "line", "here"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    let left = i32::try_from(index).unwrap() * 22;
+                    RegionRecord::untranslated(
+                        u32::try_from(index + 1).unwrap(),
+                        [[left, 10], [left + 20, 10], [left + 20, 30], [left, 30]],
+                        text,
+                    )
+                })
+                .collect(),
+        );
+
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].should_re_recognize());
+    }
+
+    #[test]
+    fn live_regions_drop_numeric_and_symbol_only_detector_noise() {
+        let mut regions = vec![
+            RegionRecord::untranslated(1, [[0, 0], [50, 0], [50, 20], [0, 20]], "0-----"),
+            RegionRecord::untranslated(2, [[0, 30], [20, 30], [20, 50], [0, 50]], "×"),
+            RegionRecord::untranslated(
+                3,
+                [[0, 60], [180, 60], [180, 80], [0, 80]],
+                "Boats are available",
+            ),
+        ];
+
+        let groups = plan_live_ocr_groups(regions.clone());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].source_text(), "Boats are available");
+
+        finalize_live_regions(&mut regions);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].order, 1);
+        assert_eq!(regions[0].source_text, "Boats are available");
     }
 
     #[test]
@@ -1025,18 +1039,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2, 3]
         );
-    }
-
-    #[test]
-    fn cache_is_bounded_and_uses_recent_entries() {
-        let mut cache = BoundedCache::new(2);
-        cache.insert("a".to_owned(), "A".to_owned());
-        cache.insert("b".to_owned(), "B".to_owned());
-        assert_eq!(cache.get("a"), Some("A".to_owned()));
-        cache.insert("c".to_owned(), "C".to_owned());
-        assert_eq!(cache.len(), 2);
-        assert!(cache.get("b").is_none());
-        assert_eq!(cache.get("a"), Some("A".to_owned()));
     }
 
     #[test]

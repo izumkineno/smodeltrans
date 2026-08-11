@@ -27,8 +27,8 @@ use windows::{
 };
 use windows_capture::{
     capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
-    frame::Frame,
-    graphics_capture_api::InternalCaptureControl,
+    frame::{DirtyRegion, Frame},
+    graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl},
     settings::{
         ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
         MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
@@ -299,6 +299,7 @@ struct CaptureFlags {
 struct CaptureHandler {
     flags: CaptureFlags,
     scratch: Vec<u8>,
+    last_roi_version: Option<u64>,
 }
 
 impl GraphicsCaptureApiHandler for CaptureHandler {
@@ -309,6 +310,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         Ok(Self {
             flags: ctx.flags,
             scratch: Vec::new(),
+            last_roi_version: None,
         })
     }
 
@@ -317,6 +319,34 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         frame: &mut Frame<'_>,
         capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        if self
+            .flags
+            .terminal_error
+            .lock()
+            .map(|error| error.is_some())
+            .unwrap_or(true)
+        {
+            capture_control.stop();
+            return Ok(());
+        }
+        let config = self
+            .flags
+            .config
+            .lock()
+            .map_err(|_| "实时 ROI 锁已损坏".to_owned())?
+            .clone();
+        if self.last_roi_version == Some(config.roi_version) {
+            if let Ok(dirty_regions) = frame.dirty_regions() {
+                if dirty_regions_miss_roi(frame.width(), frame.height(), &config, &dirty_regions) {
+                    if let Ok(mut metrics) = self.flags.metrics.lock() {
+                        metrics.frames_skipped_unchanged =
+                            metrics.frames_skipped_unchanged.saturating_add(1);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         // Window capture frames include the non-client title bar. The live ROI
         // is defined against the target client area, so remove that strip
         // before mapping coordinates and copying pixels.
@@ -326,12 +356,6 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         let frame_width = buffer.width();
         let frame_height = buffer.height();
         let bytes = buffer.as_nopadding_buffer(&mut self.scratch);
-        let config = self
-            .flags
-            .config
-            .lock()
-            .map_err(|_| "实时 ROI 锁已损坏".to_owned())?
-            .clone();
         let roi = config
             .roi
             .to_physical(frame_width, frame_height)
@@ -395,20 +419,12 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             },
             roi_version: config.roi_version,
         });
+        self.last_roi_version = Some(config.roi_version);
         if let Ok(mut metrics) = self.flags.metrics.lock() {
             metrics.frames_captured = metrics.frames_captured.saturating_add(1);
             if dropped {
                 metrics.frames_dropped = metrics.frames_dropped.saturating_add(1);
             }
-        }
-        if self
-            .flags
-            .terminal_error
-            .lock()
-            .map(|error| error.is_some())
-            .unwrap_or(true)
-        {
-            capture_control.stop();
         }
         Ok(())
     }
@@ -420,6 +436,51 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         self.flags.latest.wake();
         Ok(())
     }
+}
+
+fn dirty_regions_miss_roi(
+    frame_width: u32,
+    frame_height: u32,
+    config: &LiveConfig,
+    dirty_regions: &[DirtyRegion],
+) -> bool {
+    if frame_width != config.client_width || frame_height < config.client_height {
+        return false;
+    }
+    let title_bar_height = frame_height - config.client_height;
+    if title_bar_height > 256 {
+        return false;
+    }
+    let Some(roi) = config
+        .roi
+        .to_physical(config.client_width, config.client_height)
+    else {
+        return false;
+    };
+    let roi_left = i64::from(roi.x);
+    let roi_top = i64::from(roi.y) + i64::from(title_bar_height);
+    let roi_right = roi_left + i64::from(roi.width);
+    let roi_bottom = roi_top + i64::from(roi.height);
+    !dirty_regions_intersect_rect(dirty_regions, roi_left, roi_top, roi_right, roi_bottom)
+}
+
+fn dirty_regions_intersect_rect(
+    dirty_regions: &[DirtyRegion],
+    roi_left: i64,
+    roi_top: i64,
+    roi_right: i64,
+    roi_bottom: i64,
+) -> bool {
+    dirty_regions.iter().any(|dirty| {
+        if dirty.width <= 0 || dirty.height <= 0 {
+            return false;
+        }
+        let left = i64::from(dirty.x);
+        let top = i64::from(dirty.y);
+        let right = left + i64::from(dirty.width);
+        let bottom = top + i64::from(dirty.height);
+        left < roi_right && right > roi_left && top < roi_bottom && bottom > roi_top
+    })
 }
 
 pub(in crate::backend::live) struct CaptureWorker {
@@ -445,13 +506,19 @@ pub(in crate::backend::live) fn start_capture(
     metrics: Arc<Mutex<LiveMetrics>>,
 ) -> Result<CaptureWorker, BackendFailure> {
     let target = target_from_id(target_id)?;
+    let dirty_region_settings = if GraphicsCaptureApi::is_dirty_region_supported().unwrap_or(false)
+    {
+        DirtyRegionSettings::ReportOnly
+    } else {
+        DirtyRegionSettings::Default
+    };
     let settings = Settings::new(
         target,
         CursorCaptureSettings::WithoutCursor,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Exclude,
-        MinimumUpdateIntervalSettings::Custom(Duration::from_millis(50)),
-        DirtyRegionSettings::Default,
+        MinimumUpdateIntervalSettings::Custom(Duration::from_millis(100)),
+        dirty_region_settings,
         ColorFormat::Bgra8,
         CaptureFlags {
             latest,
@@ -470,8 +537,9 @@ pub(in crate::backend::live) fn start_capture(
 
 #[cfg(test)]
 mod tests {
-    use super::{activate_target_window, trigger_virtual_key};
+    use super::{activate_target_window, dirty_regions_intersect_rect, trigger_virtual_key};
     use crate::backend::failure::BackendFailureCode;
+    use windows_capture::frame::DirtyRegion;
 
     #[test]
     fn activating_an_invalid_target_rejects_the_handle_before_calling_windows() {
@@ -480,6 +548,37 @@ mod tests {
 
         assert_eq!(error.code(), BackendFailureCode::Arguments);
         assert_eq!(error.message(), "targetId 不是有效的窗口句柄");
+    }
+
+    #[test]
+    fn dirty_regions_only_wake_live_ocr_when_the_roi_changes() {
+        let outside = DirtyRegion {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
+        let overlapping = DirtyRegion {
+            x: 150,
+            y: 120,
+            width: 100,
+            height: 40,
+        };
+
+        assert!(!dirty_regions_intersect_rect(
+            &[outside],
+            100,
+            100,
+            200,
+            150,
+        ));
+        assert!(dirty_regions_intersect_rect(
+            &[outside, overlapping],
+            100,
+            100,
+            200,
+            150,
+        ));
     }
 
     #[test]

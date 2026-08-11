@@ -4,14 +4,21 @@ import type { BackendStatus, ModelRuntimeStatus } from "./translation-provider";
 import type {
   LiveOverlaySettings,
   LiveRecognitionSettings,
+  LiveTranslationSettings,
 } from "./live-translation-provider";
+
+import { LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS } from "./live-translation-provider";
 
 const TARGET_LANGUAGE_STORAGE_KEY = "smodeltrans.targetLanguage";
 const LIVE_OVERLAY_SETTINGS_STORAGE_KEY = "smodeltrans.liveOverlaySettings";
 const LIVE_RECOGNITION_SETTINGS_STORAGE_KEY = "smodeltrans.liveRecognitionSettings";
+const LIVE_TRANSLATION_SETTINGS_STORAGE_KEY = "smodeltrans.liveTranslationSettings";
 export const DEFAULT_LIVE_STABILITY_WAIT_MS = 300;
 export const LIVE_STABILITY_WAIT_MIN_MS = 0;
 export const LIVE_STABILITY_WAIT_MAX_MS = 5_000;
+export const DEFAULT_KEY_TRIGGER_TIMEOUT_MS = 1_000;
+export const KEY_TRIGGER_TIMEOUT_MIN_MS = 100;
+export const KEY_TRIGGER_TIMEOUT_MAX_MS = 5_000;
 
 export const targetLanguage = ref("Chinese");
 export const backendStatus = ref<BackendStatus | null>(null);
@@ -30,7 +37,12 @@ export const liveRecognitionSettings = ref<LiveRecognitionSettings>({
   triggerKey: "F8",
   triggerEvent: "press",
   stabilityWaitMs: DEFAULT_LIVE_STABILITY_WAIT_MS,
+  keyTriggerTimeoutMs: DEFAULT_KEY_TRIGGER_TIMEOUT_MS,
   textGroupingEnabled: true,
+});
+
+export const liveTranslationSettings = ref<LiveTranslationSettings>({
+  supplementalPrompt: "",
 });
 
 let persistedTargetLanguageLoaded = false;
@@ -168,6 +180,18 @@ function normalizePersistedLiveStabilityWaitMs(value: unknown): number | null {
   return value;
 }
 
+function normalizePersistedKeyTriggerTimeoutMs(value: unknown): number | null {
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < KEY_TRIGGER_TIMEOUT_MIN_MS ||
+    value > KEY_TRIGGER_TIMEOUT_MAX_MS
+  ) {
+    return null;
+  }
+  return value;
+}
+
 export function loadPersistedLiveRecognitionSettings(): string | null {
   if (persistedLiveRecognitionSettingsLoaded || typeof window === "undefined") {
     return null;
@@ -187,6 +211,7 @@ export function loadPersistedLiveRecognitionSettings(): string | null {
       triggerKey?: unknown;
       triggerEvent?: string;
       stabilityWaitMs?: unknown;
+      keyTriggerTimeoutMs?: unknown;
       textGroupingEnabled?: unknown;
     };
     const mode = value.mode === "hold_key" ? "key_trigger" : value.mode;
@@ -196,6 +221,10 @@ export function loadPersistedLiveRecognitionSettings(): string | null {
       value.stabilityWaitMs === undefined
         ? DEFAULT_LIVE_STABILITY_WAIT_MS
         : normalizePersistedLiveStabilityWaitMs(value.stabilityWaitMs);
+    const keyTriggerTimeoutMs =
+      value.keyTriggerTimeoutMs === undefined
+        ? DEFAULT_KEY_TRIGGER_TIMEOUT_MS
+        : normalizePersistedKeyTriggerTimeoutMs(value.keyTriggerTimeoutMs);
     const textGroupingEnabled =
       value.textGroupingEnabled === undefined ? true : value.textGroupingEnabled;
     if (
@@ -203,6 +232,7 @@ export function loadPersistedLiveRecognitionSettings(): string | null {
       (triggerEvent !== "press" && triggerEvent !== "release") ||
       !triggerKey ||
       stabilityWaitMs === null ||
+      keyTriggerTimeoutMs === null ||
       typeof textGroupingEnabled !== "boolean"
     ) {
       return "实时识别触发设置无效，将使用默认值。";
@@ -212,6 +242,7 @@ export function loadPersistedLiveRecognitionSettings(): string | null {
       triggerKey,
       triggerEvent,
       stabilityWaitMs,
+      keyTriggerTimeoutMs,
       textGroupingEnabled,
     };
     return null;
@@ -224,6 +255,9 @@ export function savePersistedLiveRecognitionSettings(): string | null {
   const settings = liveRecognitionSettings.value;
   if (normalizePersistedLiveStabilityWaitMs(settings.stabilityWaitMs) === null) {
     return `OCR 字幕稳定等待必须为 ${LIVE_STABILITY_WAIT_MIN_MS} 到 ${LIVE_STABILITY_WAIT_MAX_MS} 毫秒的整数。`;
+  }
+  if (normalizePersistedKeyTriggerTimeoutMs(settings.keyTriggerTimeoutMs) === null) {
+    return `按键触发 OCR 超时必须为 ${KEY_TRIGGER_TIMEOUT_MIN_MS} 到 ${KEY_TRIGGER_TIMEOUT_MAX_MS} 毫秒的整数。`;
   }
   const triggerKey = settings.triggerKey.trim();
   if (!triggerKey) {
@@ -241,5 +275,53 @@ export function savePersistedLiveRecognitionSettings(): string | null {
     return null;
   } catch {
     return "无法写入实时识别触发设置，请检查应用存储权限。";
+  }
+}
+
+let persistedLiveTranslationSettingsLoaded = false;
+
+export function loadPersistedLiveTranslationSettings(): string | null {
+  if (persistedLiveTranslationSettingsLoaded || typeof window === "undefined") {
+    return null;
+  }
+  persistedLiveTranslationSettingsLoaded = true;
+  try {
+    const rawSettings = window.localStorage.getItem(LIVE_TRANSLATION_SETTINGS_STORAGE_KEY);
+    if (!rawSettings) {
+      return null;
+    }
+    const parsed: unknown = JSON.parse(rawSettings);
+    if (!parsed || typeof parsed !== "object") {
+      return "实时翻译补充提示设置无效，将使用默认值。";
+    }
+    const value = parsed as Partial<LiveTranslationSettings>;
+    const supplementalPrompt = value.supplementalPrompt;
+    if (
+      typeof supplementalPrompt !== "string" ||
+      Array.from(supplementalPrompt).length > LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS
+    ) {
+      return "实时翻译补充提示不能超过 4096 个字符。";
+    }
+    liveTranslationSettings.value = { supplementalPrompt };
+    return null;
+  } catch {
+    return "无法读取实时翻译补充提示设置，将使用默认值。";
+  }
+}
+
+export function savePersistedLiveTranslationSettings(): string | null {
+  const supplementalPrompt = liveTranslationSettings.value.supplementalPrompt.trim();
+  if (Array.from(supplementalPrompt).length > LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS) {
+    return "实时翻译补充提示不能超过 4096 个字符。";
+  }
+  liveTranslationSettings.value = { supplementalPrompt };
+  try {
+    window.localStorage.setItem(
+      LIVE_TRANSLATION_SETTINGS_STORAGE_KEY,
+      JSON.stringify(liveTranslationSettings.value),
+    );
+    return null;
+  } catch {
+    return "无法写入实时翻译补充提示设置，请检查应用存储权限。";
   }
 }

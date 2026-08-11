@@ -14,6 +14,7 @@ import {
   listenLiveRegionBoxesVisible,
   listenLiveStatus,
   listenLiveSubtitle,
+  interruptLiveTranslation,
   pauseLiveSession,
   groupLiveSubtitleRegions,
   resolveLiveSubtitleRegionVerticalAnchor,
@@ -31,6 +32,7 @@ import type {
   LiveSessionStatus,
   LiveSubtitle,
   LiveSubtitleRegion,
+  LiveTranslationSettings,
 } from "./live-translation-provider";
 const target: CaptureWindowInfo = {
   id: "778899",
@@ -63,7 +65,12 @@ const recognitionSettings: LiveRecognitionSettings = {
   triggerKey: "F8",
   triggerEvent: "release",
   stabilityWaitMs: 800,
+  keyTriggerTimeoutMs: 1_200,
   textGroupingEnabled: true,
+};
+
+const translationSettings: LiveTranslationSettings = {
+  supplementalPrompt: "Keep character names and dialogue punctuation.",
 };
 
 const status: LiveSessionStatus = {
@@ -76,12 +83,16 @@ const status: LiveSessionStatus = {
   metrics: {
     framesCaptured: 120,
     framesDropped: 4,
+    framesSkippedUnchanged: 92,
     ocrRuns: 8,
     translationRuns: 5,
-    cacheHits: 2,
     subtitlePublishes: 3,
     lastOcrMs: 44,
     lastTranslationMs: 81,
+    gpuName: "NVIDIA GeForce RTX 4090",
+    gpuTotalMemoryMib: 24_564,
+    gpuFreeMemoryMib: 19_200,
+    gpuExecutionMode: "gpu_resident",
   },
 };
 
@@ -97,12 +108,20 @@ describe("live translation command adapter", () => {
     };
 
     await listCaptureWindows(invokeFn);
-    await beginLiveSelection(target.id, "English", overlaySettings, recognitionSettings, invokeFn);
+    await beginLiveSelection(
+      target.id,
+      "English",
+      overlaySettings,
+      recognitionSettings,
+      translationSettings,
+      invokeFn,
+    );
     await confirmLiveSelection("live-1", roi, invokeFn);
     await beginLiveRoiUpdate("live-1", invokeFn);
     await cancelLiveSelection("live-1", invokeFn);
     await pauseLiveSession("live-1", invokeFn);
     await resumeLiveSession("live-1", invokeFn);
+    await interruptLiveTranslation("live-1", invokeFn);
     await stopLiveSession("live-1", invokeFn);
     await stopLiveSession(undefined, invokeFn);
     await getLiveSessionStatus(invokeFn);
@@ -116,6 +135,7 @@ describe("live translation command adapter", () => {
           targetLanguage: "English",
           overlaySettings,
           recognitionSettings,
+          translationSettings,
         },
       },
       {
@@ -139,6 +159,10 @@ describe("live translation command adapter", () => {
         args: { sessionId: "live-1" },
       },
       {
+        command: "interrupt_live_translation",
+        args: { sessionId: "live-1" },
+      },
+      {
         command: "stop_live_session",
         args: { sessionId: "live-1" },
       },
@@ -159,6 +183,7 @@ describe("live translation command adapter", () => {
       translatedText: "Translation",
       roi,
       regions: [],
+      isStreaming: false,
       observedAtEpochMs: 1_700_000_000_000,
     };
     const debugRecord: LiveDebugRecord = {
@@ -171,7 +196,6 @@ describe("live translation command adapter", () => {
       regionCount: 2,
       roiVersion: 1,
       durationMs: 44,
-      cacheHit: false,
       observedAtEpochMs: 1_700_000_000_000,
     };
     const listenFn = async <T>(
@@ -234,6 +258,7 @@ describe("live subtitle revision filtering", () => {
     translatedText: "Translation",
     roi,
     regions: [],
+    isStreaming: false,
     observedAtEpochMs: 1_700_000_000_000,
   };
 

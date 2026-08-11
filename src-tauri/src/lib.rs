@@ -45,6 +45,7 @@ pub fn run() {
             backend::live::get_live_session_status,
             backend::live::pause_live_session,
             backend::live::resume_live_session,
+            backend::live::interrupt_live_translation,
             backend::live::stop_live_session
         ])
         .run(tauri::generate_context!())

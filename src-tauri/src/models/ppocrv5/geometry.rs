@@ -96,7 +96,7 @@ pub fn map_detector_quad(raw: [[f32; 2]; 4], profile: DetectorProfile) -> Result
 }
 
 /// Canonicalize a valid integer quadrilateral to clockwise screen order with
-/// the lexicographically smallest `(y, x)` point first.
+/// the geometric top-left point first.
 pub fn canonicalize_quad(points: QuadI) -> Result<QuadI> {
     for i in 0..4 {
         for j in (i + 1)..4 {
@@ -163,7 +163,13 @@ pub fn canonicalize_quad(points: QuadI) -> Result<QuadI> {
 
 fn rotate_top_left(points: &mut QuadI) {
     let start = (0..4)
-        .min_by_key(|&index| (points[index][1], points[index][0]))
+        .min_by_key(|&index| {
+            (
+                i64::from(points[index][0]) + i64::from(points[index][1]),
+                points[index][1],
+                points[index][0],
+            )
+        })
         .unwrap_or(0);
     points.rotate_left(start);
 }
@@ -241,9 +247,14 @@ fn canonicalize_float_quad(mut points: QuadF) -> QuadF {
     }
     let start = (0..4)
         .min_by(|&left, &right| {
-            points[left][1]
-                .partial_cmp(&points[right][1])
+            (points[left][0] + points[left][1])
+                .partial_cmp(&(points[right][0] + points[right][1]))
                 .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    points[left][1]
+                        .partial_cmp(&points[right][1])
+                        .unwrap_or(Ordering::Equal)
+                })
                 .then_with(|| {
                     points[left][0]
                         .partial_cmp(&points[right][0])
@@ -511,6 +522,18 @@ mod tests {
     fn canonicalizes_clockwise_top_left() {
         let quad = canonicalize_quad([[10, 10], [10, 30], [30, 30], [30, 10]]).unwrap();
         assert_eq!(quad, [[10, 10], [30, 10], [30, 30], [10, 30]]);
+    }
+
+    #[test]
+    fn slanted_text_quad_starts_at_left_edge_when_right_edge_is_higher() {
+        let quad = canonicalize_quad([[547, 522], [547, 546], [127, 548], [127, 524]]).unwrap();
+        assert_eq!(quad, [[127, 524], [547, 522], [547, 546], [127, 548]]);
+
+        let rectangle = minimum_area_rect(quad);
+        assert!(
+            rectangle[0][0] < rectangle[1][0],
+            "text crop must run left-to-right: {rectangle:?}"
+        );
     }
 
     #[test]

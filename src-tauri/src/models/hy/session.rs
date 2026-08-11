@@ -14,6 +14,7 @@ use std::path::Path;
 
 #[derive(Clone, Debug)]
 struct HyConversationTurn {
+    system: String,
     user: String,
     assistant_token_ids: Vec<u32>,
     token_count: usize,
@@ -45,12 +46,19 @@ impl HyConversationMemory {
         self.turns.iter().map(|turn| turn.token_count).sum()
     }
 
-    fn record_turn(&mut self, user: &str, user_token_count: usize, assistant_token_ids: Vec<u32>) {
+    fn record_turn(
+        &mut self,
+        system: &str,
+        user: &str,
+        prompt_token_count: usize,
+        assistant_token_ids: Vec<u32>,
+    ) {
         if !self.enabled {
             return;
         }
-        let token_count = user_token_count.saturating_add(assistant_token_ids.len());
+        let token_count = prompt_token_count.saturating_add(assistant_token_ids.len());
         self.turns.push(HyConversationTurn {
+            system: system.to_owned(),
             user: user.to_owned(),
             assistant_token_ids,
             token_count,
@@ -123,7 +131,8 @@ impl HySessionDriver {
     /// Run one request against a cloned state and commit only on success.
     pub(crate) fn respond(
         &mut self,
-        prompt: &str,
+        system_prompt: &str,
+        user_prompt: &str,
         config: &GenerationConfig,
         on_chunk: impl FnMut(&str) -> Result<()>,
         cancellation: &CancellationToken,
@@ -155,7 +164,9 @@ impl HySessionDriver {
             }
         }
         let prompt_token_count = if memory.enabled {
-            let count = self.model.prompt_token_count(&state, prompt)?;
+            let count = self
+                .model
+                .prompt_token_count(&state, system_prompt, user_prompt)?;
             anyhow::ensure!(
                 count <= memory.max_tokens,
                 "prompt exceeds the configured memory token budget"
@@ -169,7 +180,8 @@ impl HySessionDriver {
             &self.model,
             &mut state,
             &mut position,
-            prompt,
+            system_prompt,
+            user_prompt,
             config,
             on_chunk,
             cancellation,
@@ -186,7 +198,8 @@ impl HySessionDriver {
 
         if memory.enabled {
             memory.record_turn(
-                prompt,
+                system_prompt,
+                user_prompt,
                 prompt_token_count.unwrap_or_default(),
                 result.generated_ids.clone(),
             );
@@ -214,7 +227,7 @@ fn replay(
     memory: &HyConversationMemory,
 ) -> Result<()> {
     for turn in &memory.turns {
-        let (_, prompt_ids) = model.prefill(state, &turn.user, *position)?;
+        let (_, prompt_ids) = model.prefill(state, &turn.system, &turn.user, *position)?;
         *position = position
             .checked_add(prompt_ids.len())
             .ok_or_else(|| anyhow::anyhow!("generation position overflowed usize"))?;

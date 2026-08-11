@@ -79,12 +79,10 @@ impl Activation {
 
 /// A rectangular/grouped convolution wrapper.
 ///
-/// Candle's pinned low-level convolution API accepts scalar padding/stride
-/// values.  PP-OCRv5 also uses rectangular kernels and, in the recognizer
-/// HGNetV2 stages, asymmetric strides.  We therefore apply rectangular zero
-/// padding explicitly, run a unit-stride Candle convolution, and index-select
-/// the requested stride.  This preserves the PyTorch convolution geometry while
-/// retaining the pinned Candle operator implementation.
+/// Candle's pinned convolution API accepts scalar padding and stride values.
+/// Most PP-OCRv5 layers use symmetric geometry and can therefore execute those
+/// operations directly. Rectangular kernels with asymmetric padding or stride
+/// retain the explicit compatibility path.
 #[derive(Clone, Debug)]
 struct Conv2dLayer {
     weight: Tensor,
@@ -152,22 +150,27 @@ impl Conv2dLayer {
     }
 
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let mut padded = xs.clone();
-        if self.padding.0 != 0 {
-            padded = padded.pad_with_zeros(2, self.padding.0, self.padding.0)?;
-        }
-        if self.padding.1 != 0 {
-            padded = padded.pad_with_zeros(3, self.padding.1, self.padding.1)?;
-        }
-        let mut output = padded.conv2d(&self.weight, 0, 1, 1, self.groups)?;
+        let mut output = if self.padding.0 == self.padding.1 && self.stride.0 == self.stride.1 {
+            xs.conv2d(&self.weight, self.padding.0, self.stride.0, 1, self.groups)?
+        } else {
+            let mut padded = xs.clone();
+            if self.padding.0 != 0 {
+                padded = padded.pad_with_zeros(2, self.padding.0, self.padding.0)?;
+            }
+            if self.padding.1 != 0 {
+                padded = padded.pad_with_zeros(3, self.padding.1, self.padding.1)?;
+            }
+            let mut output = padded.conv2d(&self.weight, 0, 1, 1, self.groups)?;
+            if self.stride.0 != 1 {
+                output = stride_select(&output, 2, self.stride.0)?;
+            }
+            if self.stride.1 != 1 {
+                output = stride_select(&output, 3, self.stride.1)?;
+            }
+            output
+        };
         if let Some(bias) = &self.bias {
             output = output.broadcast_add(&bias.reshape((1, self.out_channels, 1, 1))?)?;
-        }
-        if self.stride.0 != 1 {
-            output = stride_select(&output, 2, self.stride.0)?;
-        }
-        if self.stride.1 != 1 {
-            output = stride_select(&output, 3, self.stride.1)?;
         }
         Ok(output)
     }
@@ -1614,5 +1617,104 @@ impl SharedPpOcrV5Core {
             .validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod conv_tests {
+    use super::*;
+
+    fn compatibility_forward(layer: &Conv2dLayer, xs: &Tensor) -> candle_core::Result<Tensor> {
+        let mut padded = xs.clone();
+        if layer.padding.0 != 0 {
+            padded = padded.pad_with_zeros(2, layer.padding.0, layer.padding.0)?;
+        }
+        if layer.padding.1 != 0 {
+            padded = padded.pad_with_zeros(3, layer.padding.1, layer.padding.1)?;
+        }
+        let mut output = padded.conv2d(&layer.weight, 0, 1, 1, layer.groups)?;
+        if let Some(bias) = &layer.bias {
+            output = output.broadcast_add(&bias.reshape((1, layer.out_channels, 1, 1))?)?;
+        }
+        if layer.stride.0 != 1 {
+            output = stride_select(&output, 2, layer.stride.0)?;
+        }
+        if layer.stride.1 != 1 {
+            output = stride_select(&output, 3, layer.stride.1)?;
+        }
+        Ok(output)
+    }
+
+    fn assert_tensor_close(actual: &Tensor, expected: &Tensor) -> candle_core::Result<()> {
+        assert_eq!(actual.dims(), expected.dims());
+        let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "value {index} differs: actual={actual}, expected={expected}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_symmetric_convolution_matches_compatibility_path() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+        let input = Tensor::from_vec(
+            (0..50)
+                .map(|value| ((value % 11) as f32 - 5.0) / 7.0)
+                .collect::<Vec<_>>(),
+            (1, 2, 5, 5),
+            &device,
+        )?;
+        let layer = Conv2dLayer {
+            weight: Tensor::from_vec(
+                (0..18)
+                    .map(|value| ((value % 7) as f32 - 3.0) / 5.0)
+                    .collect::<Vec<_>>(),
+                (2, 1, 3, 3),
+                &device,
+            )?,
+            bias: Some(Tensor::from_vec(vec![0.25_f32, -0.5], 2, &device)?),
+            out_channels: 2,
+            stride: (2, 2),
+            padding: (1, 1),
+            groups: 2,
+        };
+
+        let actual = layer.forward(&input)?;
+        let expected = compatibility_forward(&layer, &input)?;
+        assert_tensor_close(&actual, &expected)
+    }
+
+    #[test]
+    fn asymmetric_convolution_keeps_compatibility_geometry() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+        let input = Tensor::from_vec(
+            (0..30)
+                .map(|value| ((value % 13) as f32 - 6.0) / 9.0)
+                .collect::<Vec<_>>(),
+            (1, 1, 5, 6),
+            &device,
+        )?;
+        let layer = Conv2dLayer {
+            weight: Tensor::from_vec(
+                (0..9)
+                    .map(|value| (value as f32 - 4.0) / 6.0)
+                    .collect::<Vec<_>>(),
+                (1, 1, 3, 3),
+                &device,
+            )?,
+            bias: Some(Tensor::from_vec(vec![0.125_f32], 1, &device)?),
+            out_channels: 1,
+            stride: (2, 1),
+            padding: (1, 0),
+            groups: 1,
+        };
+
+        let actual = layer.forward(&input)?;
+        let expected = compatibility_forward(&layer, &input)?;
+        assert_tensor_close(&actual, &expected)
     }
 }

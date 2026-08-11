@@ -950,35 +950,64 @@ impl ModelWeights {
         Ok(logits)
     }
 }
-/// 使用首轮 Hy 对话模板编码提示词。
-fn encode_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<Encoding> {
-    encode_turn(tokenizer, prompt, true)
+/// 使用首轮 Hy 对话模板编码 system 与 user 提示词。
+fn encode_prompt(
+    tokenizer: &Tokenizer,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<Encoding> {
+    encode_turn(tokenizer, system_prompt, user_prompt, true)
 }
 
-/// 使用后续轮次模板编码提示词，不重复添加会话起始标记。
-fn encode_followup_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<Encoding> {
-    encode_turn(tokenizer, prompt, false)
+/// 使用后续轮次模板编码 user 提示词，不重复添加 system 与会话起始标记。
+fn encode_followup_prompt(tokenizer: &Tokenizer, user_prompt: &str) -> Result<Encoding> {
+    encode_turn(tokenizer, "", user_prompt, false)
 }
 
-/// 按 Hy 的首轮/续轮模板拼接提示词。
-fn format_turn_prompt(prompt: &str, first_turn: bool) -> String {
-    let prefix = if first_turn {
-        "<｜hy_begin▁of▁sentence｜><｜hy_User｜>"
+/// 按 Hy 1.8B 官方首轮/续轮模板拼接角色提示词。
+fn format_turn_prompt(system_prompt: &str, user_prompt: &str, first_turn: bool) -> String {
+    const BEGIN: &str = "<｜hy_begin▁of▁sentence｜>";
+    const SYSTEM_SUFFIX: &str = "<｜hy_place▁holder▁no▁3｜>";
+    const USER_PREFIX: &str = "<｜hy_User｜>";
+    const ASSISTANT_PREFIX: &str = "<｜hy_Assistant｜>";
+
+    let system_len = if first_turn && !system_prompt.is_empty() {
+        system_prompt.len() + SYSTEM_SUFFIX.len()
     } else {
-        "<｜hy_User｜>"
+        0
     };
-    let suffix = "<｜hy_Assistant｜>";
-    let mut formatted = String::with_capacity(prefix.len() + prompt.len() + suffix.len());
-    formatted.push_str(prefix);
-    formatted.push_str(prompt);
-    formatted.push_str(suffix);
+    let mut formatted = String::with_capacity(
+        if first_turn { BEGIN.len() } else { 0 }
+            + system_len
+            + USER_PREFIX.len()
+            + user_prompt.len()
+            + ASSISTANT_PREFIX.len(),
+    );
+    if first_turn {
+        formatted.push_str(BEGIN);
+        if !system_prompt.is_empty() {
+            formatted.push_str(system_prompt);
+            formatted.push_str(SYSTEM_SUFFIX);
+        }
+    }
+    formatted.push_str(USER_PREFIX);
+    formatted.push_str(user_prompt);
+    formatted.push_str(ASSISTANT_PREFIX);
     formatted
 }
 
-/// 根据是否为首轮选择 Hy 的用户/助手对话模板并进行 tokenization。
-fn encode_turn(tokenizer: &Tokenizer, prompt: &str, first_turn: bool) -> Result<Encoding> {
+/// 根据是否为首轮选择 Hy 的角色模板并进行 tokenization。
+fn encode_turn(
+    tokenizer: &Tokenizer,
+    system_prompt: &str,
+    user_prompt: &str,
+    first_turn: bool,
+) -> Result<Encoding> {
     tokenizer
-        .encode(format_turn_prompt(prompt, first_turn), first_turn)
+        .encode(
+            format_turn_prompt(system_prompt, user_prompt, first_turn),
+            first_turn,
+        )
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
@@ -1109,16 +1138,25 @@ impl HySession {
         })
     }
 
-    fn prompt_token_ids(&self, state: &HyGenerationState, prompt: &str) -> Result<Vec<u32>> {
+    fn prompt_token_ids(
+        &self,
+        state: &HyGenerationState,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<Vec<u32>> {
+        let prompt_bytes = system_prompt
+            .len()
+            .checked_add(user_prompt.len())
+            .context("Hy prompt byte length overflowed usize")?;
         anyhow::ensure!(
-            prompt.len() <= MAX_HY_PROMPT_BYTES,
+            prompt_bytes <= MAX_HY_PROMPT_BYTES,
             "Hy prompt exceeds the {}-byte limit",
             MAX_HY_PROMPT_BYTES
         );
         let encoding = if state.first_turn {
-            encode_prompt(&self.tokenizer, prompt)?
+            encode_prompt(&self.tokenizer, system_prompt, user_prompt)?
         } else {
-            encode_followup_prompt(&self.tokenizer, prompt)?
+            encode_followup_prompt(&self.tokenizer, user_prompt)?
         };
         let ids = encoding.get_ids().to_vec();
         anyhow::ensure!(
@@ -1131,9 +1169,12 @@ impl HySession {
     pub(super) fn prompt_token_count(
         &self,
         state: &HyGenerationState,
-        prompt: &str,
+        system_prompt: &str,
+        user_prompt: &str,
     ) -> Result<usize> {
-        Ok(self.prompt_token_ids(state, prompt)?.len())
+        Ok(self
+            .prompt_token_ids(state, system_prompt, user_prompt)?
+            .len())
     }
 
     fn apply_token_penalties(
@@ -1205,10 +1246,11 @@ impl HySession {
     pub(super) fn prefill(
         &self,
         state: &mut HyGenerationState,
-        prompt: &str,
+        system_prompt: &str,
+        user_prompt: &str,
         position: usize,
     ) -> Result<(Tensor, Vec<u32>)> {
-        let ids = self.prompt_token_ids(state, prompt)?;
+        let ids = self.prompt_token_ids(state, system_prompt, user_prompt)?;
         let logits = self.prefill_with_ids(state, &ids, position)?;
         Ok((logits, ids))
     }
@@ -1478,15 +1520,23 @@ mod tests {
     #[test]
     fn formats_first_turn_prompt_with_begin_marker() {
         assert_eq!(
-            format_turn_prompt("hello", true),
+            format_turn_prompt("", "hello", true),
             "<｜hy_begin▁of▁sentence｜><｜hy_User｜>hello<｜hy_Assistant｜>"
         );
     }
 
     #[test]
-    fn formats_followup_prompt_without_begin_marker() {
+    fn formats_first_turn_prompt_with_system_role() {
         assert_eq!(
-            format_turn_prompt("hello", false),
+            format_turn_prompt("system", "hello", true),
+            "<｜hy_begin▁of▁sentence｜>system<｜hy_place▁holder▁no▁3｜><｜hy_User｜>hello<｜hy_Assistant｜>"
+        );
+    }
+
+    #[test]
+    fn formats_followup_prompt_without_system_or_begin_marker() {
+        assert_eq!(
+            format_turn_prompt("ignored", "hello", false),
             "<｜hy_User｜>hello<｜hy_Assistant｜>"
         );
     }

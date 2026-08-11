@@ -34,7 +34,7 @@ const visible = computed(
     state.value === "warming" ||
     (isRegionReplace
       ? (subtitle.value?.regions.length ?? 0) > 0
-      : !!subtitle.value?.translatedText.trim()),
+      : !!subtitle.value?.isStreaming || !!subtitle.value?.translatedText.trim()),
 );
 const regionGroups = computed(() =>
   groupLiveSubtitleRegions(subtitle.value?.regions ?? []),
@@ -162,7 +162,7 @@ onBeforeUnmount(() => {
       </section>
     </div>
     <div v-else-if="visible" class="subtitle-panel">
-      <p class="translated-text">{{ subtitle?.translatedText }}</p>
+      <p class="translated-text">{{ subtitle?.translatedText || "翻译中…" }}</p>
       <p v-if="showSource && subtitle?.sourceText" class="source-text">{{ subtitle.sourceText }}</p>
     </div>
   </main>
@@ -227,8 +227,10 @@ body,
 }
 
 .translated-text,
-.source-text {
-  white-space: pre-line;
+.source-text,
+.region-source-text,
+.region-translated-text {
+  white-space: pre-wrap;
 }
 
 .translated-text {

@@ -103,17 +103,41 @@ impl LiveOverlaySettings {
     }
 }
 
+pub(super) const MAX_LIVE_SUPPLEMENTAL_PROMPT_CHARS: usize = 4_096;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LiveTranslationSettings {
+    #[serde(default)]
+    pub(crate) supplemental_prompt: String,
+}
+
+impl LiveTranslationSettings {
+    pub(super) fn validate(mut self) -> Result<Self, &'static str> {
+        let supplemental_prompt = self.supplemental_prompt.trim();
+        if supplemental_prompt.chars().count() > MAX_LIVE_SUPPLEMENTAL_PROMPT_CHARS {
+            return Err("实时翻译补充提示不能超过 4096 个字符");
+        }
+        self.supplemental_prompt = supplemental_prompt.to_owned();
+        Ok(self)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LiveMetrics {
     pub(crate) frames_captured: u64,
     pub(crate) frames_dropped: u64,
+    pub(crate) frames_skipped_unchanged: u64,
     pub(crate) ocr_runs: u64,
     pub(crate) translation_runs: u64,
-    pub(crate) cache_hits: u64,
     pub(crate) subtitle_publishes: u64,
     pub(crate) last_ocr_ms: u64,
     pub(crate) last_translation_ms: u64,
+    pub(crate) gpu_name: String,
+    pub(crate) gpu_total_memory_mib: u64,
+    pub(crate) gpu_free_memory_mib: u64,
+    pub(crate) gpu_execution_mode: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
@@ -134,9 +158,16 @@ pub(crate) enum LiveRecognitionTrigger {
 
 pub(super) const DEFAULT_STABILITY_WAIT_MS: u64 = 300;
 pub(super) const MAX_STABILITY_WAIT_MS: u64 = 5_000;
+pub(super) const DEFAULT_KEY_TRIGGER_TIMEOUT_MS: u64 = 1_000;
+pub(super) const MIN_KEY_TRIGGER_TIMEOUT_MS: u64 = 100;
+pub(super) const MAX_KEY_TRIGGER_TIMEOUT_MS: u64 = 5_000;
 
 fn default_stability_wait_ms() -> u64 {
     DEFAULT_STABILITY_WAIT_MS
+}
+
+fn default_key_trigger_timeout_ms() -> u64 {
+    DEFAULT_KEY_TRIGGER_TIMEOUT_MS
 }
 
 fn default_text_grouping_enabled() -> bool {
@@ -151,6 +182,8 @@ pub(crate) struct LiveRecognitionSettings {
     pub(crate) trigger_event: LiveRecognitionTrigger,
     #[serde(default = "default_stability_wait_ms")]
     pub(crate) stability_wait_ms: u64,
+    #[serde(default = "default_key_trigger_timeout_ms")]
+    pub(crate) key_trigger_timeout_ms: u64,
     #[serde(default = "default_text_grouping_enabled")]
     pub(crate) text_grouping_enabled: bool,
 }
@@ -162,6 +195,7 @@ impl Default for LiveRecognitionSettings {
             trigger_key: "F8".to_owned(),
             trigger_event: LiveRecognitionTrigger::Press,
             stability_wait_ms: DEFAULT_STABILITY_WAIT_MS,
+            key_trigger_timeout_ms: DEFAULT_KEY_TRIGGER_TIMEOUT_MS,
             text_grouping_enabled: default_text_grouping_enabled(),
         }
     }
@@ -280,6 +314,11 @@ impl LiveRecognitionSettings {
         if self.stability_wait_ms > MAX_STABILITY_WAIT_MS {
             return Err("OCR 字幕稳定等待必须在 0 到 5000 毫秒之间");
         }
+        if !(MIN_KEY_TRIGGER_TIMEOUT_MS..=MAX_KEY_TRIGGER_TIMEOUT_MS)
+            .contains(&self.key_trigger_timeout_ms)
+        {
+            return Err("按键触发 OCR 超时必须在 100 到 5000 毫秒之间");
+        }
 
         if !is_supported_trigger_key(canonical_key) {
             return Err("实时翻译触发按键不受支持，请重新录入标准键盘按键");
@@ -357,6 +396,7 @@ pub(crate) struct LiveSubtitle {
     pub(crate) translated_text: String,
     pub(crate) roi: LiveRoi,
     pub(crate) regions: Vec<LiveSubtitleRegion>,
+    pub(crate) is_streaming: bool,
     pub(crate) observed_at_epoch_ms: u64,
 }
 
@@ -370,10 +410,9 @@ pub(crate) enum LiveDebugStage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LiveDebugOutcome {
-    AwaitingConfirmation,
     Confirmed,
-    CacheHit,
     Completed,
+    Cancelled,
     SkippedEmptySource,
     Failed,
 }
@@ -392,7 +431,6 @@ pub(crate) struct LiveDebugRecord {
     pub(crate) region_count: u32,
     pub(crate) roi_version: u64,
     pub(crate) duration_ms: u64,
-    pub(crate) cache_hit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) message: Option<String>,
     pub(crate) observed_at_epoch_ms: u64,
@@ -459,17 +497,21 @@ impl NormalizedRoi {
 pub(super) struct LiveConfig {
     pub(super) roi: NormalizedRoi,
     pub(super) roi_version: u64,
+    pub(super) client_width: u32,
+    pub(super) client_height: u32,
     pub(super) target_language: String,
     pub(super) overlay_settings: LiveOverlaySettings,
     pub(super) recognition_settings: LiveRecognitionSettings,
+    pub(super) translation_settings: LiveTranslationSettings,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_STABILITY_WAIT_MS, LiveRecognitionMode, LiveRecognitionSettings,
-        LiveRecognitionTrigger, LiveRoi, LiveSessionState, LiveSessionStatus,
-        MAX_STABILITY_WAIT_MS,
+        DEFAULT_KEY_TRIGGER_TIMEOUT_MS, DEFAULT_STABILITY_WAIT_MS, LiveRecognitionMode,
+        LiveRecognitionSettings, LiveRecognitionTrigger, LiveRoi, LiveSessionState,
+        LiveSessionStatus, LiveTranslationSettings, MAX_KEY_TRIGGER_TIMEOUT_MS,
+        MAX_LIVE_SUPPLEMENTAL_PROMPT_CHARS, MAX_STABILITY_WAIT_MS, MIN_KEY_TRIGGER_TIMEOUT_MS,
     };
 
     #[test]
@@ -478,7 +520,31 @@ mod tests {
         assert_eq!(value["state"], "idle");
         assert_eq!(value["latestRevision"], 0);
         assert_eq!(value["metrics"]["framesCaptured"], 0);
+        assert_eq!(value["metrics"]["framesSkippedUnchanged"], 0);
+        assert_eq!(value["metrics"]["gpuExecutionMode"], "");
         assert!(value.get("sessionId").is_none());
+    }
+
+    #[test]
+    fn translation_settings_trim_and_reject_oversized_prompts() {
+        let settings = LiveTranslationSettings {
+            supplemental_prompt: "  Preserve names.  ".to_owned(),
+        }
+        .validate()
+        .expect("valid prompt");
+        assert_eq!(settings.supplemental_prompt, "Preserve names.");
+        let serialized = serde_json::to_value(&settings).expect("serialize translation settings");
+        assert_eq!(serialized["supplementalPrompt"], "Preserve names.");
+
+        let too_long = LiveTranslationSettings {
+            supplemental_prompt: "x".repeat(MAX_LIVE_SUPPLEMENTAL_PROMPT_CHARS + 1),
+        };
+        assert_eq!(
+            too_long
+                .validate()
+                .expect_err("oversized prompt should fail"),
+            "实时翻译补充提示不能超过 4096 个字符"
+        );
     }
 
     #[test]
@@ -531,6 +597,10 @@ mod tests {
         assert_eq!(automatic.mode, LiveRecognitionMode::Automatic);
         assert_eq!(automatic.trigger_event, LiveRecognitionTrigger::Press);
         assert_eq!(automatic.stability_wait_ms, DEFAULT_STABILITY_WAIT_MS);
+        assert_eq!(
+            automatic.key_trigger_timeout_ms,
+            DEFAULT_KEY_TRIGGER_TIMEOUT_MS
+        );
 
         let key_trigger = LiveRecognitionSettings {
             mode: LiveRecognitionMode::KeyTrigger,
@@ -547,6 +617,10 @@ mod tests {
         assert_eq!(serialized["mode"], "key_trigger");
         assert_eq!(serialized["triggerEvent"], "release");
         assert_eq!(serialized["stabilityWaitMs"], DEFAULT_STABILITY_WAIT_MS);
+        assert_eq!(
+            serialized["keyTriggerTimeoutMs"],
+            DEFAULT_KEY_TRIGGER_TIMEOUT_MS
+        );
     }
 
     #[test]
@@ -559,6 +633,23 @@ mod tests {
             ..LiveRecognitionSettings::default()
         };
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn recognition_settings_reject_invalid_key_trigger_timeout() {
+        for key_trigger_timeout_ms in [
+            MIN_KEY_TRIGGER_TIMEOUT_MS - 1,
+            MAX_KEY_TRIGGER_TIMEOUT_MS + 1,
+        ] {
+            let settings = LiveRecognitionSettings {
+                key_trigger_timeout_ms,
+                ..LiveRecognitionSettings::default()
+            };
+            assert!(
+                settings.validate().is_err(),
+                "timeout should be rejected: {key_trigger_timeout_ms}"
+            );
+        }
     }
 
     #[test]

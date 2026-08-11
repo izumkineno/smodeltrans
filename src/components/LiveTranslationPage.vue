@@ -15,6 +15,7 @@ import {
   useMessage,
 } from "naive-ui";
 import {
+  LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS,
   beginLiveRoiUpdate,
   beginLiveSelection,
   cancelLiveSelection,
@@ -38,13 +39,18 @@ import type {
 import {
   liveOverlaySettings,
   liveRecognitionSettings,
+  liveTranslationSettings,
+  KEY_TRIGGER_TIMEOUT_MAX_MS,
+  KEY_TRIGGER_TIMEOUT_MIN_MS,
   LIVE_STABILITY_WAIT_MAX_MS,
   LIVE_STABILITY_WAIT_MIN_MS,
   loadPersistedLiveOverlaySettings,
   loadPersistedLiveRecognitionSettings,
+  loadPersistedLiveTranslationSettings,
   loadPersistedTargetLanguage,
   savePersistedLiveOverlaySettings,
   savePersistedLiveRecognitionSettings,
+  savePersistedLiveTranslationSettings,
   savePersistedTargetLanguage,
   targetLanguage,
 } from "../services/workspace-settings";
@@ -73,12 +79,16 @@ function emptyMetrics(): LiveMetrics {
   return {
     framesCaptured: 0,
     framesDropped: 0,
+    framesSkippedUnchanged: 0,
     ocrRuns: 0,
     translationRuns: 0,
-    cacheHits: 0,
     subtitlePublishes: 0,
     lastOcrMs: 0,
     lastTranslationMs: 0,
+    gpuName: "",
+    gpuTotalMemoryMib: 0,
+    gpuFreeMemoryMib: 0,
+    gpuExecutionMode: "",
   };
 }
 
@@ -316,6 +326,16 @@ function formatDuration(value: number): string {
   return value > 0 ? `${formatInteger(value)} ms` : "暂无";
 }
 
+function gpuExecutionModeLabel(value: string): string {
+  const labels: Record<string, string> = {
+    cpu: "CPU",
+    gpu_resident: "GPU 常驻",
+    gpu_balanced: "GPU 均衡",
+    gpu_constrained: "GPU 分层",
+  };
+  return labels[value] ?? "未初始化";
+}
+
 function formatDebugTime(epochMillis: number): string {
   const time = new Date(epochMillis);
   const formatted = new Intl.DateTimeFormat("zh-CN", {
@@ -330,9 +350,7 @@ function formatDebugTime(epochMillis: number): string {
 
 function debugOutcomeLabel(outcome: LiveDebugOutcome): string {
   const labels: Record<LiveDebugOutcome, string> = {
-    awaiting_confirmation: "等待二次确认",
     confirmed: "识别已确认",
-    cache_hit: "命中缓存",
     completed: "翻译完成",
     skipped_empty_source: "空文本跳过",
     failed: "处理失败",
@@ -373,6 +391,7 @@ async function startSelection(): Promise<void> {
   try {
     loadPersistedLiveOverlaySettings();
     loadPersistedLiveRecognitionSettings();
+    loadPersistedLiveTranslationSettings();
     targetLanguage.value = language;
     const persistenceError = savePersistedTargetLanguage();
     if (persistenceError) {
@@ -382,12 +401,17 @@ async function startSelection(): Promise<void> {
     if (recognitionPersistenceError) {
       showWorkspaceToast(toast, "warning", recognitionPersistenceError);
     }
+    const translationPersistenceError = savePersistedLiveTranslationSettings();
+    if (translationPersistenceError) {
+      showWorkspaceToast(toast, "warning", translationPersistenceError);
+    }
     applyStatus(
       await beginLiveSelection(
         targetId,
         language,
         liveOverlaySettings.value,
         liveRecognitionSettings.value,
+        liveTranslationSettings.value,
       ),
     );
   } catch (error) {
@@ -432,6 +456,15 @@ function saveLiveRecognitionPreferences(): void {
     return;
   }
   showWorkspaceToast(toast, "success", "实时识别设置已保存，下次开始抓取时生效。");
+}
+
+function saveLiveTranslationPreferences(): void {
+  const persistError = savePersistedLiveTranslationSettings();
+  if (persistError) {
+    showWorkspaceToast(toast, "error", persistError);
+    return;
+  }
+  showWorkspaceToast(toast, "success", "实时翻译补充提示已保存，下次开始抓取时生效。");
 }
 
 async function runSessionAction(action: Exclude<LiveAction, "refresh" | "start">): Promise<void> {
@@ -517,6 +550,7 @@ onActivated(() => {
   loadPersistedTargetLanguage();
   loadPersistedLiveOverlaySettings();
   loadPersistedLiveRecognitionSettings();
+  loadPersistedLiveTranslationSettings();
   void startStatusBinding();
 });
 onDeactivated(cleanupPage);
@@ -765,13 +799,50 @@ onBeforeUnmount(cleanupPage);
       </p>
     </n-card>
 
-    <n-card class="live-card live-recognition-card" :bordered="false">
+    <n-card class="live-card live-settings-card" :bordered="false">
       <div class="card-heading">
         <div>
           <span class="step-index">04</span>
           <div>
+            <h3>翻译补充提示</h3>
+            <p>把 OCR 内容和此处的要求一起传给 Hy-MT2，只作用于新的实时会话。</p>
+          </div>
+        </div>
+        <n-button
+          secondary
+          size="small"
+          :disabled="hasActiveSession"
+          @click="saveLiveTranslationPreferences"
+        >
+          保存翻译提示
+        </n-button>
+      </div>
+
+      <label class="live-field">
+        <span>补充提示词</span>
+        <n-input
+          v-model:value="liveTranslationSettings.supplementalPrompt"
+          type="textarea"
+          :maxlength="LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS"
+          :autosize="{ minRows: 3, maxRows: 8 }"
+          :disabled="hasActiveSession"
+          placeholder="例如：这是游戏对白；修复明显的 OCR 断词，保留角色名和引号，译文简洁自然。"
+          aria-label="实时 OCR 翻译补充提示词"
+        />
+      </label>
+
+      <p class="live-settings-note">
+        提示词会和 OCR 待译文本放在同一条 user 消息中；全局 System/User 预设仍会同时生效。
+      </p>
+    </n-card>
+
+    <n-card class="live-card live-recognition-card" :bordered="false">
+      <div class="card-heading">
+        <div>
+          <span class="step-index">05</span>
+          <div>
             <h3>识别与稳定</h3>
-            <p>选择识别方式、稳定等待，以及相邻 OCR 文本的处理策略。</p>
+            <p>选择识别方式、稳定等待、按键触发超时，以及相邻 OCR 文本的处理策略。</p>
         </div>
         </div>
         <n-button
@@ -804,6 +875,21 @@ onBeforeUnmount(cleanupPage);
             :precision="0"
             :disabled="hasActiveSession"
             aria-label="OCR 字幕稳定等待"
+          />
+        </label>
+        <label
+          v-if="liveRecognitionSettings.mode === 'key_trigger'"
+          class="live-field live-number-field"
+        >
+          <span>按键触发超时（毫秒）</span>
+          <n-input-number
+            v-model:value="liveRecognitionSettings.keyTriggerTimeoutMs"
+            :min="KEY_TRIGGER_TIMEOUT_MIN_MS"
+            :max="KEY_TRIGGER_TIMEOUT_MAX_MS"
+            :step="100"
+            :precision="0"
+            :disabled="hasActiveSession"
+            aria-label="按键触发 OCR 超时"
           />
         </label>
         <label class="live-field">
@@ -858,7 +944,8 @@ onBeforeUnmount(cleanupPage);
               ? `按下 ${formatTriggerKey(liveRecognitionSettings.triggerKey)}`
               : `松开 ${formatTriggerKey(liveRecognitionSettings.triggerKey)}`
           }}
-          后等待字幕画面稳定 {{ liveRecognitionSettings.stabilityWaitMs }} ms，再执行一次 OCR 和翻译。
+          后等待字幕画面稳定 {{ liveRecognitionSettings.stabilityWaitMs }} ms；若超过
+          {{ liveRecognitionSettings.keyTriggerTimeoutMs }} ms 仍未稳定，则使用最新画面执行一次 OCR 和翻译。
         </template>
         <template v-else>
           自动模式会根据 ROI 画面变化，等待字幕连续稳定
@@ -884,12 +971,24 @@ onBeforeUnmount(cleanupPage);
       <dl class="metrics-grid">
         <div><dt>捕获帧</dt><dd>{{ formatInteger(liveStatus.metrics.framesCaptured) }}</dd></div>
         <div><dt>丢弃帧</dt><dd>{{ formatInteger(liveStatus.metrics.framesDropped) }}</dd></div>
+        <div><dt>ROI 未变化跳过</dt><dd>{{ formatInteger(liveStatus.metrics.framesSkippedUnchanged) }}</dd></div>
         <div><dt>OCR 次数</dt><dd>{{ formatInteger(liveStatus.metrics.ocrRuns) }}</dd></div>
         <div><dt>翻译次数</dt><dd>{{ formatInteger(liveStatus.metrics.translationRuns) }}</dd></div>
-        <div><dt>缓存命中</dt><dd>{{ formatInteger(liveStatus.metrics.cacheHits) }}</dd></div>
         <div><dt>字幕发布</dt><dd>{{ formatInteger(liveStatus.metrics.subtitlePublishes) }}</dd></div>
         <div><dt>最近 OCR</dt><dd>{{ formatDuration(liveStatus.metrics.lastOcrMs) }}</dd></div>
         <div><dt>最近翻译</dt><dd>{{ formatDuration(liveStatus.metrics.lastTranslationMs) }}</dd></div>
+        <div><dt>GPU</dt><dd>{{ liveStatus.metrics.gpuName || "未初始化" }}</dd></div>
+        <div>
+          <dt>可用 / 总显存</dt>
+          <dd>
+            {{
+              liveStatus.metrics.gpuTotalMemoryMib > 0
+                ? `${formatInteger(liveStatus.metrics.gpuFreeMemoryMib)} / ${formatInteger(liveStatus.metrics.gpuTotalMemoryMib)} MiB`
+                : "暂无"
+            }}
+          </dd>
+        </div>
+        <div><dt>执行策略</dt><dd>{{ gpuExecutionModeLabel(liveStatus.metrics.gpuExecutionMode) }}</dd></div>
       </dl>
     </n-card>
 
@@ -918,7 +1017,6 @@ onBeforeUnmount(cleanupPage);
             <div><dt>文本区域</dt><dd>{{ record.regionCount }}</dd></div>
             <div><dt>耗时</dt><dd>{{ record.durationMs }} ms</dd></div>
             <div><dt>目标语言</dt><dd>{{ record.targetLanguage }}</dd></div>
-            <div><dt>缓存</dt><dd>{{ record.cacheHit ? "命中" : "未命中" }}</dd></div>
           </dl>
           <div v-if="record.sourceText" class="debug-record-text">
             <span>OCR 输出</span>

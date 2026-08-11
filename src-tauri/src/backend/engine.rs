@@ -1,6 +1,6 @@
 use crate::{
     backend::{
-        contracts::{HyPort, OcrOutput, OcrPort, OutputPort, RegionRecord, TranslationOutput},
+        contracts::{OcrOutput, OcrPort, OutputPort, RegionRecord, TranslationOutput},
         failure::BackendFailure,
         input::DecodedImage,
         settings::{BackendSettings, DeviceKind},
@@ -12,21 +12,99 @@ use crate::{
 };
 use candle_core::Device as CandleDevice;
 
+#[cfg(feature = "cuda")]
+const MIB: usize = 1024 * 1024;
+const GPU_RESIDENT_TOTAL_MIB: usize = 8 * 1024;
+const GPU_RESIDENT_FREE_MIB: usize = 4 * 1024;
+const GPU_BALANCED_FREE_MIB: usize = 2_500;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuExecutionPolicy {
+    Cpu,
+    Resident,
+    Balanced,
+    Constrained,
+}
+
+impl GpuExecutionPolicy {
+    fn for_memory(total_mib: usize, free_mib: usize) -> Self {
+        if total_mib >= GPU_RESIDENT_TOTAL_MIB && free_mib >= GPU_RESIDENT_FREE_MIB {
+            Self::Resident
+        } else if free_mib >= GPU_BALANCED_FREE_MIB {
+            Self::Balanced
+        } else {
+            Self::Constrained
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Resident => "gpu_resident",
+            Self::Balanced => "gpu_balanced",
+            Self::Constrained => "gpu_constrained",
+        }
+    }
+
+    fn region_parallelism(self, configured: usize) -> usize {
+        match self {
+            Self::Cpu | Self::Resident => configured,
+            Self::Balanced => configured.min(8),
+            Self::Constrained => configured.min(4),
+        }
+        .max(1)
+    }
+
+    fn recognizer_batch_pixels(self) -> usize {
+        match self {
+            Self::Cpu => 48 * 3200 * 4,
+            Self::Resident => 48 * 3200 * 16,
+            Self::Balanced => 48 * 3200 * 8,
+            Self::Constrained => 48 * 3200 * 4,
+        }
+    }
+
+    fn keeps_models_resident(self) -> bool {
+        matches!(self, Self::Resident)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GpuResourceInfo {
+    pub(crate) name: String,
+    pub(crate) total_memory_mib: u64,
+    pub(crate) free_memory_mib: u64,
+    pub(crate) execution_mode: &'static str,
+}
+
 pub(crate) struct BackendEngine {
     pub(crate) settings: BackendSettings,
     device: CandleDevice,
+    gpu_policy: GpuExecutionPolicy,
     ocr: Option<PpOcrV5Provider>,
     hy: Option<hy::HyTranslator>,
     output: ImageOutput,
 }
 
 impl BackendEngine {
-    pub(crate) fn new(settings: BackendSettings) -> Result<Self, BackendFailure> {
+    pub(crate) fn new(mut settings: BackendSettings) -> Result<Self, BackendFailure> {
         let device = create_device(settings.device_kind)?;
+        let fallback_policy = if settings.device_kind == DeviceKind::Cuda {
+            GpuExecutionPolicy::Balanced
+        } else {
+            GpuExecutionPolicy::Cpu
+        };
+        let gpu_policy = query_gpu_memory(&device)
+            .ok()
+            .flatten()
+            .map(|(_, total_mib, free_mib)| GpuExecutionPolicy::for_memory(total_mib, free_mib))
+            .unwrap_or(fallback_policy);
+        settings.region_parallelism = gpu_policy.region_parallelism(settings.region_parallelism);
         Ok(Self {
             output: ImageOutput::new(settings.font_path.clone()),
             settings,
             device,
+            gpu_policy,
             ocr: None,
             hy: None,
         })
@@ -46,11 +124,15 @@ impl BackendEngine {
 
     pub(crate) fn load_ocr(&mut self) -> Result<(), BackendFailure> {
         if self.ocr.is_none() {
+            if !self.gpu_policy.keeps_models_resident() {
+                self.hy = None;
+            }
             self.ocr = Some(PpOcrV5Provider::load(
                 &self.settings.detector_model_dir,
                 &self.settings.recognizer_model_dir,
                 &self.device,
                 self.settings.region_parallelism,
+                self.gpu_policy.recognizer_batch_pixels(),
             )?);
         }
         Ok(())
@@ -65,6 +147,9 @@ impl BackendEngine {
         )
         .map_err(|error| BackendFailure::arguments(format!("invalid model config: {error:#}")))?;
         if self.hy.is_none() {
+            if !self.gpu_policy.keeps_models_resident() {
+                self.ocr = None;
+            }
             let translator = hy::load_with_config(
                 &self.settings.hy_model,
                 &self.device,
@@ -78,6 +163,47 @@ impl BackendEngine {
             self.hy = Some(translator);
         }
         Ok(())
+    }
+
+    pub(crate) fn prepare_live_pipeline(
+        &mut self,
+        target_language: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), BackendFailure> {
+        self.load_ocr()?;
+        self.ocr
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("PP-OCRv5 provider was not initialized"))?
+            .warm_up(cancellation)?;
+        if self.gpu_policy.keeps_models_resident() {
+            self.load_translator(target_language)?;
+            self.hy
+                .as_mut()
+                .ok_or_else(|| BackendFailure::internal("Hy translator was not initialized"))?
+                .warm_up(cancellation)
+                .map_err(|error| {
+                    BackendFailure::translation(format!("warm up Hy CUDA kernels: {error:#}"))
+                })?;
+        }
+        Ok(())
+    }
+    pub(crate) fn gpu_resource_info(&self) -> Result<Option<GpuResourceInfo>, BackendFailure> {
+        let resources = query_gpu_memory(&self.device).ok().flatten();
+        Ok(resources
+            .map(|(name, total_mib, free_mib)| GpuResourceInfo {
+                name,
+                total_memory_mib: u64::try_from(total_mib).unwrap_or(u64::MAX),
+                free_memory_mib: u64::try_from(free_mib).unwrap_or(u64::MAX),
+                execution_mode: self.gpu_policy.label(),
+            })
+            .or_else(|| {
+                (self.settings.device_kind == DeviceKind::Cuda).then(|| GpuResourceInfo {
+                    name: "CUDA".to_owned(),
+                    total_memory_mib: 0,
+                    free_memory_mib: 0,
+                    execution_mode: self.gpu_policy.label(),
+                })
+            }))
     }
 
     pub(crate) fn unload_ocr(&mut self) {
@@ -160,12 +286,12 @@ impl BackendEngine {
             return Ok(output);
         }
 
-        report_progress(60, "正在准备 Hy-MT2");
         self.translate_regions_with_progress(
             &mut records,
             image.target_language(),
             cancellation,
             false,
+            "",
             &mut report_progress,
         )?;
         cancellation.check()?;
@@ -188,6 +314,7 @@ impl BackendEngine {
             target_language,
             cancellation,
             false,
+            "",
             |_, _| {},
         )
     }
@@ -196,15 +323,58 @@ impl BackendEngine {
         &mut self,
         records: &mut [RegionRecord],
         target_language: &str,
+        supplemental_prompt: &str,
         cancellation: &CancellationToken,
+        mut on_chunk: impl FnMut(u32, &str),
     ) -> Result<(), BackendFailure> {
-        self.translate_regions_with_progress(
-            records,
-            target_language,
-            cancellation,
-            true,
-            |_, _| {},
-        )
+        if records.is_empty() {
+            return Ok(());
+        }
+        cancellation.check()?;
+        self.load_translator(target_language)?;
+        let prompt = self.settings.prompt.clone();
+        let generation = self.settings.generation.clone();
+        let translator = self
+            .hy
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("Hy provider was not initialized"))?;
+        for record in records.iter_mut() {
+            let order = record.order;
+            let source_text = record.source_text.clone();
+            let mut streamed_text = String::new();
+            let result = translator
+                .translate_text(
+                    &source_text,
+                    target_language,
+                    &prompt,
+                    supplemental_prompt,
+                    &generation,
+                    cancellation,
+                    |chunk| {
+                        streamed_text.push_str(chunk);
+                        on_chunk(order, &streamed_text);
+                        Ok(())
+                    },
+                )
+                .map_err(|error| {
+                    if cancellation.is_cancelled() {
+                        BackendFailure::cancelled("Hy translation was cancelled")
+                    } else {
+                        BackendFailure::translation(format!(
+                            "Hy live region translation failed: {error:#}"
+                        ))
+                    }
+                })?;
+            cancellation.check()?;
+            if result.text.trim().is_empty() {
+                return Err(BackendFailure::translation(format!(
+                    "Hy returned empty translation for region {order}"
+                )));
+            }
+            record.translated_text = result.text;
+            on_chunk(order, &record.translated_text);
+        }
+        cancellation.check()
     }
 
     fn translate_regions_with_progress(
@@ -213,6 +383,7 @@ impl BackendEngine {
         target_language: &str,
         cancellation: &CancellationToken,
         contextual: bool,
+        supplemental_prompt: &str,
         mut report_progress: impl FnMut(u8, &'static str),
     ) -> Result<(), BackendFailure> {
         if records.is_empty() {
@@ -244,9 +415,19 @@ impl BackendEngine {
             .enumerate()
         {
             translated.extend(if contextual {
-                translator.translate_contextual(batch, target_language, cancellation)?
+                translator.translate_contextual_with_supplemental_prompt(
+                    batch,
+                    target_language,
+                    supplemental_prompt,
+                    cancellation,
+                )?
             } else {
-                translator.translate(batch, target_language, cancellation)?
+                translator.translate_with_supplemental_prompt(
+                    batch,
+                    target_language,
+                    supplemental_prompt,
+                    cancellation,
+                )?
             });
             let progress =
                 70 + u8::try_from(((batch_index + 1) * 20) / total_batches).unwrap_or(20);
@@ -279,8 +460,10 @@ impl BackendEngine {
         &mut self,
         text: &str,
         target_language: &str,
+        supplemental_prompt: &str,
         cancellation: &CancellationToken,
         mut report_progress: impl FnMut(u8, &'static str),
+        mut on_chunk: impl FnMut(&str),
     ) -> Result<String, BackendFailure> {
         cancellation.check()?;
         report_progress(20, "正在准备 Hy-MT2");
@@ -298,9 +481,13 @@ impl BackendEngine {
                 text,
                 target_language,
                 &prompt,
+                supplemental_prompt,
                 &generation,
                 cancellation,
-                |_| Ok(()),
+                |chunk| {
+                    on_chunk(chunk);
+                    Ok(())
+                },
             )
             .map_err(|error| {
                 if cancellation.is_cancelled() {
@@ -310,17 +497,7 @@ impl BackendEngine {
                 }
             })?;
         cancellation.check()?;
-        let text = result.text.trim().to_owned();
-        if text.is_empty() {
-            return Err(BackendFailure::translation(
-                "Hy returned empty text translation",
-            ));
-        }
-        if text.len() > crate::backend::input::MAX_TEXT_BYTES {
-            return Err(BackendFailure::translation(
-                "text output exceeds the 8 MiB limit",
-            ));
-        }
+        let text = validate_text_translation_output(result.text)?;
         report_progress(100, "翻译完成");
         Ok(text)
     }
@@ -355,6 +532,20 @@ impl BackendEngine {
     }
 }
 
+fn validate_text_translation_output(text: String) -> Result<String, BackendFailure> {
+    if text.trim().is_empty() {
+        return Err(BackendFailure::translation(
+            "Hy returned empty text translation",
+        ));
+    }
+    if text.len() > crate::backend::input::MAX_TEXT_BYTES {
+        return Err(BackendFailure::translation(
+            "text output exceeds the 8 MiB limit",
+        ));
+    }
+    Ok(text)
+}
+
 fn create_device(kind: DeviceKind) -> Result<CandleDevice, BackendFailure> {
     match kind {
         DeviceKind::Cpu => Ok(CandleDevice::Cpu),
@@ -375,9 +566,34 @@ fn create_device(kind: DeviceKind) -> Result<CandleDevice, BackendFailure> {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn query_gpu_memory(
+    device: &CandleDevice,
+) -> Result<Option<(String, usize, usize)>, BackendFailure> {
+    let CandleDevice::Cuda(cuda) = device else {
+        return Ok(None);
+    };
+    let stream = cuda.cuda_stream();
+    let context = stream.context();
+    let name = context
+        .name()
+        .map_err(|error| BackendFailure::device(format!("读取 CUDA 设备名称失败：{error}")))?;
+    let (free_bytes, total_bytes) = context
+        .mem_get_info()
+        .map_err(|error| BackendFailure::device(format!("读取 CUDA 显存信息失败：{error}")))?;
+    Ok(Some((name, total_bytes / MIB, free_bytes / MIB)))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn query_gpu_memory(
+    _device: &CandleDevice,
+) -> Result<Option<(String, usize, usize)>, BackendFailure> {
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BackendEngine, DeviceKind};
+    use super::{BackendEngine, DeviceKind, GpuExecutionPolicy, validate_text_translation_output};
     use crate::{
         backend::{input::decode_image, settings::BackendSettings},
         model_config::{GenerationConfig, MemoryConfig, PromptConfig},
@@ -404,6 +620,17 @@ mod tests {
     }
 
     #[test]
+    fn text_translation_output_preserves_model_whitespace() {
+        let output = "  第一  行\n下一行  ".to_owned();
+
+        assert_eq!(
+            validate_text_translation_output(output.clone()).unwrap(),
+            output
+        );
+        assert!(validate_text_translation_output(" \n\t ".to_owned()).is_err());
+    }
+
+    #[test]
     fn cpu_engine_is_constructible_but_translation_is_device_gated() {
         let engine = BackendEngine::new(settings(DeviceKind::Cpu)).expect("cpu device");
         assert_eq!(engine.settings.device_kind, DeviceKind::Cpu);
@@ -417,6 +644,27 @@ mod tests {
         let engine = BackendEngine::new(settings).expect("cpu device");
 
         assert_eq!(engine.settings.generation.max_new_tokens, 64);
+    }
+
+    #[test]
+    fn gpu_policy_uses_vram_to_bound_batch_pixels_and_model_residency() {
+        let resident = GpuExecutionPolicy::for_memory(24 * 1024, 20 * 1024);
+        assert_eq!(resident.label(), "gpu_resident");
+        assert_eq!(resident.region_parallelism(16), 16);
+        assert_eq!(resident.recognizer_batch_pixels(), 48 * 3200 * 16);
+        assert!(resident.keeps_models_resident());
+
+        let balanced = GpuExecutionPolicy::for_memory(12 * 1024, 3 * 1024);
+        assert_eq!(balanced.label(), "gpu_balanced");
+        assert_eq!(balanced.region_parallelism(16), 8);
+        assert_eq!(balanced.recognizer_batch_pixels(), 48 * 3200 * 8);
+        assert!(!balanced.keeps_models_resident());
+
+        let constrained = GpuExecutionPolicy::for_memory(8 * 1024, 2 * 1024);
+        assert_eq!(constrained.label(), "gpu_constrained");
+        assert_eq!(constrained.region_parallelism(16), 4);
+        assert_eq!(constrained.recognizer_batch_pixels(), 48 * 3200 * 4);
+        assert!(!constrained.keeps_models_resident());
     }
     #[cfg(all(feature = "cuda", feature = "flash-attn"))]
     #[test]
