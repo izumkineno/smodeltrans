@@ -52,9 +52,14 @@ impl HyConversationMemory {
         user: &str,
         prompt_token_count: usize,
         assistant_token_ids: Vec<u32>,
-    ) {
-        if !self.enabled {
-            return;
+    ) -> bool {
+        if !self.enabled
+            || self
+                .turns
+                .iter()
+                .any(|turn| memory_text_similarity(&turn.user, user) > 0.80)
+        {
+            return false;
         }
         let token_count = prompt_token_count.saturating_add(assistant_token_ids.len());
         self.turns.push(HyConversationTurn {
@@ -63,6 +68,7 @@ impl HyConversationMemory {
             assistant_token_ids,
             token_count,
         });
+        true
     }
 
     fn trim(&mut self) -> bool {
@@ -94,6 +100,55 @@ impl HyConversationMemory {
         }
         Ok(())
     }
+}
+
+fn memory_text_similarity(left: &str, right: &str) -> f32 {
+    let left = normalize_memory_text(left);
+    let right = normalize_memory_text(right);
+    if left == right {
+        return 1.0;
+    }
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+
+    let left_chars: Vec<char> = left.chars().collect();
+    let right_chars: Vec<char> = right.chars().collect();
+    if left_chars.len() < 2 || right_chars.len() < 2 {
+        return 0.0;
+    }
+    let mut left_ngrams = character_ngrams(&left_chars);
+    let mut right_ngrams = character_ngrams(&right_chars);
+    left_ngrams.sort_unstable();
+    right_ngrams.sort_unstable();
+
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let mut intersection = 0usize;
+    while left_index < left_ngrams.len() && right_index < right_ngrams.len() {
+        match left_ngrams[left_index].cmp(&right_ngrams[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => {
+                intersection += 1;
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+    (2 * intersection) as f32 / (left_ngrams.len() + right_ngrams.len()) as f32
+}
+
+fn normalize_memory_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn character_ngrams(chars: &[char]) -> Vec<(char, char)> {
+    chars.windows(2).map(|pair| (pair[0], pair[1])).collect()
 }
 
 /// Loaded Hy resources plus the private state needed to service requests.
@@ -197,16 +252,18 @@ impl HySessionDriver {
         }
 
         if memory.enabled {
-            memory.record_turn(
+            let recorded = memory.record_turn(
                 system_prompt,
                 user_prompt,
                 prompt_token_count.unwrap_or_default(),
                 result.generated_ids.clone(),
             );
-            let trimmed = memory.trim();
-            memory.validate_budget()?;
-            if trimmed {
-                replay_pending = true;
+            if recorded {
+                let trimmed = memory.trim();
+                memory.validate_budget()?;
+                if trimmed {
+                    replay_pending = true;
+                }
             }
         } else {
             replay_pending = false;
@@ -237,4 +294,28 @@ fn replay(
             .ok_or_else(|| anyhow::anyhow!("generation position overflowed usize"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HyConversationMemory, memory_text_similarity};
+    use crate::model_config::MemoryConfig;
+
+    #[test]
+    fn duplicate_memory_text_requires_similarity_above_eighty_percent() {
+        assert!(memory_text_similarity("A quick brown fox.", "a quick brown fox!") > 0.80);
+        assert!(memory_text_similarity("A quick brown fox.", "Close the window.") <= 0.80);
+    }
+
+    #[test]
+    fn memory_skips_similar_turns() {
+        let mut memory = HyConversationMemory::from_config(MemoryConfig {
+            enabled: true,
+            max_tokens: 128,
+            max_turns: 4,
+        });
+        assert!(memory.record_turn("system", "Translate: Hello, world.", 4, vec![1, 2]));
+        assert!(!memory.record_turn("system", "translate: hello, world!", 4, vec![3, 4]));
+        assert_eq!(memory.turns.len(), 1);
+    }
 }

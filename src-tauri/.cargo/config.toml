@@ -1,0 +1,8 @@
+# Keep CUDA host objects on the same dynamic MSVC CRT as Rust and Tauri.
+# Candle's current flash-attention build script invokes nvcc without an
+# explicit runtime flag, so nvcc otherwise emits /MT objects (/DEFAULTLIB:LIBCMT).
+[env]
+NVCC_PREPEND_FLAGS = { value = "-Xcompiler=/MD", force = true }
+# `esaxx-rs` is the other native C++ dependency in this link. `cc` reads
+# CXXFLAGS after its default runtime choice, so this keeps it on /MD as well.
+CXXFLAGS = { value = "/MD", force = true }

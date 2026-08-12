@@ -15,6 +15,10 @@ import {
   useMessage,
 } from "naive-ui";
 import {
+  LIVE_MEMORY_TOKENS_MAX,
+  LIVE_MEMORY_TOKENS_MIN,
+  LIVE_MEMORY_TURNS_MAX,
+  LIVE_MEMORY_TURNS_MIN,
   LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS,
   beginLiveRoiUpdate,
   beginLiveSelection,
@@ -152,7 +156,9 @@ const liveStatus = ref<LiveSessionStatus>({
 
 const windowOptions = computed(() =>
   captureWindows.value.map((target) => ({
-    label: `${target.title || "未命名窗口"} — ${target.processName} · ${target.width}×${target.height}`,
+    label: `${target.title || "未命名窗口"} — ${target.processName} · ${
+      target.isMinimized ? "已最小化，可直接恢复" : `${target.width}×${target.height}`
+    }`,
     value: target.id,
   })),
 );
@@ -581,7 +587,7 @@ onBeforeUnmount(cleanupPage);
             <span class="step-index">01</span>
             <div>
               <h3>捕获目标</h3>
-              <p>选择一个可见且未最小化的窗口，再指定翻译语言。</p>
+              <p>选择一个窗口；最小化窗口会在开始选择时自动恢复。</p>
             </div>
           </div>
           <n-button
@@ -610,7 +616,7 @@ onBeforeUnmount(cleanupPage);
           <n-empty
             v-if="isDesktopRuntime && windowsLoaded && captureWindows.length === 0"
             size="small"
-            description="没有找到可用于框选的窗口。请打开并保持显示目标程序，然后刷新列表。"
+            description="没有找到可用于框选的窗口。请打开目标程序，然后刷新列表。"
           />
           <label class="live-field">
             <span>目标语言</span>
@@ -629,7 +635,9 @@ onBeforeUnmount(cleanupPage);
             <strong>{{ selectedTarget.title || "未命名窗口" }}</strong>
             <span>{{ selectedTarget.processName }} · PID {{ selectedTarget.processId }}</span>
           </div>
-          <code>{{ selectedTarget.width }}×{{ selectedTarget.height }}</code>
+          <code>{{
+            selectedTarget.isMinimized ? "已最小化（开始时自动恢复）" : `${selectedTarget.width}×${selectedTarget.height}`
+          }}</code>
         </div>
 
         <n-alert type="warning" title="捕获模式" :show-icon="true">
@@ -831,8 +839,46 @@ onBeforeUnmount(cleanupPage);
         />
       </label>
 
+      <div class="live-translation-memory-grid">
+        <label class="live-field">
+          <span>保留近期翻译上下文</span>
+          <n-switch
+            v-model:value="liveTranslationSettings.memoryEnabled"
+            :disabled="hasActiveSession"
+            aria-label="启用实时翻译上下文记忆"
+          >
+            <template #checked>启用</template>
+            <template #unchecked>关闭</template>
+          </n-switch>
+        </label>
+        <label class="live-field live-number-field">
+          <span>上下文 token 预算</span>
+          <n-input-number
+            v-model:value="liveTranslationSettings.memoryMaxTokens"
+            :min="LIVE_MEMORY_TOKENS_MIN"
+            :max="LIVE_MEMORY_TOKENS_MAX"
+            :step="256"
+            :precision="0"
+            :disabled="hasActiveSession || !liveTranslationSettings.memoryEnabled"
+            aria-label="实时翻译上下文 token 预算"
+          />
+        </label>
+        <label class="live-field live-number-field">
+          <span>保留轮数</span>
+          <n-input-number
+            v-model:value="liveTranslationSettings.memoryMaxTurns"
+            :min="LIVE_MEMORY_TURNS_MIN"
+            :max="LIVE_MEMORY_TURNS_MAX"
+            :step="1"
+            :precision="0"
+            :disabled="hasActiveSession || !liveTranslationSettings.memoryEnabled"
+            aria-label="实时翻译上下文记忆轮数"
+          />
+        </label>
+      </div>
+
       <p class="live-settings-note">
-        提示词会和 OCR 待译文本放在同一条 user 消息中；全局 System/User 预设仍会同时生效。
+        提示词会和 OCR 待译文本放在同一条 user 消息中；启用记忆后会在同一实时会话中保留近期翻译上下文，并过滤相似度超过 80% 的重复记忆。
       </p>
     </n-card>
 
@@ -1155,6 +1201,13 @@ onBeforeUnmount(cleanupPage);
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+}
+
+.live-translation-memory-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) repeat(2, minmax(150px, 0.7fr));
+  gap: 12px;
+  margin-top: 12px;
 }
 .live-trigger-key-control {
   display: flex;
@@ -1486,6 +1539,7 @@ onBeforeUnmount(cleanupPage);
   .live-form,
   .live-settings-grid,
   .live-recognition-grid,
+  .live-translation-memory-grid,
   .metrics-grid { grid-template-columns: 1fr 1fr; }
   .live-page-intro { align-items: flex-start; gap: 12px; }
 }
@@ -1494,6 +1548,7 @@ onBeforeUnmount(cleanupPage);
   .live-form,
   .live-settings-grid,
   .live-recognition-grid,
+  .live-translation-memory-grid,
   .metrics-grid { grid-template-columns: 1fr; }
   .card-heading { align-items: flex-start; gap: 10px; }
   .live-footer { flex-wrap: wrap; }

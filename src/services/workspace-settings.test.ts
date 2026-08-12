@@ -32,7 +32,7 @@ afterAll(() => {
 });
 
 describe("live translation settings persistence", () => {
-  test("loads and persists the supplemental prompt", () => {
+  test("migrates prior prompt-only settings and persists memory controls", () => {
     stored.set(
       "smodeltrans.liveTranslationSettings",
       JSON.stringify({
@@ -41,15 +41,28 @@ describe("live translation settings persistence", () => {
     );
 
     expect(loadPersistedLiveTranslationSettings()).toBeNull();
-    expect(liveTranslationSettings.value.supplementalPrompt).toBe(
-      "  Keep dialogue punctuation.  ",
-    );
+    expect(liveTranslationSettings.value).toMatchObject({
+      supplementalPrompt: "  Keep dialogue punctuation.  ",
+      memoryEnabled: true,
+      memoryMaxTokens: 4_096,
+      memoryMaxTurns: 16,
+    });
 
-    liveTranslationSettings.value.supplementalPrompt = "  Preserve names.  ";
+    liveTranslationSettings.value = {
+      supplementalPrompt: "  Preserve names.  ",
+      memoryEnabled: true,
+      memoryMaxTokens: 8_192,
+      memoryMaxTurns: 8,
+    };
     expect(savePersistedLiveTranslationSettings()).toBeNull();
     expect(
       JSON.parse(stored.get("smodeltrans.liveTranslationSettings") ?? "{}"),
-    ).toEqual({ supplementalPrompt: "Preserve names." });
+    ).toEqual({
+      supplementalPrompt: "Preserve names.",
+      memoryEnabled: true,
+      memoryMaxTokens: 8_192,
+      memoryMaxTurns: 8,
+    });
   });
 });
 

@@ -942,6 +942,7 @@ mod tests {
             order: 1,
             quad_points: [[0, 0], [20, 0], [20, 10], [0, 10]],
             source_text: "AB".to_owned(),
+            confidence_milli: 900,
             translated_text: String::new(),
             characters: vec![CharacterRecord {
                 order: 1,

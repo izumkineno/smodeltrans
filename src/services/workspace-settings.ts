@@ -7,7 +7,16 @@ import type {
   LiveTranslationSettings,
 } from "./live-translation-provider";
 
-import { LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS } from "./live-translation-provider";
+import {
+  DEFAULT_LIVE_MEMORY_ENABLED,
+  DEFAULT_LIVE_MEMORY_TOKENS,
+  DEFAULT_LIVE_MEMORY_TURNS,
+  LIVE_MEMORY_TOKENS_MAX,
+  LIVE_MEMORY_TOKENS_MIN,
+  LIVE_MEMORY_TURNS_MAX,
+  LIVE_MEMORY_TURNS_MIN,
+  LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS,
+} from "./live-translation-provider";
 
 const TARGET_LANGUAGE_STORAGE_KEY = "smodeltrans.targetLanguage";
 const LIVE_OVERLAY_SETTINGS_STORAGE_KEY = "smodeltrans.liveOverlaySettings";
@@ -43,6 +52,9 @@ export const liveRecognitionSettings = ref<LiveRecognitionSettings>({
 
 export const liveTranslationSettings = ref<LiveTranslationSettings>({
   supplementalPrompt: "",
+  memoryEnabled: DEFAULT_LIVE_MEMORY_ENABLED,
+  memoryMaxTokens: DEFAULT_LIVE_MEMORY_TOKENS,
+  memoryMaxTurns: DEFAULT_LIVE_MEMORY_TURNS,
 });
 
 let persistedTargetLanguageLoaded = false;
@@ -292,29 +304,65 @@ export function loadPersistedLiveTranslationSettings(): string | null {
     }
     const parsed: unknown = JSON.parse(rawSettings);
     if (!parsed || typeof parsed !== "object") {
-      return "实时翻译补充提示设置无效，将使用默认值。";
+      return "实时翻译设置无效，将使用默认值。";
     }
     const value = parsed as Partial<LiveTranslationSettings>;
     const supplementalPrompt = value.supplementalPrompt;
+    const memoryEnabled =
+      value.memoryEnabled === undefined ? DEFAULT_LIVE_MEMORY_ENABLED : value.memoryEnabled;
+    const memoryMaxTokens =
+      value.memoryMaxTokens === undefined ? DEFAULT_LIVE_MEMORY_TOKENS : value.memoryMaxTokens;
+    const memoryMaxTurns =
+      value.memoryMaxTurns === undefined ? DEFAULT_LIVE_MEMORY_TURNS : value.memoryMaxTurns;
     if (
       typeof supplementalPrompt !== "string" ||
-      Array.from(supplementalPrompt).length > LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS
+      Array.from(supplementalPrompt).length > LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS ||
+      typeof memoryEnabled !== "boolean" ||
+      !Number.isInteger(memoryMaxTokens) ||
+      memoryMaxTokens < LIVE_MEMORY_TOKENS_MIN ||
+      memoryMaxTokens > LIVE_MEMORY_TOKENS_MAX ||
+      !Number.isInteger(memoryMaxTurns) ||
+      memoryMaxTurns < LIVE_MEMORY_TURNS_MIN ||
+      memoryMaxTurns > LIVE_MEMORY_TURNS_MAX
     ) {
-      return "实时翻译补充提示不能超过 4096 个字符。";
+      return "实时翻译记忆设置无效，将使用默认值。";
     }
-    liveTranslationSettings.value = { supplementalPrompt };
+    liveTranslationSettings.value = {
+      supplementalPrompt,
+      memoryEnabled,
+      memoryMaxTokens,
+      memoryMaxTurns,
+    };
     return null;
   } catch {
-    return "无法读取实时翻译补充提示设置，将使用默认值。";
+    return "无法读取实时翻译设置，将使用默认值。";
   }
 }
 
 export function savePersistedLiveTranslationSettings(): string | null {
-  const supplementalPrompt = liveTranslationSettings.value.supplementalPrompt.trim();
+  const settings = liveTranslationSettings.value;
+  const supplementalPrompt = settings.supplementalPrompt.trim();
   if (Array.from(supplementalPrompt).length > LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS) {
     return "实时翻译补充提示不能超过 4096 个字符。";
   }
-  liveTranslationSettings.value = { supplementalPrompt };
+  if (
+    !Number.isInteger(settings.memoryMaxTokens) ||
+    settings.memoryMaxTokens < LIVE_MEMORY_TOKENS_MIN ||
+    settings.memoryMaxTokens > LIVE_MEMORY_TOKENS_MAX
+  ) {
+    return `实时翻译记忆 token 预算必须为 ${LIVE_MEMORY_TOKENS_MIN} 到 ${LIVE_MEMORY_TOKENS_MAX} 的整数。`;
+  }
+  if (
+    !Number.isInteger(settings.memoryMaxTurns) ||
+    settings.memoryMaxTurns < LIVE_MEMORY_TURNS_MIN ||
+    settings.memoryMaxTurns > LIVE_MEMORY_TURNS_MAX
+  ) {
+    return `实时翻译记忆轮数必须为 ${LIVE_MEMORY_TURNS_MIN} 到 ${LIVE_MEMORY_TURNS_MAX} 的整数。`;
+  }
+  liveTranslationSettings.value = {
+    ...settings,
+    supplementalPrompt,
+  };
   try {
     window.localStorage.setItem(
       LIVE_TRANSLATION_SETTINGS_STORAGE_KEY,
@@ -322,6 +370,6 @@ export function savePersistedLiveTranslationSettings(): string | null {
     );
     return null;
   } catch {
-    return "无法写入实时翻译补充提示设置，请检查应用存储权限。";
+    return "无法写入实时翻译设置，请检查应用存储权限。";
   }
 }

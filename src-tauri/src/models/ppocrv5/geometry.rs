@@ -359,18 +359,19 @@ fn solve_homography(source: QuadF, destination: QuadF) -> Result<[f64; 8]> {
     Ok(std::array::from_fn(|index| matrix[index][8]))
 }
 
-fn bicubic_weight(value: f64) -> f64 {
+fn cubic_weight(value: f64) -> f64 {
     let x = value.abs();
+    const A: f64 = -0.75;
     if x <= 1.0 {
-        1.5 * x * x * x - 2.5 * x * x + 1.0
+        (A + 2.0) * x * x * x - (A + 3.0) * x * x + 1.0
     } else if x < 2.0 {
-        -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0
+        A * x * x * x - 5.0 * A * x * x + 8.0 * A * x - 4.0 * A
     } else {
         0.0
     }
 }
 
-fn sample_bicubic(image: &RgbImage, x: f64, y: f64) -> Rgb<u8> {
+fn sample_cubic(image: &RgbImage, x: f64, y: f64) -> Rgb<u8> {
     let x = x.clamp(0.0, f64::from(image.width().saturating_sub(1)));
     let y = y.clamp(0.0, f64::from(image.height().saturating_sub(1)));
     let x_floor = x.floor() as i32;
@@ -379,8 +380,8 @@ fn sample_bicubic(image: &RgbImage, x: f64, y: f64) -> Rgb<u8> {
     let mut total = 0.0;
     for dy in -1..=2 {
         for dx in -1..=2 {
-            let weight = bicubic_weight(x - f64::from(x_floor + dx))
-                * bicubic_weight(y - f64::from(y_floor + dy));
+            let weight = cubic_weight(x - f64::from(x_floor + dx))
+                * cubic_weight(y - f64::from(y_floor + dy));
             let px = (x_floor + dx).clamp(0, image.width().saturating_sub(1) as i32) as u32;
             let py = (y_floor + dy).clamp(0, image.height().saturating_sub(1) as i32) as u32;
             let pixel = image.get_pixel(px, py);
@@ -441,6 +442,10 @@ impl RegionCrop {
 
 /// Crop a region from the original RGB image using the official
 /// min-area-rectangle → perspective-warp → tall-rotation sequence.
+///
+/// PaddleOCR uses OpenCV `INTER_CUBIC` for this warp. Keeping its $A=-0.75$
+/// cubic kernel preserves narrow strokes, such as dialogue apostrophes, before
+/// the recognizer normalizes each crop to 48 pixels high.
 pub fn crop_region(image: &RgbImage, quad: QuadI) -> Result<RegionCrop> {
     ensure!(
         image.width() > 0 && image.height() > 0,
@@ -473,11 +478,7 @@ pub fn crop_region(image: &RgbImage, quad: QuadI) -> Result<RegionCrop> {
             );
             let source_x = (transform[0] * x + transform[1] * y + transform[2]) / denominator;
             let source_y = (transform[3] * x + transform[4] * y + transform[5]) / denominator;
-            warped.put_pixel(
-                x as u32,
-                y as u32,
-                sample_bicubic(image, source_x, source_y),
-            );
+            warped.put_pixel(x as u32, y as u32, sample_cubic(image, source_x, source_y));
         }
     }
     let rotated = f64::from(height) / f64::from(width) >= 1.5;
@@ -552,6 +553,24 @@ mod tests {
         assert_eq!(
             mapped,
             [[10.0, 5.0], [30.0, 5.0], [30.0, 15.0], [10.0, 15.0]]
+        );
+    }
+
+    #[test]
+    fn crop_sampling_matches_opencv_cubic_interpolation() {
+        let mut image = RgbImage::new(4, 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                image.put_pixel(x, y, Rgb([(x * 40 + y * 20) as u8; 3]));
+            }
+        }
+
+        let sampled = sample_cubic(&image, 1.25, 1.75);
+        assert_eq!(sampled, Rgb([86, 86, 86]));
+        assert_ne!(
+            sampled,
+            Rgb([80, 80, 80]),
+            "cubic must not regress to bilinear"
         );
     }
 }

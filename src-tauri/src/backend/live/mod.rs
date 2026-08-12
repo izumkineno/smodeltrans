@@ -12,8 +12,8 @@ use self::{
     },
     scheduler::{
         LatestFrameSlot, OwnedFrame, StabilityScheduler, finalize_live_regions,
-        live_translated_region_text, normalize_text, normalized_live_region_text,
-        plan_live_ocr_groups, roi_result_is_current,
+        live_translated_region_text, normalized_live_region_text, plan_live_ocr_groups,
+        roi_result_is_current,
     },
 };
 use super::{
@@ -23,7 +23,7 @@ use super::{
     failure::{BackendFailure, BackendFailureCode},
     input::{DecodedImage, validate_target_language},
 };
-use crate::model_support::CancellationToken;
+use crate::{model_config::MemoryConfig, model_support::CancellationToken};
 use image::RgbImage;
 use std::{
     sync::{
@@ -92,6 +92,7 @@ struct SessionRuntime {
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     cancellation: CancellationToken,
+    auto_paused: Arc<AtomicBool>,
     translation_cancellation: Arc<Mutex<Option<CancellationToken>>>,
     latest: Arc<LatestFrameSlot>,
     join: Option<JoinHandle<()>>,
@@ -159,8 +160,12 @@ impl LiveSessionManager {
         let translation_settings = translation_settings
             .validate()
             .map_err(BackendFailure::arguments)?;
-        let target = target_by_id(&target_id)?;
+        let mut target = target_by_id(&target_id)?;
+        platform::activate_target_window(&target_id)?;
         let geometry = platform::target_geometry(&target_id)?;
+        target.width = geometry.width;
+        target.height = geometry.height;
+        target.is_minimized = false;
         trace_live(format_args!(
             "selector request target={target_id} language={target_language} mode={:?} trigger={} stability_wait_ms={}",
             recognition_settings.mode,
@@ -172,8 +177,9 @@ impl LiveSessionManager {
                 "请等待当前图片或文本任务结束后再启动实时翻译",
             ));
         }
-        platform::activate_target_window(&target_id)?;
-        trace_live(format_args!("target window activated target={target_id}"));
+        trace_live(format_args!(
+            "target window restored and activated target={target_id}"
+        ));
         if self
             .backend
             .live_active
@@ -237,16 +243,18 @@ impl LiveSessionManager {
         if current.state != LiveSessionState::Selecting {
             return Err(BackendFailure::arguments("当前会话不在区域选择状态"));
         }
-        let target = current
+        let mut target = current
             .target
             .clone()
             .ok_or_else(|| BackendFailure::internal("实时会话缺少目标窗口"))?;
+        platform::activate_target_window(&target.id)?;
         let geometry = platform::target_geometry(&target.id)?;
+        target.width = geometry.width;
+        target.height = geometry.height;
+        target.is_minimized = false;
         let display_roi = normalized
             .to_physical(geometry.width, geometry.height)
             .ok_or_else(|| BackendFailure::arguments("ROI 无法映射到当前目标客户区"))?;
-        platform::activate_target_window(&target.id)?;
-        trace_live(format_args!("target window activated target={}", target.id));
         let has_runtime = self
             .inner
             .lock()
@@ -346,6 +354,7 @@ impl LiveSessionManager {
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
         let cancellation = CancellationToken::new();
+        let auto_paused = Arc::new(AtomicBool::new(false));
         let translation_cancellation = Arc::new(Mutex::new(None));
         let runner = SessionLoop {
             app: app.clone(),
@@ -357,6 +366,7 @@ impl LiveSessionManager {
             stop: Arc::clone(&stop),
             paused: Arc::clone(&paused),
             cancellation: cancellation.clone(),
+            auto_paused: Arc::clone(&auto_paused),
             translation_cancellation: Arc::clone(&translation_cancellation),
             latest: Arc::clone(&latest),
             terminal_error,
@@ -386,6 +396,7 @@ impl LiveSessionManager {
                 stop,
                 paused,
                 cancellation,
+                auto_paused,
                 translation_cancellation,
                 latest,
                 join: Some(join),
@@ -420,8 +431,8 @@ impl LiveSessionManager {
             .target
             .as_ref()
             .ok_or_else(|| BackendFailure::internal("实时会话缺少目标窗口"))?;
-        let geometry = platform::target_geometry(&target.id)?;
         platform::activate_target_window(&target.id)?;
+        let geometry = platform::target_geometry(&target.id)?;
         trace_live(format_args!("target window activated target={}", target.id));
         {
             let mut inner = self
@@ -433,6 +444,7 @@ impl LiveSessionManager {
                 .runtime
                 .as_mut()
                 .ok_or_else(|| BackendFailure::internal("实时运行时已丢失"))?;
+            runtime.auto_paused.store(false, Ordering::SeqCst);
             runtime.paused.store(true, Ordering::SeqCst);
             runtime.latest.wake();
         }
@@ -496,6 +508,12 @@ impl LiveSessionManager {
     ) -> Result<LiveSessionStatus, BackendFailure> {
         let current = self.current_status()?;
         require_session(&current, session_id)?;
+        let target_id = current
+            .target
+            .as_ref()
+            .ok_or_else(|| BackendFailure::internal("实时会话缺少目标窗口"))?
+            .id
+            .clone();
         let required = if paused {
             LiveSessionState::Running
         } else {
@@ -508,6 +526,11 @@ impl LiveSessionManager {
                 "仅暂停的会话可以继续"
             }));
         }
+        if !paused && platform::target_is_minimized(&target_id)? {
+            return Err(BackendFailure::arguments(
+                "目标窗口仍处于最小化状态，恢复窗口后才能继续",
+            ));
+        }
         let inner = self
             .inner
             .lock()
@@ -517,6 +540,9 @@ impl LiveSessionManager {
             .as_ref()
             .filter(|runtime| runtime.id == session_id)
             .ok_or_else(|| BackendFailure::internal("实时运行时已丢失"))?;
+        if paused {
+            runtime.auto_paused.store(false, Ordering::SeqCst);
+        }
         runtime.paused.store(paused, Ordering::SeqCst);
         runtime.latest.wake();
         drop(inner);
@@ -670,6 +696,7 @@ struct SessionLoop {
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     cancellation: CancellationToken,
+    auto_paused: Arc<AtomicBool>,
     translation_cancellation: Arc<Mutex<Option<CancellationToken>>>,
     latest: Arc<LatestFrameSlot>,
     terminal_error: Arc<Mutex<Option<String>>>,
@@ -705,12 +732,16 @@ impl SessionLoop {
             .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
             .clone()
             .map_err(BackendFailure::arguments)?;
-        let target_language = self
-            .config
-            .lock()
-            .map_err(|_| BackendFailure::internal("实时配置锁已损坏"))?
-            .target_language
-            .clone();
+        let (target_language, memory) = {
+            let config = self
+                .config
+                .lock()
+                .map_err(|_| BackendFailure::internal("实时配置锁已损坏"))?;
+            (
+                config.target_language.clone(),
+                config.translation_settings.memory_config(),
+            )
+        };
         let (gpu, states) = {
             let mut engine = self
                 .backend
@@ -723,7 +754,7 @@ impl SessionLoop {
             let engine = engine
                 .as_mut()
                 .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
-            engine.prepare_live_pipeline(&target_language, &self.cancellation)?;
+            engine.prepare_live_pipeline(&target_language, memory, &self.cancellation)?;
             (engine.gpu_resource_info()?, engine.model_states())
         };
         self.backend.set_model_states(states.0, states.1);
@@ -756,11 +787,18 @@ impl SessionLoop {
         let terminal_error = Arc::clone(&self.terminal_error);
         let config = Arc::clone(&self.config);
         let metrics = Arc::clone(&self.metrics);
+        let paused = Arc::clone(&self.paused);
         thread::Builder::new()
             .name("smodeltrans-wgc-startup".to_owned())
             .spawn(move || {
-                let result =
-                    platform::start_capture(&target_id, latest, terminal_error, config, metrics);
+                let result = platform::start_capture(
+                    &target_id,
+                    latest,
+                    terminal_error,
+                    config,
+                    metrics,
+                    paused,
+                );
                 if let Err(error) = sender.send(result) {
                     if let Ok(capture) = error.0 {
                         let _ = capture.stop();
@@ -782,6 +820,8 @@ impl SessionLoop {
         let mut last_geometry_sync = Instant::now() - Duration::from_secs(1);
         let mut terminal_message = None;
         let mut debug_sequence = 0_u64;
+        let mut last_target_state_sync = Instant::now() - Duration::from_secs(1);
+        let mut target_minimized = None;
 
         let mut trigger_pending = false;
         let mut waiting_for_trigger = false;
@@ -797,6 +837,13 @@ impl SessionLoop {
             {
                 terminal_message = Some(error);
                 break;
+            }
+            if last_target_state_sync.elapsed() >= Duration::from_millis(250) {
+                if let Err(error) = self.sync_target_window_state(&mut target_minimized) {
+                    terminal_message = Some(error.message().to_owned());
+                    break;
+                }
+                last_target_state_sync = Instant::now();
             }
             if self.paused.load(Ordering::SeqCst) {
                 let _ = self.latest.wait_take(Duration::from_millis(100));
@@ -1039,18 +1086,18 @@ impl SessionLoop {
                         true,
                     );
                     let translation_started = Instant::now();
-                    let translated = match self.translate_regions_streaming(
-                        &mut recognized.regions,
+                    let translated = match self.translate_subtitle_streaming(
+                        &confirmed_text,
                         &config.target_language,
                         &config.translation_settings.supplemental_prompt,
+                        config.translation_settings.memory_config(),
                         translation_cancellation
                             .as_ref()
                             .expect("translation cancellation token is initialized"),
                         revision,
                         frame,
-                        LiveOverlayMode::Subtitle,
                     ) {
-                        Ok(()) => live_translated_region_text(&recognized.regions),
+                        Ok(translated) => translated,
                         Err(error) if error.code() == BackendFailureCode::Cancelled => {
                             self.finish_translation();
                             break;
@@ -1101,6 +1148,7 @@ impl SessionLoop {
                         &mut recognized.regions,
                         &config.target_language,
                         &config.translation_settings.supplemental_prompt,
+                        config.translation_settings.memory_config(),
                         translation_cancellation
                             .as_ref()
                             .expect("translation cancellation token is initialized"),
@@ -1180,10 +1228,12 @@ impl SessionLoop {
                 false,
             );
             let _ = update_status(&self.status, &self.app, |status| {
-                status.state = LiveSessionState::Running;
                 status.latest_revision = revision;
                 status.metrics = self.metrics_snapshot();
-                status.message = format!("字幕已更新，OCR {ocr_ms} ms。");
+                if !self.paused.load(Ordering::SeqCst) {
+                    status.state = LiveSessionState::Running;
+                    status.message = format!("字幕已更新，OCR {ocr_ms} ms。");
+                }
             });
         }
         self.finish(Some(capture), terminal_message);
@@ -1205,6 +1255,75 @@ impl SessionLoop {
                 status.metrics = final_metrics;
             });
         }
+    }
+
+    fn sync_target_window_state(
+        &self,
+        last_minimized: &mut Option<bool>,
+    ) -> Result<(), BackendFailure> {
+        let minimized = platform::target_is_minimized(&self.target_id)?;
+        if last_minimized.replace(minimized) == Some(minimized) {
+            return Ok(());
+        }
+
+        if minimized {
+            let was_paused = self.paused.load(Ordering::SeqCst);
+            if !was_paused {
+                self.auto_paused.store(true, Ordering::SeqCst);
+                self.paused.store(true, Ordering::SeqCst);
+            }
+            self.latest.clear();
+            self.latest.wake();
+            set_overlay_visible(&self.app, false);
+            let _ = update_status(&self.status, &self.app, |status| {
+                if !was_paused {
+                    status.state = LiveSessionState::Paused;
+                    status.message =
+                        "目标窗口已最小化，实时翻译已自动暂停；恢复窗口后将继续。".to_owned();
+                } else if status.state == LiveSessionState::Paused {
+                    status.message = "目标窗口已最小化，实时翻译保持暂停。".to_owned();
+                }
+                if let Some(target) = status.target.as_mut() {
+                    target.is_minimized = true;
+                    target.width = 0;
+                    target.height = 0;
+                }
+                status.metrics = self.metrics_snapshot();
+            });
+            return Ok(());
+        }
+
+        let geometry = platform::target_geometry(&self.target_id)?;
+        let auto_resume = self.auto_paused.swap(false, Ordering::SeqCst);
+        if auto_resume {
+            self.paused.store(false, Ordering::SeqCst);
+            self.latest.clear();
+            self.latest.wake();
+        }
+        position_overlay(&self.app, geometry, self.config_overlay_settings());
+        set_overlay_visible(&self.app, true);
+        let _ = update_status(&self.status, &self.app, |status| {
+            if auto_resume {
+                status.state = LiveSessionState::Running;
+                status.message = "目标窗口已恢复，实时翻译继续运行。".to_owned();
+            } else if status.state == LiveSessionState::Paused {
+                status.message = "目标窗口已恢复，实时翻译仍处于手动暂停。".to_owned();
+            }
+            if let Some(target) = status.target.as_mut() {
+                target.is_minimized = false;
+                target.width = geometry.width;
+                target.height = geometry.height;
+            }
+            status.metrics = self.metrics_snapshot();
+        });
+        Ok(())
+    }
+
+    fn config_overlay_settings(&self) -> LiveOverlaySettings {
+        self.config
+            .lock()
+            .map(|config| config.overlay_settings)
+            .unwrap_or_default()
     }
 
     fn roi_is_current(&self, version: u64) -> bool {
@@ -1289,11 +1408,46 @@ impl SessionLoop {
         );
     }
 
+    fn translate_subtitle_streaming(
+        &self,
+        source_text: &str,
+        target_language: &str,
+        supplemental_prompt: &str,
+        memory: MemoryConfig,
+        cancellation: &CancellationToken,
+        revision: u64,
+        frame: &OwnedFrame,
+    ) -> Result<String, BackendFailure> {
+        let mut last_emit = Instant::now() - Duration::from_millis(40);
+        self.translate_live_subtitle(
+            source_text,
+            target_language,
+            supplemental_prompt,
+            memory,
+            cancellation,
+            |partial| {
+                if last_emit.elapsed() >= Duration::from_millis(32) {
+                    self.emit_subtitle(
+                        revision,
+                        frame,
+                        source_text,
+                        partial,
+                        &[],
+                        LiveOverlayMode::Subtitle,
+                        true,
+                    );
+                    last_emit = Instant::now();
+                }
+            },
+        )
+    }
+
     fn translate_regions_streaming(
         &self,
         regions: &mut [RegionRecord],
         target_language: &str,
         supplemental_prompt: &str,
+        memory: MemoryConfig,
         cancellation: &CancellationToken,
         revision: u64,
         frame: &OwnedFrame,
@@ -1305,6 +1459,7 @@ impl SessionLoop {
             regions,
             target_language,
             supplemental_prompt,
+            memory,
             cancellation,
             |order, partial| {
                 if let Some(region) = streamed_regions
@@ -1364,8 +1519,7 @@ impl SessionLoop {
             .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
         let detected = engine.recognize_regions(&decoded, &self.cancellation)?;
         let detected_count = detected.len();
-        let mut regions =
-            self.refine_live_regions(engine, &decoded, detected, text_grouping_enabled);
+        let mut regions = Self::refine_live_regions(detected, text_grouping_enabled);
         finalize_live_regions(&mut regions);
         trace_live(format_args!(
             "OCR regions detected={detected_count} finalized={} text_grouping_enabled={text_grouping_enabled}",
@@ -1383,51 +1537,61 @@ impl SessionLoop {
     }
 
     fn refine_live_regions(
-        &self,
-        engine: &mut BackendEngine,
-        image: &DecodedImage,
         detected: Vec<RegionRecord>,
         text_grouping_enabled: bool,
     ) -> Vec<RegionRecord> {
         if !text_grouping_enabled {
             return detected;
         }
-        let mut refined = Vec::with_capacity(detected.len());
-        for group in plan_live_ocr_groups(detected) {
-            let fallback_text = group.source_text();
-            if !group.should_re_recognize() {
-                refined.push(group.into_merged_region(fallback_text));
-                continue;
-            }
-            let merged = match engine.recognize_region(image, group.quad(), &self.cancellation) {
-                Ok(Some(region)) if re_recognized_text_is_usable(&region, &fallback_text) => region,
-                Ok(Some(region)) => {
-                    trace_live(format_args!(
-                        "rejecting short merged OCR result source={} fallback={}",
-                        debug_text(&region.source_text),
-                        debug_text(&fallback_text)
-                    ));
-                    group.into_merged_region(fallback_text)
-                }
-                Ok(None) => {
-                    trace_live(format_args!(
-                        "merged OCR returned no text; using joined fragments source={}",
-                        debug_text(&fallback_text)
-                    ));
-                    group.into_merged_region(fallback_text)
-                }
-                Err(error) => {
-                    trace_live(format_args!(
-                        "merged OCR failed; using joined fragments error={} source={}",
-                        error.message(),
-                        debug_text(&fallback_text)
-                    ));
-                    group.into_merged_region(fallback_text)
-                }
-            };
-            refined.push(merged);
+        plan_live_ocr_groups(detected)
+            .into_iter()
+            .map(|group| {
+                let fallback_text = group.source_text();
+                group.into_merged_region(fallback_text)
+            })
+            .collect()
+    }
+
+    fn translate_live_subtitle(
+        &self,
+        source_text: &str,
+        target_language: &str,
+        supplemental_prompt: &str,
+        memory: MemoryConfig,
+        cancellation: &CancellationToken,
+        on_chunk: impl FnMut(&str),
+    ) -> Result<String, BackendFailure> {
+        cancellation.check()?;
+        let settings = self
+            .backend
+            .settings
+            .lock()
+            .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
+            .clone()
+            .map_err(BackendFailure::arguments)?;
+        let mut engine = self
+            .backend
+            .engine
+            .lock()
+            .map_err(|_| BackendFailure::internal("模型引擎锁已损坏"))?;
+        if engine.is_none() {
+            *engine = Some(BackendEngine::new(settings)?);
         }
-        refined
+        let engine = engine
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
+        let result = engine.translate_live_subtitle(
+            source_text,
+            target_language,
+            supplemental_prompt,
+            memory,
+            cancellation,
+            on_chunk,
+        );
+        let states = engine.model_states();
+        self.backend.set_model_states(states.0, states.1);
+        self.backend.touch_activity();
+        result
     }
 
     fn translate_live_regions(
@@ -1435,6 +1599,7 @@ impl SessionLoop {
         regions: &mut [RegionRecord],
         target_language: &str,
         supplemental_prompt: &str,
+        memory: MemoryConfig,
         cancellation: &CancellationToken,
         on_chunk: impl FnMut(u32, &str),
     ) -> Result<(), BackendFailure> {
@@ -1461,6 +1626,7 @@ impl SessionLoop {
             regions,
             target_language,
             supplemental_prompt,
+            memory,
             cancellation,
             on_chunk,
         );
@@ -1492,18 +1658,6 @@ fn live_subtitle_region(region: &RegionRecord, roi: LiveRoi) -> Option<LiveSubti
         source_text: region.source_text.clone(),
         translated_text: region.translated_text.clone(),
     })
-}
-
-fn re_recognized_text_is_usable(region: &RegionRecord, fallback_text: &str) -> bool {
-    let candidate_len = normalize_text(&region.source_text)
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .count();
-    let fallback_len = normalize_text(fallback_text)
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .count();
-    candidate_len > 0 && candidate_len.saturating_mul(3) >= fallback_len.saturating_mul(2)
 }
 
 fn await_capture_start_result<T>(
@@ -1809,6 +1963,20 @@ where
         .map_err(|error| BackendFailure::internal(format!("实时窗口主线程操作意外退出: {error}")))?
 }
 
+fn set_overlay_visible(app: &tauri::AppHandle, visible: bool) {
+    let app = app.clone();
+    let _ = run_window_operation_on_main_thread(app.clone(), move || {
+        let Some(window) = app.get_webview_window(OVERLAY_LABEL) else {
+            return Ok(());
+        };
+        if visible {
+            let _ = window.show();
+        } else {
+            let _ = window.hide();
+        }
+        Ok(())
+    });
+}
 async fn run_live_operation<T, F>(operation: F) -> Result<T, BackendError>
 where
     T: Send + 'static,
@@ -1939,10 +2107,12 @@ mod tests {
         await_capture_start_result,
         contracts::{LiveOverlayAttachment, LiveOverlayMode, LiveOverlaySettings, LiveRoi},
         key_trigger_timeout_reached, live_subtitle_region, live_translated_region_text,
-        overlay_bounds, overlay_url_path,
+        normalized_live_region_text, overlay_bounds, overlay_url_path,
         platform::TargetGeometry,
     };
-    use crate::backend::contracts::RegionRecord;
+    use crate::{
+        backend::contracts::RegionRecord, models::hy::translation::build_translation_prompt,
+    };
     use std::{
         sync::{atomic::AtomicBool, mpsc},
         time::Duration,
@@ -1962,7 +2132,6 @@ mod tests {
 
         assert_eq!(result, "capture-ready");
     }
-
     #[test]
     fn capture_start_wait_exits_when_the_session_stops() {
         let stop = AtomicBool::new(true);
@@ -2127,5 +2296,29 @@ mod tests {
         assert_eq!(first.bounds.height, 30);
         assert_eq!(second.bounds.top, 130);
         assert_eq!(second.bounds.top - first.bounds.top, 60);
+    }
+
+    #[test]
+    fn subtitle_prompt_contains_all_ocr_regions_in_one_request() {
+        let regions = vec![
+            RegionRecord::untranslated(
+                1,
+                [[0, 0], [300, 0], [300, 20], [0, 20]],
+                "Don't go causing any trouble. I'll tie",
+            ),
+            RegionRecord::untranslated(
+                2,
+                [[0, 30], [260, 30], [260, 50], [0, 50]],
+                "you up real tight if you do.",
+            ),
+        ];
+
+        let source_text = normalized_live_region_text(&regions);
+        assert_eq!(
+            build_translation_prompt(&source_text, "Chinese"),
+            "Translate the following text into Chinese. Output only the translation: \
+Don't go causing any trouble. I'll tie\n\
+you up real tight if you do."
+        );
     }
 }

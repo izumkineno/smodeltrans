@@ -5,7 +5,7 @@ use crate::{
         input::DecodedImage,
         settings::{BackendSettings, DeviceKind},
     },
-    model_config::ModelConfig,
+    model_config::{MemoryConfig, ModelConfig},
     model_support::CancellationToken,
     models::{hy, ppocrv5::PpOcrV5Provider},
     output::ImageOutput,
@@ -83,6 +83,7 @@ pub(crate) struct BackendEngine {
     gpu_policy: GpuExecutionPolicy,
     ocr: Option<PpOcrV5Provider>,
     hy: Option<hy::HyTranslator>,
+    translator_memory: Option<MemoryConfig>,
     output: ImageOutput,
 }
 
@@ -107,6 +108,7 @@ impl BackendEngine {
             gpu_policy,
             ocr: None,
             hy: None,
+            translator_memory: None,
         })
     }
 
@@ -126,6 +128,7 @@ impl BackendEngine {
         if self.ocr.is_none() {
             if !self.gpu_policy.keeps_models_resident() {
                 self.hy = None;
+                self.translator_memory = None;
             }
             self.ocr = Some(PpOcrV5Provider::load(
                 &self.settings.detector_model_dir,
@@ -139,13 +142,25 @@ impl BackendEngine {
     }
 
     pub(crate) fn load_translator(&mut self, target_language: &str) -> Result<(), BackendFailure> {
+        self.load_translator_with_memory(target_language, self.settings.memory.clone())
+    }
+
+    fn load_translator_with_memory(
+        &mut self,
+        target_language: &str,
+        memory: MemoryConfig,
+    ) -> Result<(), BackendFailure> {
         let config = ModelConfig::from_parts(
             target_language,
             self.settings.prompt.clone(),
             self.settings.generation.clone(),
-            self.settings.memory.clone(),
+            memory.clone(),
         )
         .map_err(|error| BackendFailure::arguments(format!("invalid model config: {error:#}")))?;
+        if self.hy.is_some() && self.translator_memory.as_ref() != Some(&memory) {
+            self.hy = None;
+            self.translator_memory = None;
+        }
         if self.hy.is_none() {
             if !self.gpu_policy.keeps_models_resident() {
                 self.ocr = None;
@@ -161,13 +176,21 @@ impl BackendEngine {
                 BackendFailure::asset(format!("load local Hy-MT2 model: {error:#}"))
             })?;
             self.hy = Some(translator);
+            self.translator_memory = Some(memory);
         }
         Ok(())
+    }
+
+    pub(crate) fn reset_translator_context(&mut self) {
+        if let Some(translator) = self.hy.as_mut() {
+            translator.reset_context();
+        }
     }
 
     pub(crate) fn prepare_live_pipeline(
         &mut self,
         target_language: &str,
+        memory: MemoryConfig,
         cancellation: &CancellationToken,
     ) -> Result<(), BackendFailure> {
         self.load_ocr()?;
@@ -175,18 +198,18 @@ impl BackendEngine {
             .as_mut()
             .ok_or_else(|| BackendFailure::internal("PP-OCRv5 provider was not initialized"))?
             .warm_up(cancellation)?;
-        if self.gpu_policy.keeps_models_resident() {
-            self.load_translator(target_language)?;
-            self.hy
-                .as_mut()
-                .ok_or_else(|| BackendFailure::internal("Hy translator was not initialized"))?
-                .warm_up(cancellation)
-                .map_err(|error| {
-                    BackendFailure::translation(format!("warm up Hy CUDA kernels: {error:#}"))
-                })?;
-        }
+        self.load_translator_with_memory(target_language, memory)?;
+        self.hy
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("Hy translator was not initialized"))?
+            .warm_up(cancellation)
+            .map_err(|error| {
+                BackendFailure::translation(format!("warm up Hy CUDA kernels: {error:#}"))
+            })?;
+        self.reset_translator_context();
         Ok(())
     }
+
     pub(crate) fn gpu_resource_info(&self) -> Result<Option<GpuResourceInfo>, BackendFailure> {
         let resources = query_gpu_memory(&self.device).ok().flatten();
         Ok(resources
@@ -212,6 +235,7 @@ impl BackendEngine {
 
     pub(crate) fn unload_translator(&mut self) {
         self.hy = None;
+        self.translator_memory = None;
     }
 
     pub(crate) fn unload_models(&mut self) {
@@ -238,21 +262,6 @@ impl BackendEngine {
             ));
         }
         Ok(document.regions)
-    }
-
-    pub(crate) fn recognize_region(
-        &mut self,
-        image: &DecodedImage,
-        quad: [[i32; 2]; 4],
-        cancellation: &CancellationToken,
-    ) -> Result<Option<RegionRecord>, BackendFailure> {
-        cancellation.check()?;
-        self.load_ocr()?;
-        let ocr = self
-            .ocr
-            .as_mut()
-            .ok_or_else(|| BackendFailure::internal("PP-OCRv5 provider was not initialized"))?;
-        ocr.recognize_quad(image, quad, cancellation)
     }
 
     pub(crate) fn translate(
@@ -324,6 +333,7 @@ impl BackendEngine {
         records: &mut [RegionRecord],
         target_language: &str,
         supplemental_prompt: &str,
+        memory: MemoryConfig,
         cancellation: &CancellationToken,
         mut on_chunk: impl FnMut(u32, &str),
     ) -> Result<(), BackendFailure> {
@@ -331,7 +341,7 @@ impl BackendEngine {
             return Ok(());
         }
         cancellation.check()?;
-        self.load_translator(target_language)?;
+        self.load_translator_with_memory(target_language, memory)?;
         let prompt = self.settings.prompt.clone();
         let generation = self.settings.generation.clone();
         let translator = self
@@ -375,6 +385,49 @@ impl BackendEngine {
             on_chunk(order, &record.translated_text);
         }
         cancellation.check()
+    }
+
+    pub(crate) fn translate_live_subtitle(
+        &mut self,
+        source_text: &str,
+        target_language: &str,
+        supplemental_prompt: &str,
+        memory: MemoryConfig,
+        cancellation: &CancellationToken,
+        mut on_chunk: impl FnMut(&str),
+    ) -> Result<String, BackendFailure> {
+        cancellation.check()?;
+        self.load_translator_with_memory(target_language, memory)?;
+        let prompt = self.settings.prompt.clone();
+        let generation = self.settings.generation.clone();
+        let translator = self
+            .hy
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("Hy provider was not initialized"))?;
+        let result = translator
+            .translate_text(
+                source_text,
+                target_language,
+                &prompt,
+                supplemental_prompt,
+                &generation,
+                cancellation,
+                |chunk| {
+                    on_chunk(chunk);
+                    Ok(())
+                },
+            )
+            .map_err(|error| {
+                if cancellation.is_cancelled() {
+                    BackendFailure::cancelled("Hy translation was cancelled")
+                } else {
+                    BackendFailure::translation(format!(
+                        "Hy live subtitle translation failed: {error:#}"
+                    ))
+                }
+            })?;
+        cancellation.check()?;
+        validate_live_subtitle_translation_output(result.text)
     }
 
     fn translate_regions_with_progress(
@@ -541,6 +594,15 @@ fn validate_text_translation_output(text: String) -> Result<String, BackendFailu
     if text.len() > crate::backend::input::MAX_TEXT_BYTES {
         return Err(BackendFailure::translation(
             "text output exceeds the 8 MiB limit",
+        ));
+    }
+    Ok(text)
+}
+
+fn validate_live_subtitle_translation_output(text: String) -> Result<String, BackendFailure> {
+    if text.trim().is_empty() {
+        return Err(BackendFailure::translation(
+            "Hy returned empty live subtitle translation",
         ));
     }
     Ok(text)

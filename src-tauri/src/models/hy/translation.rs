@@ -108,6 +108,10 @@ impl HyTranslator {
         Ok(())
     }
 
+    pub(crate) fn reset_context(&mut self) {
+        self.session.reset();
+    }
+
     /// Translate plain neutral text using the Hy translation prompt contract.
     pub(crate) fn translate_text(
         &mut self,

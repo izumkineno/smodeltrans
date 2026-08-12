@@ -14,6 +14,7 @@ export interface CaptureWindowInfo {
   processId: number;
   width: number;
   height: number;
+  isMinimized: boolean;
 }
 
 export interface LiveRoi {
@@ -85,9 +86,19 @@ export interface LiveRecognitionSettings {
 }
 
 export const LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS = 4_096;
+export const LIVE_MEMORY_TOKENS_MIN = 1;
+export const LIVE_MEMORY_TOKENS_MAX = 262_144;
+export const LIVE_MEMORY_TURNS_MIN = 1;
+export const LIVE_MEMORY_TURNS_MAX = 1_024;
+export const DEFAULT_LIVE_MEMORY_ENABLED = true;
+export const DEFAULT_LIVE_MEMORY_TOKENS = 4_096;
+export const DEFAULT_LIVE_MEMORY_TURNS = 16;
 
 export interface LiveTranslationSettings {
   supplementalPrompt: string;
+  memoryEnabled: boolean;
+  memoryMaxTokens: number;
+  memoryMaxTurns: number;
 }
 
 export interface LiveSubtitleRegion {

@@ -324,36 +324,6 @@ pub(super) struct LiveOcrGroup {
 }
 
 impl LiveOcrGroup {
-    pub(super) fn should_re_recognize(&self) -> bool {
-        const SEVERE_FRAGMENT_COUNT: usize = 6;
-        const SHORT_FRAGMENT_CHARACTER_LIMIT: usize = 2;
-
-        let fragment_count = self.regions.len();
-        if fragment_count >= SEVERE_FRAGMENT_COUNT {
-            return true;
-        }
-        if fragment_count < 3 {
-            return false;
-        }
-        let short_fragments = self
-            .regions
-            .iter()
-            .filter(|region| {
-                region
-                    .source_text
-                    .chars()
-                    .filter(|character| character.is_alphanumeric())
-                    .count()
-                    <= SHORT_FRAGMENT_CHARACTER_LIMIT
-            })
-            .count();
-        short_fragments.saturating_mul(2) >= fragment_count
-    }
-
-    pub(super) fn quad(&self) -> [[i32; 2]; 4] {
-        self.quad
-    }
-
     pub(super) fn source_text(&self) -> String {
         join_fragments(
             self.regions
@@ -368,6 +338,12 @@ impl LiveOcrGroup {
     }
 
     pub(super) fn into_merged_region(self, source_text: String) -> RegionRecord {
+        let confidence_milli = self
+            .regions
+            .iter()
+            .filter_map(|region| (region.confidence_milli > 0).then_some(region.confidence_milli))
+            .min()
+            .unwrap_or(0);
         let mut characters = self
             .regions
             .into_iter()
@@ -380,6 +356,7 @@ impl LiveOcrGroup {
             order: 0,
             quad_points: self.quad,
             source_text: normalize_text(&source_text),
+            confidence_milli,
             translated_text: String::new(),
             characters,
         }
@@ -701,8 +678,8 @@ pub(super) const fn roi_result_is_current(result_version: u64, current_version: 
 mod tests {
     use super::{
         LatestFrameSlot, OwnedFrame, StabilityScheduler, finalize_live_regions,
-        live_translated_region_text, normalized_live_region_text, normalized_region_text,
-        plan_live_ocr_groups, roi_result_is_current,
+        live_translated_region_text, normalized_live_region_text, plan_live_ocr_groups,
+        roi_result_is_current,
     };
     use crate::backend::contracts::RegionRecord;
     use crate::backend::live::contracts::LiveRoi;
@@ -797,19 +774,6 @@ mod tests {
     }
 
     #[test]
-    fn region_text_is_geometry_ordered_then_whitespace_normalized() {
-        let regions = vec![
-            RegionRecord::untranslated(1, [[60, 50], [90, 50], [90, 70], [60, 70]], " third "),
-            RegionRecord::untranslated(2, [[50, 10], [90, 10], [90, 30], [50, 30]], "second"),
-            RegionRecord::untranslated(3, [[5, 10], [40, 10], [40, 30], [5, 30]], " first\nline "),
-        ];
-        assert_eq!(
-            normalized_region_text(&regions),
-            "first line\nsecond\nthird"
-        );
-    }
-
-    #[test]
     fn live_translated_region_text_preserves_model_whitespace() {
         let mut regions = vec![
             RegionRecord::untranslated(1, [[60, 50], [90, 50], [90, 70], [60, 70]], "third"),
@@ -846,30 +810,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Hello world", "next line", "unrelated"]
         );
-        assert!(!groups[0].should_re_recognize());
-        assert!(!groups[1].should_re_recognize());
-        assert!(!groups[2].should_re_recognize());
-    }
-
-    #[test]
-    fn live_grouping_re_recognizes_only_severely_fragmented_lines() {
-        let groups = plan_live_ocr_groups(
-            ["A", "very", "broken", "subtitle", "line", "here"]
-                .into_iter()
-                .enumerate()
-                .map(|(index, text)| {
-                    let left = i32::try_from(index).unwrap() * 22;
-                    RegionRecord::untranslated(
-                        u32::try_from(index + 1).unwrap(),
-                        [[left, 10], [left + 20, 10], [left + 20, 30], [left, 30]],
-                        text,
-                    )
-                })
-                .collect(),
-        );
-
-        assert_eq!(groups.len(), 1);
-        assert!(groups[0].should_re_recognize());
     }
 
     #[test]

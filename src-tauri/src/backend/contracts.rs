@@ -15,6 +15,8 @@ pub(crate) struct RegionRecord {
     pub(crate) order: u32,
     pub(crate) quad_points: [[i32; 2]; 4],
     pub(crate) source_text: String,
+    /// Mean CTC confidence in thousandths; zero means unavailable.
+    pub(crate) confidence_milli: u16,
     pub(crate) translated_text: String,
     pub(crate) characters: Vec<CharacterRecord>,
 }
@@ -29,6 +31,7 @@ impl RegionRecord {
             order,
             quad_points,
             source_text: source_text.into(),
+            confidence_milli: 0,
             translated_text: String::new(),
             characters: Vec::new(),
         }
@@ -37,6 +40,15 @@ impl RegionRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OcrDocument {
+    pub(crate) regions: Vec<RegionRecord>,
+}
+
+#[derive(Debug)]
+pub(crate) struct OcrOutput {
+    pub(crate) annotated_png: Vec<u8>,
+    pub(crate) markdown: String,
+    pub(crate) text: String,
+    pub(crate) provider_label: String,
     pub(crate) regions: Vec<RegionRecord>,
 }
 
@@ -60,16 +72,6 @@ pub(crate) struct TranslationOutput {
     pub(crate) provider_label: String,
     pub(crate) is_translated: bool,
 }
-
-#[derive(Debug)]
-pub(crate) struct OcrOutput {
-    pub(crate) annotated_png: Vec<u8>,
-    pub(crate) markdown: String,
-    pub(crate) text: String,
-    pub(crate) provider_label: String,
-    pub(crate) regions: Vec<RegionRecord>,
-}
-
 pub(crate) trait OcrPort: Send {
     fn recognize(
         &mut self,

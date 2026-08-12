@@ -10,7 +10,10 @@ use crate::backend::{
 };
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use windows::{
@@ -20,7 +23,9 @@ use windows::{
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, VK_CONTROL, VK_F1, VK_MENU, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB,
             },
-            WindowsAndMessaging::{EnumWindows, IsIconic, IsWindow, IsWindowVisible},
+            WindowsAndMessaging::{
+                EnumWindows, IsIconic, IsWindow, IsWindowVisible, SW_RESTORE, ShowWindow,
+            },
         },
     },
     core::BOOL,
@@ -50,7 +55,7 @@ unsafe extern "system" fn collect_top_level_window(hwnd: HWND, windows: LPARAM) 
     TRUE
 }
 
-fn enumerate_visible_top_level_windows() -> Result<Vec<Window>, BackendFailure> {
+fn enumerate_top_level_windows() -> Result<Vec<Window>, BackendFailure> {
     let mut raw_windows: Vec<HWND> = Vec::new();
     unsafe {
         EnumWindows(
@@ -62,9 +67,7 @@ fn enumerate_visible_top_level_windows() -> Result<Vec<Window>, BackendFailure> 
     Ok(raw_windows
         .into_iter()
         .filter(|hwnd| unsafe {
-            IsWindow(Some(*hwnd)).as_bool()
-                && IsWindowVisible(*hwnd).as_bool()
-                && !IsIconic(*hwnd).as_bool()
+            IsWindow(Some(*hwnd)).as_bool() && IsWindowVisible(*hwnd).as_bool()
         })
         .map(|hwnd| Window::from_raw_hwnd(hwnd.0))
         .collect())
@@ -80,12 +83,14 @@ pub(in crate::backend::live) fn list_target_windows()
     let current_pid = std::process::id();
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
-    let windows = enumerate_visible_top_level_windows()?;
+    let windows = enumerate_top_level_windows()?;
     for window in windows {
         let raw = window.as_raw_hwnd() as usize;
         if raw == 0 || !seen.insert(raw) {
             continue;
         }
+        let hwnd = HWND(window.as_raw_hwnd());
+        let is_minimized = unsafe { IsIconic(hwnd).as_bool() };
         let title = window.title().unwrap_or_default();
         let Ok(process_id) = window.process_id() else {
             continue;
@@ -93,8 +98,13 @@ pub(in crate::backend::live) fn list_target_windows()
         if process_id == current_pid {
             continue;
         }
-        let Ok(geometry) = geometry_for_window(&window) else {
-            continue;
+        let (width, height) = if is_minimized {
+            (0, 0)
+        } else {
+            let Ok(geometry) = geometry_for_window(&window) else {
+                continue;
+            };
+            (geometry.width, geometry.height)
         };
         targets.push(CaptureWindowInfo {
             id: raw.to_string(),
@@ -103,8 +113,9 @@ pub(in crate::backend::live) fn list_target_windows()
                 .process_name()
                 .unwrap_or_else(|_| "未知进程".to_owned()),
             process_id,
-            width: geometry.width,
-            height: geometry.height,
+            width,
+            height,
+            is_minimized,
         });
     }
     targets.sort_by(|left, right| left.title.to_lowercase().cmp(&right.title.to_lowercase()));
@@ -173,18 +184,30 @@ pub(in crate::backend::live) fn target_geometry(
 pub(in crate::backend::live) fn activate_target_window(
     target_id: &str,
 ) -> Result<(), BackendFailure> {
-    use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{BringWindowToTop, SetForegroundWindow};
 
     let window = target_from_id(target_id)?;
     let hwnd = HWND(window.as_raw_hwnd());
+    if unsafe { IsIconic(hwnd).as_bool() } {
+        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+    }
     if unsafe { !SetForegroundWindow(hwnd).as_bool() } {
         return Err(BackendFailure::arguments(
             "Windows 未允许将目标窗口置于前台；请关闭可能打开的系统菜单后重试",
         ));
     }
+    unsafe {
+        BringWindowToTop(hwnd)
+            .map_err(|error| BackendFailure::internal(format!("目标窗口置顶失败: {error}")))?;
+    }
     Ok(())
 }
-
+pub(in crate::backend::live) fn target_is_minimized(
+    target_id: &str,
+) -> Result<bool, BackendFailure> {
+    let window = target_from_id(target_id)?;
+    Ok(unsafe { IsIconic(HWND(window.as_raw_hwnd())).as_bool() })
+}
 pub(in crate::backend::live) fn recognition_is_active(settings: &LiveRecognitionSettings) -> bool {
     if settings.mode == LiveRecognitionMode::Automatic {
         return true;
@@ -294,12 +317,14 @@ struct CaptureFlags {
     terminal_error: Arc<Mutex<Option<String>>>,
     config: Arc<Mutex<LiveConfig>>,
     metrics: Arc<Mutex<LiveMetrics>>,
+    paused: Arc<AtomicBool>,
 }
 
 struct CaptureHandler {
     flags: CaptureFlags,
     scratch: Vec<u8>,
     last_roi_version: Option<u64>,
+    was_paused: bool,
 }
 
 impl GraphicsCaptureApiHandler for CaptureHandler {
@@ -311,6 +336,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             flags: ctx.flags,
             scratch: Vec::new(),
             last_roi_version: None,
+            was_paused: false,
         })
     }
 
@@ -328,6 +354,14 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         {
             capture_control.stop();
             return Ok(());
+        }
+        if self.flags.paused.load(Ordering::Relaxed) {
+            self.was_paused = true;
+            return Ok(());
+        }
+        if self.was_paused {
+            self.last_roi_version = None;
+            self.was_paused = false;
         }
         let config = self
             .flags
@@ -504,6 +538,7 @@ pub(in crate::backend::live) fn start_capture(
     terminal_error: Arc<Mutex<Option<String>>>,
     config: Arc<Mutex<LiveConfig>>,
     metrics: Arc<Mutex<LiveMetrics>>,
+    paused: Arc<AtomicBool>,
 ) -> Result<CaptureWorker, BackendFailure> {
     let target = target_from_id(target_id)?;
     let dirty_region_settings = if GraphicsCaptureApi::is_dirty_region_supported().unwrap_or(false)
@@ -525,6 +560,7 @@ pub(in crate::backend::live) fn start_capture(
             terminal_error,
             config,
             metrics,
+            paused,
         },
     );
     let control = CaptureHandler::start_free_threaded(settings).map_err(|error| {

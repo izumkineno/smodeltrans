@@ -1,3 +1,4 @@
+use crate::model_config::MemoryConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -9,6 +10,7 @@ pub(crate) struct CaptureWindowInfo {
     pub(crate) process_id: u32,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) is_minimized: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -105,11 +107,40 @@ impl LiveOverlaySettings {
 
 pub(super) const MAX_LIVE_SUPPLEMENTAL_PROMPT_CHARS: usize = 4_096;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+fn default_live_memory_enabled() -> bool {
+    true
+}
+
+fn default_live_memory_max_tokens() -> usize {
+    MemoryConfig::default().max_tokens
+}
+
+fn default_live_memory_max_turns() -> usize {
+    MemoryConfig::default().max_turns
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LiveTranslationSettings {
     #[serde(default)]
     pub(crate) supplemental_prompt: String,
+    #[serde(default = "default_live_memory_enabled")]
+    pub(crate) memory_enabled: bool,
+    #[serde(default = "default_live_memory_max_tokens")]
+    pub(crate) memory_max_tokens: usize,
+    #[serde(default = "default_live_memory_max_turns")]
+    pub(crate) memory_max_turns: usize,
+}
+
+impl Default for LiveTranslationSettings {
+    fn default() -> Self {
+        Self {
+            supplemental_prompt: String::new(),
+            memory_enabled: default_live_memory_enabled(),
+            memory_max_tokens: default_live_memory_max_tokens(),
+            memory_max_turns: default_live_memory_max_turns(),
+        }
+    }
 }
 
 impl LiveTranslationSettings {
@@ -118,8 +149,20 @@ impl LiveTranslationSettings {
         if supplemental_prompt.chars().count() > MAX_LIVE_SUPPLEMENTAL_PROMPT_CHARS {
             return Err("实时翻译补充提示不能超过 4096 个字符");
         }
+        let memory = self.memory_config();
+        memory
+            .validate()
+            .map_err(|_| "实时翻译记忆预算无效，请检查 token 预算和记忆轮数")?;
         self.supplemental_prompt = supplemental_prompt.to_owned();
         Ok(self)
+    }
+
+    pub(super) fn memory_config(&self) -> MemoryConfig {
+        MemoryConfig {
+            enabled: self.memory_enabled,
+            max_tokens: self.memory_max_tokens,
+            max_turns: self.memory_max_turns,
+        }
     }
 }
 
@@ -469,7 +512,6 @@ impl NormalizedRoi {
         }
         Ok(normalized)
     }
-
     pub(super) fn to_physical(self, client_width: u32, client_height: u32) -> Option<LiveRoi> {
         if client_width == 0 || client_height == 0 {
             return None;
@@ -492,7 +534,6 @@ impl NormalizedRoi {
         })
     }
 }
-
 #[derive(Clone, Debug)]
 pub(super) struct LiveConfig {
     pub(super) roi: NormalizedRoi,
@@ -513,6 +554,7 @@ mod tests {
         LiveSessionStatus, LiveTranslationSettings, MAX_KEY_TRIGGER_TIMEOUT_MS,
         MAX_LIVE_SUPPLEMENTAL_PROMPT_CHARS, MAX_STABILITY_WAIT_MS, MIN_KEY_TRIGGER_TIMEOUT_MS,
     };
+    use crate::model_config::{MAX_MEMORY_TOKENS, MAX_MEMORY_TURNS};
 
     #[test]
     fn status_serde_contract_is_camel_case() {
@@ -529,21 +571,40 @@ mod tests {
     fn translation_settings_trim_and_reject_oversized_prompts() {
         let settings = LiveTranslationSettings {
             supplemental_prompt: "  Preserve names.  ".to_owned(),
+            ..LiveTranslationSettings::default()
         }
         .validate()
         .expect("valid prompt");
         assert_eq!(settings.supplemental_prompt, "Preserve names.");
+        assert!(settings.memory_enabled);
+        assert_eq!(settings.memory_max_tokens, 4096);
+        assert_eq!(settings.memory_max_turns, 16);
         let serialized = serde_json::to_value(&settings).expect("serialize translation settings");
         assert_eq!(serialized["supplementalPrompt"], "Preserve names.");
+        assert_eq!(serialized["memoryEnabled"], true);
+        assert_eq!(serialized["memoryMaxTokens"], 4096);
+        assert_eq!(serialized["memoryMaxTurns"], 16);
 
         let too_long = LiveTranslationSettings {
-            supplemental_prompt: "x".repeat(MAX_LIVE_SUPPLEMENTAL_PROMPT_CHARS + 1),
+            memory_max_tokens: MAX_MEMORY_TOKENS + 1,
+            ..LiveTranslationSettings::default()
         };
         assert_eq!(
             too_long
                 .validate()
-                .expect_err("oversized prompt should fail"),
-            "实时翻译补充提示不能超过 4096 个字符"
+                .expect_err("oversized memory should fail"),
+            "实时翻译记忆预算无效，请检查 token 预算和记忆轮数"
+        );
+
+        let too_many_turns = LiveTranslationSettings {
+            memory_max_turns: MAX_MEMORY_TURNS + 1,
+            ..LiveTranslationSettings::default()
+        };
+        assert_eq!(
+            too_many_turns
+                .validate()
+                .expect_err("oversized turn budget should fail"),
+            "实时翻译记忆预算无效，请检查 token 预算和记忆轮数"
         );
     }
 

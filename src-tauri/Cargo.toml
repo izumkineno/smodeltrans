@@ -30,7 +30,7 @@ image = { version = "=0.25.8", default-features = false, features = ["png", "jpe
 ab_glyph = "=0.2.32"
 fontdb = "=0.23.0"
 unicode-segmentation = "=1.13.3"
-imageproc = "=0.26.2"
+imageproc = { version = "=0.26.2", default-features = false, features = ["text"] }
 tokenizers = "=0.22.2"
 toml = "=0.8.23"
 sha2 = "=0.10.9"

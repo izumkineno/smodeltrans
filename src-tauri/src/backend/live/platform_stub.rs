@@ -8,7 +8,7 @@ use crate::backend::{
         scheduler::LatestFrameSlot,
     },
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::backend::live) struct TargetGeometry {
@@ -47,6 +47,12 @@ pub(in crate::backend::live) fn activate_target_window(
     Err(unsupported())
 }
 
+pub(in crate::backend::live) fn target_is_minimized(
+    _target_id: &str,
+) -> Result<bool, BackendFailure> {
+    Err(unsupported())
+}
+
 pub(in crate::backend::live) fn recognition_is_active(settings: &LiveRecognitionSettings) -> bool {
     settings.mode == LiveRecognitionMode::Automatic
 }
@@ -57,6 +63,7 @@ pub(in crate::backend::live) fn start_capture(
     _terminal_error: Arc<Mutex<Option<String>>>,
     _config: Arc<Mutex<LiveConfig>>,
     _metrics: Arc<Mutex<LiveMetrics>>,
+    _paused: Arc<AtomicBool>,
 ) -> Result<CaptureWorker, BackendFailure> {
     Err(unsupported())
 }

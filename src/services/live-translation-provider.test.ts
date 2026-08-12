@@ -41,6 +41,7 @@ const target: CaptureWindowInfo = {
   processId: 4242,
   width: 1920,
   height: 1080,
+  isMinimized: false,
 };
 
 const roi: LiveRoi = {
@@ -71,6 +72,9 @@ const recognitionSettings: LiveRecognitionSettings = {
 
 const translationSettings: LiveTranslationSettings = {
   supplementalPrompt: "Keep character names and dialogue punctuation.",
+  memoryEnabled: true,
+  memoryMaxTokens: 4_096,
+  memoryMaxTurns: 16,
 };
 
 const status: LiveSessionStatus = {
