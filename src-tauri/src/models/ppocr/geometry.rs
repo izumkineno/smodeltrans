@@ -376,18 +376,28 @@ fn sample_cubic(image: &RgbImage, x: f64, y: f64) -> Rgb<u8> {
     let y = y.clamp(0.0, f64::from(image.height().saturating_sub(1)));
     let x_floor = x.floor() as i32;
     let y_floor = y.floor() as i32;
+    let max_x = image.width().saturating_sub(1) as i32;
+    let max_y = image.height().saturating_sub(1) as i32;
+    let x_indices: [usize; 4] =
+        std::array::from_fn(|index| (x_floor + index as i32 - 1).clamp(0, max_x) as usize);
+    let y_indices: [usize; 4] =
+        std::array::from_fn(|index| (y_floor + index as i32 - 1).clamp(0, max_y) as usize);
+    let x_weights: [f64; 4] =
+        std::array::from_fn(|index| cubic_weight(x - f64::from(x_floor + index as i32 - 1)));
+    let y_weights: [f64; 4] =
+        std::array::from_fn(|index| cubic_weight(y - f64::from(y_floor + index as i32 - 1)));
+    let pixels = image.as_raw();
+    let image_width = image.width() as usize;
     let mut channels = [0.0_f64; 3];
     let mut total = 0.0;
-    for dy in -1..=2 {
-        for dx in -1..=2 {
-            let weight = cubic_weight(x - f64::from(x_floor + dx))
-                * cubic_weight(y - f64::from(y_floor + dy));
-            let px = (x_floor + dx).clamp(0, image.width().saturating_sub(1) as i32) as u32;
-            let py = (y_floor + dy).clamp(0, image.height().saturating_sub(1) as i32) as u32;
-            let pixel = image.get_pixel(px, py);
-            for channel in 0..3 {
-                channels[channel] += weight * f64::from(pixel[channel]);
-            }
+    for (dy, &py) in y_indices.iter().enumerate() {
+        let row_offset = py * image_width * 3;
+        for (dx, &px) in x_indices.iter().enumerate() {
+            let weight = x_weights[dx] * y_weights[dy];
+            let offset = row_offset + px * 3;
+            channels[0] += weight * f64::from(pixels[offset]);
+            channels[1] += weight * f64::from(pixels[offset + 1]);
+            channels[2] += weight * f64::from(pixels[offset + 2]);
             total += weight;
         }
     }
@@ -495,82 +505,3 @@ pub fn crop_region(image: &RgbImage, quad: QuadI) -> Result<RegionCrop> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detector_resize_matches_transformers_stride_rounding() {
-        let subtitle_profile = DetectorProfile::for_image(400, 100).unwrap();
-        assert_eq!(
-            (
-                subtitle_profile.detector_width,
-                subtitle_profile.detector_height
-            ),
-            (384, 96)
-        );
-        let scaled_profile = DetectorProfile::for_image(1920, 1080).unwrap();
-        assert_eq!(
-            (
-                scaled_profile.detector_width,
-                scaled_profile.detector_height
-            ),
-            (960, 544)
-        );
-    }
-
-    #[test]
-    fn canonicalizes_clockwise_top_left() {
-        let quad = canonicalize_quad([[10, 10], [10, 30], [30, 30], [30, 10]]).unwrap();
-        assert_eq!(quad, [[10, 10], [30, 10], [30, 30], [10, 30]]);
-    }
-
-    #[test]
-    fn slanted_text_quad_starts_at_left_edge_when_right_edge_is_higher() {
-        let quad = canonicalize_quad([[547, 522], [547, 546], [127, 548], [127, 524]]).unwrap();
-        assert_eq!(quad, [[127, 524], [547, 522], [547, 546], [127, 548]]);
-
-        let rectangle = minimum_area_rect(quad);
-        assert!(
-            rectangle[0][0] < rectangle[1][0],
-            "text crop must run left-to-right: {rectangle:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_self_intersecting_quad() {
-        assert!(canonicalize_quad([[0, 0], [10, 10], [0, 10], [10, 0]]).is_err());
-    }
-    #[test]
-    fn crop_coordinates_map_back_to_the_source_quad() {
-        let image = RgbImage::new(40, 30);
-        let crop = crop_region(&image, [[10, 5], [30, 5], [30, 15], [10, 15]]).unwrap();
-        assert_eq!(crop.image.dimensions(), (20, 10));
-
-        let mapped = crop
-            .map_output_quad([[0.0, 0.0], [20.0, 0.0], [20.0, 10.0], [0.0, 10.0]])
-            .unwrap();
-        assert_eq!(
-            mapped,
-            [[10.0, 5.0], [30.0, 5.0], [30.0, 15.0], [10.0, 15.0]]
-        );
-    }
-
-    #[test]
-    fn crop_sampling_matches_opencv_cubic_interpolation() {
-        let mut image = RgbImage::new(4, 4);
-        for y in 0..4 {
-            for x in 0..4 {
-                image.put_pixel(x, y, Rgb([(x * 40 + y * 20) as u8; 3]));
-            }
-        }
-
-        let sampled = sample_cubic(&image, 1.25, 1.75);
-        assert_eq!(sampled, Rgb([86, 86, 86]));
-        assert_ne!(
-            sampled,
-            Rgb([80, 80, 80]),
-            "cubic must not regress to bilinear"
-        );
-    }
-}

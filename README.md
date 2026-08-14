@@ -1,6 +1,6 @@
 # smodeltrans
 
-`smodeltrans` is a Tauri 2 desktop workspace built with Vue 3, TypeScript, Naive UI, and Candle. It provides local Hy-MT2 text translation, PP-OCRv5 recognition, OCR-assisted image translation, persistent settings, and live model runtime monitoring with explicit load and unload controls.
+`smodeltrans` is a Tauri 2 desktop workspace built with Vue 3, TypeScript, Naive UI, and Candle. It provides local Hy-MT2 text translation, PP-OCR recognition, OCR-assisted image translation, persistent settings, and live model runtime monitoring with explicit load and unload controls.
 
 ## Development
 

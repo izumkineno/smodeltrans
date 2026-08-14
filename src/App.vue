@@ -1243,6 +1243,69 @@ a:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.settings-model-select-row {
+  flex-wrap: wrap;
+}
+
+.settings-model-select {
+  min-width: 200px;
+  flex: 1;
+  max-width: 380px;
+}
+
+.settings-model-help {
+  flex-basis: 100%;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.model-dialog-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.model-dialog-path-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.model-dialog-path-value {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.settings-actions-feedback {
+  min-width: 0;
+  flex: 1;
+  margin-right: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
 .settings-card-actions {
   display: flex;
   justify-content: flex-end;

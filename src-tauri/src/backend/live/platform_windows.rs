@@ -432,6 +432,8 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                 rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
             }
         }
+        let image = image::RgbImage::from_raw(roi.width, roi.height, rgb)
+            .ok_or_else(|| "实时捕获帧缓冲区无效".to_owned())?;
         let observed_at_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
@@ -441,7 +443,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         let dropped = self.flags.latest.replace(OwnedFrame {
             width: roi.width,
             height: roi.height,
-            rgb,
+            image: Arc::new(image),
             observed_at_epoch_ms,
             roi: LiveRoi {
                 x: roi.x,

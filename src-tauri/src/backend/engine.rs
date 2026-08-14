@@ -7,7 +7,7 @@ use crate::{
     },
     model_config::{MemoryConfig, ModelConfig},
     model_support::CancellationToken,
-    models::{hy, ppocrv5::PpOcrV5Provider},
+    models::{hy, ppocr::PpOcrProvider},
     output::ImageOutput,
 };
 use candle_core::Device as CandleDevice;
@@ -81,7 +81,7 @@ pub(crate) struct BackendEngine {
     pub(crate) settings: BackendSettings,
     device: CandleDevice,
     gpu_policy: GpuExecutionPolicy,
-    ocr: Option<PpOcrV5Provider>,
+    ocr: Option<PpOcrProvider>,
     hy: Option<hy::HyTranslator>,
     translator_memory: Option<MemoryConfig>,
     output: ImageOutput,
@@ -130,7 +130,7 @@ impl BackendEngine {
                 self.hy = None;
                 self.translator_memory = None;
             }
-            self.ocr = Some(PpOcrV5Provider::load(
+            self.ocr = Some(PpOcrProvider::load(
                 &self.settings.detector_model_dir,
                 &self.settings.recognizer_model_dir,
                 &self.device,
@@ -196,7 +196,7 @@ impl BackendEngine {
         self.load_ocr()?;
         self.ocr
             .as_mut()
-            .ok_or_else(|| BackendFailure::internal("PP-OCRv5 provider was not initialized"))?
+            .ok_or_else(|| BackendFailure::internal("PP-OCR provider was not initialized"))?
             .warm_up(cancellation)?;
         self.load_translator_with_memory(target_language, memory)?;
         self.hy
@@ -253,7 +253,7 @@ impl BackendEngine {
         let ocr = self
             .ocr
             .as_mut()
-            .ok_or_else(|| BackendFailure::internal("PP-OCRv5 provider was not initialized"))?;
+            .ok_or_else(|| BackendFailure::internal("PP-OCR provider was not initialized"))?;
         let document = ocr.recognize(image, cancellation)?;
         cancellation.check()?;
         if document.regions.len() > crate::backend::input::MAX_REGIONS {
@@ -271,12 +271,12 @@ impl BackendEngine {
         mut report_progress: impl FnMut(u8, &'static str),
     ) -> Result<TranslationOutput, BackendFailure> {
         cancellation.check()?;
-        report_progress(20, "正在准备 PP-OCRv5");
+        report_progress(20, "正在准备 PP-OCR");
         self.load_ocr()?;
         let ocr = self
             .ocr
             .as_mut()
-            .ok_or_else(|| BackendFailure::internal("PP-OCRv5 provider was not initialized"))?;
+            .ok_or_else(|| BackendFailure::internal("PP-OCR provider was not initialized"))?;
         let document = ocr.recognize(image, cancellation)?;
         cancellation.check()?;
         report_progress(55, "OCR 识别完成");
@@ -562,12 +562,12 @@ impl BackendEngine {
         mut report_progress: impl FnMut(u8, &'static str),
     ) -> Result<OcrOutput, BackendFailure> {
         cancellation.check()?;
-        report_progress(20, "正在准备 PP-OCRv5");
+        report_progress(20, "正在准备 PP-OCR");
         self.load_ocr()?;
         let ocr = self
             .ocr
             .as_mut()
-            .ok_or_else(|| BackendFailure::internal("PP-OCRv5 provider was not initialized"))?;
+            .ok_or_else(|| BackendFailure::internal("PP-OCR provider was not initialized"))?;
         let document = ocr.recognize(image, cancellation)?;
         cancellation.check()?;
         report_progress(75, "OCR 识别完成");
@@ -612,13 +612,13 @@ fn create_device(kind: DeviceKind) -> Result<CandleDevice, BackendFailure> {
     match kind {
         DeviceKind::Cpu => Ok(CandleDevice::Cpu),
         DeviceKind::Cuda => {
-            #[cfg(not(feature = "flash-attn"))]
+            #[cfg(not(feature = "cuda"))]
             {
                 return Err(BackendFailure::device(
-                    "CUDA 图片翻译需要编译 feature `cuda,flash-attn`",
+                    "CUDA 模式需要编译 feature `cuda`",
                 ));
             }
-            #[cfg(feature = "flash-attn")]
+            #[cfg(feature = "cuda")]
             {
                 CandleDevice::new_cuda(0).map_err(|error| {
                     BackendFailure::device(format!("初始化 CUDA 设备失败：{error:#}"))
@@ -678,6 +678,8 @@ mod tests {
             prompt: PromptConfig::default(),
             generation: GenerationConfig::default(),
             memory: MemoryConfig::default(),
+            model_root: PathBuf::from("models"),
+            catalog: Default::default(),
         }
     }
 
@@ -730,7 +732,7 @@ mod tests {
     }
     #[cfg(all(feature = "cuda", feature = "flash-attn"))]
     #[test]
-    #[ignore = "requires the staged PP-OCRv5/Hy assets and a supported CUDA device"]
+    #[ignore = "requires the staged PP-OCR/Hy assets and a supported CUDA device"]
     fn cuda_native_fixture_smoke() {
         assert_eq!(
             env::var("SMODELTRANS_RUN_CUDA_E2E").as_deref(),
@@ -742,8 +744,8 @@ mod tests {
         let fixture = manifest_root.join("tests/fixtures/ppocrv5/contract-game-ui.png");
         let encoded = BASE64.encode(fs::read(fixture).expect("fixture"));
         let settings = BackendSettings {
-            detector_model_dir: model_root.join("ppocrv5/detector"),
-            recognizer_model_dir: model_root.join("ppocrv5/recognizer"),
+            detector_model_dir: model_root.join("ppocrv5/server_det"),
+            recognizer_model_dir: model_root.join("ppocrv5/server_rec"),
             hy_model: model_root.join("hy/Hy-MT2-1.8B-Q4_K_M.gguf"),
             font_path: None,
             target_language: "English".to_owned(),
@@ -754,6 +756,8 @@ mod tests {
             prompt: PromptConfig::default(),
             generation: GenerationConfig::default(),
             memory: MemoryConfig::default(),
+            model_root: model_root.clone(),
+            catalog: Default::default(),
         };
         let mut engine = BackendEngine::new(settings).expect("CUDA engine");
         let image = decode_image(

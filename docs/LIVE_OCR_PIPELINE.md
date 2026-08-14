@@ -1,8 +1,8 @@
 # 实时翻译 OCR 完整处理流程
 
-> 本文是 `smodeltrans` 当前实现的开发文档，覆盖 Windows 实时翻译从窗口采集、ROI 映射、帧调度、PP-OCRv5 检测与识别、实时文本重组，到 Hy-MT2 翻译和前端覆盖层发布的完整链路。
+> 本文是 `smodeltrans` 当前实现的开发文档，覆盖 Windows 实时翻译从窗口采集、ROI 映射、帧调度、PP-OCR 检测与识别、实时文本重组，到 Hy-MT2 翻译和前端覆盖层发布的完整链路。
 >
-> 文档以当前源码为准；修改实现时必须同步检查本文中的参数和流程。主要入口：`src-tauri/src/backend/live/mod.rs`、`src-tauri/src/backend/live/platform_windows.rs`、`src-tauri/src/backend/live/scheduler.rs`、`src-tauri/src/models/ppocrv5/adapter.rs`、`src-tauri/src/models/ppocrv5/geometry.rs`。
+> 文档以当前源码为准；修改实现时必须同步检查本文中的参数和流程。主要入口：`src-tauri/src/backend/live/mod.rs`、`src-tauri/src/backend/live/platform_windows.rs`、`src-tauri/src/backend/live/scheduler.rs`、`src-tauri/src/models/ppocr/adapter.rs`、`src-tauri/src/models/ppocr/geometry.rs`。
 
 ## 1. 端到端概览
 
@@ -18,10 +18,10 @@ flowchart LR
     F --> G[去标题栏/ROI 裁剪/BGRA→RGB]
     G --> H[LatestFrameSlot 最新帧槽]
     H --> I[自动稳定检测或按键触发]
-    I --> J[PP-OCRv5 detector]
+    I --> J[PP-OCR detector]
     J --> K[文本四边形]
     K --> L[透视裁剪/旋转/识别批处理]
-    L --> M[PP-OCRv5 recognizer + CTC 解码]
+    L --> M[PP-OCR recognizer + CTC 解码]
     M --> N[有界质量复核与字符坐标]
     N --> O[实时区域去重/分行/碎片合并]
     O --> P[Hy-MT2 逐区域流式翻译]
@@ -48,8 +48,8 @@ flowchart LR
 | ROI 与设置契约 | `src-tauri/src/backend/live/contracts.rs` | `LiveRoi`、`NormalizedRoi`、`LiveConfig` |
 | 稳定调度与文本重组 | `src-tauri/src/backend/live/scheduler.rs` | `StabilityScheduler`、`plan_live_ocr_groups`、`finalize_live_regions` |
 | 模型调度 | `src-tauri/src/backend/engine.rs` | `BackendEngine`、`GpuExecutionPolicy` |
-| OCR 模型适配 | `src-tauri/src/models/ppocrv5/adapter.rs` | `PpOcrV5Provider`、`detector_tensor`、`recognize_regions` |
-| OCR 几何 | `src-tauri/src/models/ppocrv5/geometry.rs` | `DetectorProfile`、`crop_region`、`map_detector_quad` |
+| OCR 模型适配 | `src-tauri/src/models/ppocr/adapter.rs` | `PpOcrProvider`、`detector_tensor`、`recognize_regions` |
+| OCR 几何 | `src-tauri/src/models/ppocr/geometry.rs` | `DetectorProfile`、`crop_region`、`map_detector_quad` |
 | 翻译模型 | `src-tauri/src/models/hy/translation.rs`、`session.rs` | `HyTranslator`、`translate_text`、`HySessionDriver` |
 | 前端结果显示 | `src/components/LiveTranslationPage.vue`、`src/services/live-translation-provider.ts` | `live-subtitle`、`live-debug-record` |
 
@@ -65,10 +65,9 @@ flowchart LR
 
 ### 2.2 关键运行时结构
 
-```text
 OwnedFrame
   width / height       ROI 局部物理尺寸
-  rgb                  [R,G,B, R,G,B, ...] 连续字节
+  image                `Arc<RgbImage>`，RGB 字节按 `[R,G,B, ...]` 排列
   roi                  ROI 在目标客户区中的物理位置
   roi_version          当前 ROI/窗口尺寸版本
   observed_at_epoch_ms 捕获时间
@@ -112,10 +111,10 @@ RegionRecord
 
 旧版前端持久化配置缺少新字段时，前端和 Rust serde 会补默认值。会话运行中配置编辑受到限制，修改后应重新启动或重新选择会话。
 
-### 3.3 目标窗口与 ROI 版本
+### 3.3 目标窗口、最小化状态与 ROI 版本
 
-1. 前端调用 `list_capture_windows` 获取可捕获窗口。
-2. `begin_live_selection` 校验目标语言、覆盖层、识别和翻译设置，并激活目标窗口。
+1. 前端调用 `list_capture_windows` 获取可捕获的顶级窗口。已最小化但仍存活的窗口也会列出；此时后端返回 `isMinimized=true` 且尺寸为 `0×0`，前端标注“已最小化，可直接恢复”。
+2. `begin_live_selection` 校验目标语言、覆盖层、识别和翻译设置，先调用 `activate_target_window` 恢复并激活目标窗口，再读取客户区几何。
 3. 用户在选择器窗口中框选 CSS 区域；前端根据设备像素比换算为物理像素，并保证最小 ROI 尺寸。
 4. `confirm_live_selection` 再次校验 ROI，转换为 `NormalizedRoi`：
    - `left = x / client_width`
@@ -123,9 +122,10 @@ RegionRecord
    - `right = (x + width) / client_width`
    - `bottom = (y + height) / client_height`
 5. 捕获线程根据每一帧的实际客户区尺寸将归一化 ROI 四舍五入回物理像素。
-6. 目标窗口尺寸每约 500 ms 同步一次。尺寸改变时 `roi_version` 自增、清空最新帧并重置稳定检测；任何旧版本 OCR/翻译结果都会被丢弃。
+6. 运行中每约 `250 ms` 检查目标是否最小化；每约 `500 ms` 同步客户区几何。窗口尺寸改变时 `roi_version` 自增、清空最新帧并重置稳定检测；任何旧版本 OCR/翻译结果都会被丢弃。
+7. 目标运行中被最小化时，会话自动进入暂停状态、清空待处理帧并隐藏覆盖层。窗口恢复后重新定位覆盖层并自动继续；若此前是手动暂停，则只恢复几何和覆盖层，不解除手动暂停。手动点击“继续”时目标仍最小化会返回错误。
 
-归一化 ROI 的意义是窗口缩放时保留相对位置；它不是对图像做缩放或压缩。
+归一化 ROI 的意义是窗口缩放时保留相对位置；它不是对图像做缩放或压缩。Windows Graphics Capture 对最小化窗口通常不能提供可用画面，因此这里采用暂停/恢复，而不是声称可以在最小化状态下持续 OCR。
 
 ## 4. Windows 图像获取
 
@@ -179,9 +179,9 @@ for each BGRA pixel:
 - dirty-region 判断；
 - ROI 行偏移计算；
 - BGRA→RGB 逐像素复制；
-- `OwnedFrame` 的字节分配。
+- 直接构造 `RgbImage`，并通过 `Arc` 交给 `OwnedFrame` 和 `DecodedImage` 共享。
 
-会话线程在 OCR 入口使用 `RgbImage::from_raw(frame.width, frame.height, frame.rgb.clone())`，因此当前实现还会为模型输入复制一次 RGB 缓冲区。该复制不是压缩，但属于可观测的 CPU/内存成本。
+OCR 入口只克隆 `Arc`，不再复制整张 ROI 的 RGB 字节。该优化不改变任何像素、模型输入尺寸、归一化、阈值或解码结果；仍然没有图像压缩。捕获回调仍需为每个写入槽位的有效帧分配并填充 RGB 图像，因为捕获线程和会话线程可能并发持有不同帧。
 
 ## 5. OCR 调度：什么时候启动一次识别
 
@@ -248,13 +248,13 @@ changed_ratio > 0.02
 5. 强制超时不会制造空帧；没有捕获到帧时仍不会启动 OCR。
 
 因此按键超时是“避免永远等不到稳定画面”的兜底，不是图像压缩或识别质量参数。
+### 5.4 暂停、最小化、窗口变化和取消
 
-### 5.4 暂停、窗口变化和取消
-
-- 暂停时会话线程不消费模型工作，停止后续 OCR/翻译调度。
+- 手动暂停时会话线程不消费模型工作，停止后续 OCR/翻译调度；手动恢复前会拒绝仍处于最小化状态的目标窗口。
+- 目标窗口最小化时，运行线程自动暂停、清空 latest slot 并隐藏覆盖层；恢复后自动重新定位覆盖层并恢复运行。自动暂停不会覆盖手动暂停意图。
 - 窗口尺寸或 ROI 变化会清空 latest slot、重置稳定状态并增加 ROI 版本。
-- OCR 和翻译前后都检查 `CancellationToken`。
 - 会话停止、目标窗口关闭、配置锁/捕获错误都会结束捕获并关闭选择器和覆盖层。
+- OCR 和翻译前后都检查 `CancellationToken`。
 
 ## 6. 模型加载、GPU 策略与预热
 
@@ -269,7 +269,7 @@ changed_ratio > 0.02
 
 实时启动的 `prepare_live_pipeline` 顺序：
 
-1. 加载 PP-OCRv5 detector 和 recognizer 图。
+1. 加载 PP-OCR detector 和 recognizer 图。
 2. CUDA 下用 `320×96` 黑色画面运行一次整图 OCR，并用完整四边形运行一次区域识别，预热 CUDA kernel。
 3. 按实时记忆配置加载 Hy-MT2。
 4. 运行 Hy warm-up（单 token）。
@@ -278,9 +278,9 @@ changed_ratio > 0.02
 
 非 resident 策略在加载一个模型时可能卸载另一个模型，以控制显存峰值；因此显存不足时 OCR 和翻译之间的模型切换会增加延迟，但不会改变 OCR 输入像素。
 
-## 7. PP-OCRv5：整张 ROI 的检测阶段
+## 7. PP-OCR：整张 ROI 的检测阶段
 
-OCR 入口是 `PpOcrV5Provider::recognize`。它先对整张 ROI 建立 detector profile，再依次执行 detector 输入、模型前向和四边形后处理。
+OCR 入口是 `PpOcrProvider::recognize`。它先对整张 ROI 建立 detector profile，再依次执行 detector 输入、模型前向和四边形后处理。
 
 ### 7.1 Detector 输入尺寸
 
@@ -343,7 +343,7 @@ R: (R/255 - 0.406) / 0.225
 
 四边形 canonicalization 很关键。后续透视裁剪假设点序是 `[左上, 右上, 右下, 左下]` 的屏幕顺时针顺序；顺序错误会让整行文字旋转、翻转或被送入错误方向的 recognizer。
 
-## 8. PP-OCRv5：区域裁剪和 recognizer
+## 8. PP-OCR：区域裁剪和 recognizer
 
 ### 8.1 最小面积矩形和透视 warp
 
@@ -435,7 +435,7 @@ CTC 解码只做 blank/重复折叠，不使用语言模型纠错。因此 `I'll
 
 ## 10. 实时 OCR 后处理：区域去重、分行和碎片合并
 
-PP-OCRv5 detector 可能把一行英文拆成多个相邻区域，也可能产生重复框。实时模式在 `SessionLoop::refine_live_regions` 中进行一次确定性的区域整理；它不重新调用 recognizer。
+PP-OCR detector 可能把一行英文拆成多个相邻区域，也可能产生重复框。实时模式在 `SessionLoop::refine_live_regions` 中进行一次确定性的区域整理；它不重新调用 recognizer。启用文本分组时才执行这些整理，关闭后保留 detector 返回的区域。
 
 ### 10.1 初始清洗
 
@@ -492,8 +492,6 @@ PP-OCRv5 detector 可能把一行英文拆成多个相邻区域，也可能产�
 4. 清空旧的 `translated_text`。
 5. 按字符 order 排列字符并重新编号。
 6. 随后由调用方生成用于翻译的 `normalized_live_region_text`，区域之间用换行分隔。
-
-这一步只整理区域和文本，不会把 `I'll` 之类的字符从 `Hll` 自动改回 `I'll`；字符级纠错必须发生在 recognizer 输入、模型或明确的后处理规则中。
 
 ## 11. 翻译阶段：Hy-MT2
 
@@ -599,12 +597,13 @@ Hy 会话的记忆由 `HyConversationMemory` 管理：
 对于约 `900×600` 的 ROI，当前延迟主要由下列因素组成：
 
 1. 捕获线程 CPU 复制 ROI 和 BGRA→RGB。
-2. 会话线程复制 RGB buffer 构造 `RgbImage`。
-3. detector stride 对齐 resize 和 detector 前向。
-4. detector 候选数量、每个候选的最小面积矩形和 CPU cubic 透视 warp。
-5. 有界质量复核触发时增加的一次 recognizer 推理。
-6. recognizer argmax token 复制回 CPU、CTC 解码和字符坐标逆变换。
-7. Hy-MT2 GPU 生成、记忆 replay 和流式事件发布。
+2. detector stride 对齐 resize 和 detector 前向。
+3. detector 候选数量、每个候选的最小面积矩形和 CPU cubic 透视 warp。
+4. 有界质量复核触发时增加的一次 recognizer 推理。
+5. recognizer argmax token 复制回 CPU、CTC 解码和字符坐标逆变换。
+6. Hy-MT2 GPU 生成、记忆 replay 和流式事件发布。
+
+会话线程与 OCR 适配器共享同一个 `Arc<RgbImage>`，不会在 OCR 入口复制整张 ROI。对 `900×600` RGB ROI，这会固定省去一次约 `1.54 MiB` 的内存复制和一次同等大小的临时分配；模型看到的字节完全相同。该收益属于 CPU/内存带宽优化，不代表 detector 或 recognizer 推理耗时按相同比例下降。
 
 可用 `LiveMetrics` 区分：
 
@@ -674,4 +673,4 @@ Hy 会话的记忆由 `HyConversationMemory` 管理：
 - 实时区域去重、分行、相邻碎片合并和最终编号；
 - Hy prompt 结构化、补充提示、记忆相似度去重和预算行为。
 
-带真实 PP-OCRv5 资产的 CUDA fixture 测试位于 `src-tauri/src/models/ppocrv5/adapter.rs` 测试模块，默认 `#[ignore]`，需要支持 CUDA 的设备和环境变量 `SMODELTRANS_RUN_CUDA_E2E=1`。涉及 OCR 识别质量或性能的改动不能只依赖纯函数测试；应同时验证真实 fixture 的最终 source text、区域数量和耗时。
+带真实 PP-OCR 资产的 CUDA fixture 测试位于 `src-tauri/src/models/ppocr/adapter.rs` 测试模块，默认 `#[ignore]`，需要支持 CUDA 的设备和环境变量 `SMODELTRANS_RUN_CUDA_E2E=1`。涉及 OCR 识别质量或性能的改动不能只依赖纯函数测试；应同时验证真实 fixture 的最终 source text、区域数量和耗时。

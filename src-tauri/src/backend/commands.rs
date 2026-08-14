@@ -6,7 +6,10 @@ use super::{
         DecodedImage, decode_image, decode_ocr_image, validate_target_language, validate_text,
     },
     runtime::{RuntimeMetrics, RuntimeMetricsSnapshot},
-    settings::{BackendSettings, BackendSettingsUpdate, BackendStatus},
+    settings::{
+        BackendSettings, BackendSettingsUpdate, BackendStatus, ModelCatalogOptions,
+        ModelCatalogUpdate,
+    },
 };
 
 use crate::model_support::{RunId, RunRegistry, lock_with_cancellation};
@@ -221,7 +224,7 @@ impl ModelTarget {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Ocr => "PP-OCRv5",
+            Self::Ocr => "PP-OCR",
             Self::Translator => "Hy-MT2",
         }
     }
@@ -465,6 +468,41 @@ pub(crate) fn update_backend_settings(
     state.record_control("重置模型运行时", Duration::ZERO, true, "模型设置已更新");
     state.touch_activity();
     Ok(updated.status(false))
+}
+
+#[tauri::command]
+pub(crate) fn list_model_catalog(
+    state: State<'_, BackendState>,
+) -> Result<ModelCatalogOptions, BackendError> {
+    let settings = state
+        .settings
+        .lock()
+        .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
+        .clone()
+        .map_err(BackendFailure::arguments)?;
+    Ok(settings.catalog_options())
+}
+
+#[tauri::command]
+pub(crate) fn save_model_catalog(
+    request: ModelCatalogUpdate,
+    state: State<'_, BackendState>,
+) -> Result<BackendStatus, BackendError> {
+    let mut settings = state
+        .settings
+        .lock()
+        .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?;
+    let mut current = settings.clone().map_err(BackendFailure::arguments)?;
+    current
+        .save_catalog(request)
+        .map_err(BackendFailure::arguments)?;
+    if let Some(config_path) = state.config_path.as_deref() {
+        persist_backend_settings(config_path, &current)?;
+    }
+    *settings = Ok(current);
+    drop(settings);
+    state.touch_activity();
+    current_backend_status(state.inner())
 }
 
 fn persist_backend_settings(

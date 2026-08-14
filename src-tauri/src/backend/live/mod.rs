@@ -24,7 +24,6 @@ use super::{
     input::{DecodedImage, validate_target_language},
 };
 use crate::{model_config::MemoryConfig, model_support::CancellationToken};
-use image::RgbImage;
 use std::{
     sync::{
         Arc, Mutex,
@@ -408,7 +407,7 @@ impl LiveSessionManager {
             status.target = Some(target);
             status.roi = Some(display_roi);
             status.message =
-                "正在连接 Windows Graphics Capture，并预热 PP-OCRv5 与 Hy-MT2 模型。".to_owned();
+                "正在连接 Windows Graphics Capture，并预热 PP-OCR 与 Hy-MT2 模型。".to_owned();
         })
     }
 
@@ -995,7 +994,7 @@ impl SessionLoop {
                     status.metrics = self.metrics_snapshot();
                 });
             }
-            let Some(frame) = last_frame.as_ref() else {
+            let Some(frame) = last_frame.as_mut() else {
                 continue;
             };
             let frame_version = frame.roi_version;
@@ -1489,10 +1488,8 @@ impl SessionLoop {
         frame: &OwnedFrame,
         target_language: &str,
     ) -> Result<RecognizedFrame, BackendFailure> {
-        self.cancellation.check()?;
-        let image = RgbImage::from_raw(frame.width, frame.height, frame.rgb.clone())
-            .ok_or_else(|| BackendFailure::internal("实时捕获帧缓冲区无效"))?;
-        let decoded = DecodedImage::from_rgb_image(image, "live-frame", target_language);
+        let image = Arc::clone(&frame.image);
+        let decoded = DecodedImage::from_shared_rgb_image(image, "live-frame", target_language);
         let settings = self
             .backend
             .settings

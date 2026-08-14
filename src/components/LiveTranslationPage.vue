@@ -643,7 +643,7 @@ onBeforeUnmount(cleanupPage);
         <n-alert type="warning" title="捕获模式" :show-icon="true">
           请将游戏或应用切换为<strong>无边框全屏</strong>或<strong>窗口模式</strong>。独占全屏与受保护内容可能无法提供画面。
         </n-alert>
-        <n-alert type="info" title="PP-OCRv5 识别边界" :show-icon="true">
+        <n-alert type="info" title="PP-OCR 识别边界" :show-icon="true">
           当前 server recognizer 不覆盖韩文；P1 建议用于中文、英文、日文与常见拉丁字符字幕。目标语言只控制 Hy-MT2 的翻译输出。
         </n-alert>
 
@@ -1080,7 +1080,7 @@ onBeforeUnmount(cleanupPage);
     <footer class="live-footer">
       <span>单窗口 · 单 ROI</span>
       <span aria-hidden="true">·</span>
-      <span>PP-OCRv5 + Hy-MT2</span>
+      <span>PP-OCR + Hy-MT2</span>
       <span class="footer-spacer"></span>
       <span>Windows 桌面端</span>
     </footer>

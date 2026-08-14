@@ -40,6 +40,19 @@ impl DecodedImage {
         &self.target_language
     }
 
+    pub(crate) fn from_shared_rgb_image(
+        canvas: Arc<RgbImage>,
+        file_name: impl Into<String>,
+        target_language: impl Into<String>,
+    ) -> Self {
+        Self {
+            canvas,
+            encoded_bytes: Arc::from([]),
+            file_name: file_name.into(),
+            target_language: target_language.into(),
+        }
+    }
+
     pub(crate) fn from_rgb_image(
         canvas: RgbImage,
         file_name: impl Into<String>,
@@ -182,7 +195,11 @@ fn validate_file_name(file_name: &str) -> Result<(), BackendFailure> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_TEXT_BYTES, decode_ocr_image, validate_target_language, validate_text};
+    use super::{
+        DecodedImage, MAX_TEXT_BYTES, decode_ocr_image, validate_target_language, validate_text,
+    };
+    use image::RgbImage;
+    use std::sync::Arc;
 
     #[test]
     fn target_language_validation_trims_and_bounds_unicode_scalars() {
@@ -192,6 +209,16 @@ mod tests {
         );
         assert!(validate_target_language("   ").is_err());
         assert!(validate_target_language(&"中".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn shared_rgb_constructor_preserves_canvas_allocation() {
+        let canvas = Arc::new(RgbImage::from_raw(2, 1, vec![1, 2, 3, 4, 5, 6]).unwrap());
+        let identity = Arc::as_ptr(&canvas) as usize;
+        let decoded = DecodedImage::from_shared_rgb_image(canvas, "live-frame", "English");
+
+        assert_eq!(decoded.canvas_identity(), identity);
+        assert_eq!(decoded.canvas().as_raw(), &[1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

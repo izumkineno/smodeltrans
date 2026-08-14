@@ -132,7 +132,7 @@ async function runModelControl(model: ModelTarget, action: ModelAction): Promise
     clockNowMs.value = observedAt;
     applySharedModelRuntimeStatus(status);
     errorMessage.value = "";
-    const modelLabel = model === "ocr" ? "PP-OCRv5" : "Hy-MT2";
+    const modelLabel = model === "ocr" ? "PP-OCR" : "Hy-MT2";
     showWorkspaceToast(toast, "success", `${modelLabel} 已${action === "load" ? "加载" : "卸载"}。`);
   } catch (error) {
     const message = errorText(error);
@@ -247,7 +247,7 @@ onBeforeUnmount(stopPolling);
               <div class="model-identity">
                 <span class="model-kind">OCR</span>
                 <div>
-                  <h4>PP-OCRv5</h4>
+                  <h4>PP-OCR</h4>
                   <p>文字检测与识别</p>
                 </div>
               </div>

@@ -2,7 +2,7 @@ use super::contracts::DEFAULT_STABILITY_WAIT_MS;
 use crate::backend::contracts::RegionRecord;
 
 use std::{
-    sync::{Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
 
@@ -16,7 +16,7 @@ const CHANGED_CELL_RATIO: f32 = 0.02;
 pub(super) struct OwnedFrame {
     pub(super) width: u32,
     pub(super) height: u32,
-    pub(super) rgb: Vec<u8>,
+    pub(super) image: Arc<image::RgbImage>,
     pub(super) observed_at_epoch_ms: u64,
     pub(super) roi: crate::backend::live::contracts::LiveRoi,
     pub(super) roi_version: u64,
@@ -144,18 +144,19 @@ fn luminance_signature(frame: &OwnedFrame) -> Option<[u8; SIGNATURE_SIZE]> {
     let width = usize::try_from(frame.width).ok()?;
     let height = usize::try_from(frame.height).ok()?;
     let expected_len = width.checked_mul(height)?.checked_mul(3)?;
-    if width == 0 || height == 0 || frame.rgb.len() < expected_len {
+    if width == 0 || height == 0 || frame.image.as_raw().len() < expected_len {
         return None;
     }
+    let pixels = frame.image.as_raw();
     let mut signature = [0_u8; SIGNATURE_SIZE];
     for row in 0..SIGNATURE_ROWS {
         let y = ((row * height) / SIGNATURE_ROWS).min(height - 1);
         for column in 0..SIGNATURE_COLUMNS {
             let x = ((column * width) / SIGNATURE_COLUMNS).min(width - 1);
             let offset = (y * width + x) * 3;
-            let red = u32::from(frame.rgb[offset]);
-            let green = u32::from(frame.rgb[offset + 1]);
-            let blue = u32::from(frame.rgb[offset + 2]);
+            let red = u32::from(pixels[offset]);
+            let green = u32::from(pixels[offset + 1]);
+            let blue = u32::from(pixels[offset + 2]);
             signature[row * SIGNATURE_COLUMNS + column] =
                 ((red * 77 + green * 150 + blue * 29) >> 8) as u8;
         }
@@ -689,7 +690,9 @@ mod tests {
         OwnedFrame {
             width: 24,
             height: 14,
-            rgb: vec![value; 24 * 14 * 3],
+            image: std::sync::Arc::new(
+                image::RgbImage::from_raw(24, 14, vec![value; 24 * 14 * 3]).unwrap(),
+            ),
             observed_at_epoch_ms: 1,
             roi: LiveRoi {
                 x: 0,
@@ -709,7 +712,7 @@ mod tests {
         assert!(!slot.replace(frame(1, 1)));
         assert!(slot.replace(frame(2, 2)));
         let latest = slot.wait_take(Duration::ZERO).expect("latest frame");
-        assert_eq!(latest.rgb[0], 2);
+        assert_eq!(latest.image.as_raw()[0], 2);
         assert_eq!(latest.roi_version, 2);
         assert!(slot.wait_take(Duration::ZERO).is_none());
     }
@@ -765,7 +768,10 @@ mod tests {
         for y in 4..10 {
             for x in 8..16 {
                 let offset = (y * changed.width as usize + x) * 3;
-                changed.rgb[offset..offset + 3].fill(240);
+                std::sync::Arc::get_mut(&mut changed.image)
+                    .unwrap()
+                    .as_mut()[offset..offset + 3]
+                    .fill(240);
             }
         }
         assert!(!scheduler.observe(&changed, 400));

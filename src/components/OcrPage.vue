@@ -645,7 +645,7 @@ onBeforeUnmount(() => {
               variant="result"
               :src="annotatedResultUrl"
               :preview-src="annotatedResultUrl"
-              alt="可在放大预览中选择文字的 PP-OCRv5 标注识别图片"
+              alt="可在放大预览中选择文字的 PP-OCR 标注识别图片"
               :render-toolbar="renderImageToolbar"
               :image-width="resultImageWidth"
               :image-height="resultImageHeight"
@@ -661,7 +661,7 @@ onBeforeUnmount(() => {
           <div class="ocr-result-toolbar">
             <span>识别输出</span>
             <div class="ocr-result-toolbar-meta">
-              <span>{{ providerLabel || 'PP-OCRv5' }}</span>
+              <span>{{ providerLabel || 'PP-OCR' }}</span>
               <span v-if="durationLabel">处理用时 {{ durationLabel }}</span>
             </div>
           </div>
@@ -717,7 +717,7 @@ onBeforeUnmount(() => {
     </div>
 
     <footer class="ocr-page-footer">
-      <span>PP-OCRv5 本地识别</span>
+      <span>PP-OCR 本地识别</span>
       <span class="ocr-footer-separator" aria-hidden="true"></span>
       <span>Candle · Tauri</span>
       <span class="ocr-footer-spacer"></span>

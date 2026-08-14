@@ -1,10 +1,13 @@
-//! PP-OCRv5 provider adapter and native detector/recognizer pipeline.
+//! PP-OCR provider adapter and native detector/recognizer pipeline.
 
 use super::{
-    assets::{GraphRole, PpOcrV5Assets},
+    assets::{DetectorPostProcess, GraphRole, PpOcrAssets, PpOcrVariant},
+    common::{DetectorOutput, RecognizerOutput},
     geometry::{self, DetectorProfile, QuadI, RegionCrop},
-    model::{self, PpOcrV5Detector, PpOcrV5Recognizer, RecognizerOutput},
     records::{PpOcrCharacterRecord, PpOcrRegionRecord},
+    v5::mobile::{PpOcrMobileDetector, PpOcrMobileRecognizer},
+    v5::server::{PpOcrServerDetector, PpOcrServerRecognizer},
+    v6::{PpOcrV6Detector, PpOcrV6Recognizer},
 };
 use crate::{
     backend::{
@@ -19,23 +22,54 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::ops;
 use image::{GrayImage, Luma, Rgb, RgbImage, imageops};
 use imageproc::contours::find_contours;
-use std::path::Path;
+use rayon::prelude::*;
+use std::{path::Path, sync::LazyLock, time::Instant};
 
-const DETECTOR_THRESHOLD: f32 = 0.30;
-const MAX_DETECTOR_CANDIDATES: usize = 1000;
-const DETECTOR_BOX_THRESHOLD: f32 = 0.60;
-const UNCLIP_RATIO: f32 = 1.50;
 const MIN_BOX_SIDE: f32 = 3.0;
 const MAX_TOTAL_CROP_PIXELS: u64 = 64 * 1024 * 1024;
 const MIN_RECOGNIZER_WIDTH: usize = 320;
-#[cfg(test)]
-const DEFAULT_MAX_RECOGNIZER_BATCH_PIXELS: usize = 48 * 3200 * 4;
+const PARALLEL_CROP_MIN_QUADS: usize = 4;
 const MAX_BATCH_WIDTH_RATIO_NUMERATOR: usize = 3;
 const MAX_BATCH_WIDTH_RATIO_DENOMINATOR: usize = 2;
 const RECOGNIZER_IMAGE_MEAN: [f32; 3] = [0.5, 0.5, 0.5];
 const RECOGNIZER_IMAGE_STD: [f32; 3] = [0.5, 0.5, 0.5];
 const MAX_RECOGNITION_RESCUE_CANDIDATES: usize = 24;
 const RECOGNITION_RESCUE_MAX_SPAN: usize = 3;
+
+fn trace_ocr(message: std::fmt::Arguments<'_>) {
+    if std::env::var_os("SMODELTRANS_TRACE_OCR").is_some() {
+        eprintln!("[ocr] {message}");
+    }
+}
+
+static OCR_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(
+            std::thread::available_parallelism()
+                .map(|count| count.get().min(8))
+                .unwrap_or(4),
+        )
+        .thread_name(|index| format!("ocr-{index}"))
+        .build()
+        .expect("build OCR thread pool")
+});
+
+fn ocr_pool() -> &'static rayon::ThreadPool {
+    &OCR_POOL
+}
+/// Batching strategy for a recognizer region pass.
+///
+/// `Ratio` keeps the width-similarity batching used by the main pass; padding a
+/// batch to its widest member does not change CTC decoding.  `ExactWidth`
+/// groups only regions whose resized width is identical, so every member's
+/// `batch_width` matches what a single-region forward would have used — this
+/// keeps character geometry bit-identical for rescue candidates while still
+/// collapsing same-width candidates into shared forwards.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecognitionBatchMode {
+    Ratio,
+    ExactWidth,
+}
 
 #[derive(Debug)]
 struct ImageNormalizer {
@@ -61,14 +95,100 @@ impl ImageNormalizer {
     }
 }
 
-/// A loaded PP-OCRv5 detector and recognizer pair.
+/// A loaded PP-OCR detector graph from any supported family or tier.
+enum DetectorKind {
+    V5Server(PpOcrServerDetector),
+    V5Mobile(PpOcrMobileDetector),
+    V6(PpOcrV6Detector),
+}
+
+impl DetectorKind {
+    fn load(assets: &PpOcrAssets, device: &Device) -> std::result::Result<Self, BackendFailure> {
+        match assets.variant {
+            PpOcrVariant::V5Server => PpOcrServerDetector::load(assets, device)
+                .map(Self::V5Server)
+                .map_err(|error| {
+                    BackendFailure::ocr(format!("load PP-OCR detector graph: {error:#}"))
+                }),
+            PpOcrVariant::V5Mobile => PpOcrMobileDetector::load(assets, device)
+                .map(Self::V5Mobile)
+                .map_err(|error| {
+                    BackendFailure::ocr(format!("load PP-OCR mobile detector graph: {error:#}"))
+                }),
+            PpOcrVariant::V6Tiny | PpOcrVariant::V6Small | PpOcrVariant::V6Medium => {
+                PpOcrV6Detector::load(assets, device)
+                    .map(Self::V6)
+                    .map_err(|error| {
+                        BackendFailure::ocr(format!(
+                            "load PP-OCR {} detector graph: {error:#}",
+                            assets.variant.label()
+                        ))
+                    })
+            }
+        }
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<DetectorOutput> {
+        match self {
+            Self::V5Server(detector) => detector.forward(input),
+            Self::V5Mobile(detector) => detector.forward(input),
+            Self::V6(detector) => detector.forward(input),
+        }
+    }
+}
+
+/// A loaded PP-OCR recognizer graph from any supported family or tier.
+enum RecognizerKind {
+    V5Server(PpOcrServerRecognizer),
+    V5Mobile(PpOcrMobileRecognizer),
+    V6(PpOcrV6Recognizer),
+}
+
+impl RecognizerKind {
+    fn load(assets: &PpOcrAssets, device: &Device) -> std::result::Result<Self, BackendFailure> {
+        match assets.variant {
+            PpOcrVariant::V5Server => PpOcrServerRecognizer::load(assets, device)
+                .map(Self::V5Server)
+                .map_err(|error| {
+                    BackendFailure::ocr(format!("load PP-OCR recognizer graph: {error:#}"))
+                }),
+            PpOcrVariant::V5Mobile => PpOcrMobileRecognizer::load(assets, device)
+                .map(Self::V5Mobile)
+                .map_err(|error| {
+                    BackendFailure::ocr(format!("load PP-OCR mobile recognizer graph: {error:#}"))
+                }),
+            PpOcrVariant::V6Tiny | PpOcrVariant::V6Small | PpOcrVariant::V6Medium => {
+                PpOcrV6Recognizer::load(assets, device)
+                    .map(Self::V6)
+                    .map_err(|error| {
+                        BackendFailure::ocr(format!(
+                            "load PP-OCR {} recognizer graph: {error:#}",
+                            assets.variant.label()
+                        ))
+                    })
+            }
+        }
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<RecognizerOutput> {
+        match self {
+            Self::V5Server(recognizer) => recognizer.forward(input),
+            Self::V5Mobile(recognizer) => recognizer.forward(input),
+            Self::V6(recognizer) => recognizer.forward(input),
+        }
+    }
+}
+
+/// A loaded PP-OCR detector and recognizer pair.
 ///
 /// We load both graphs from the validated local safetensors assets before the
 /// provider is exposed to the backend.  Requests only perform preprocessing,
 /// native Candle inference, and deterministic postprocessing.
-pub(crate) struct PpOcrV5Provider {
-    detector: PpOcrV5Detector,
-    recognizer: PpOcrV5Recognizer,
+pub(crate) struct PpOcrProvider {
+    detector: DetectorKind,
+    recognizer: RecognizerKind,
+    variant: PpOcrVariant,
+    postprocess: DetectorPostProcess,
     characters: Vec<String>,
     device: Device,
     detector_normalizer: ImageNormalizer,
@@ -78,7 +198,7 @@ pub(crate) struct PpOcrV5Provider {
     warmed_up: bool,
 }
 
-impl PpOcrV5Provider {
+impl PpOcrProvider {
     pub(crate) fn load(
         detector_dir: &Path,
         recognizer_dir: &Path,
@@ -88,28 +208,35 @@ impl PpOcrV5Provider {
     ) -> std::result::Result<Self, BackendFailure> {
         if region_parallelism == 0 {
             return Err(BackendFailure::arguments(
-                "PP-OCRv5 region parallelism must be positive",
+                "PP-OCR region parallelism must be positive",
             ));
         }
         if max_recognizer_batch_pixels == 0 {
             return Err(BackendFailure::arguments(
-                "PP-OCRv5 recognizer batch pixel budget must be positive",
+                "PP-OCR recognizer batch pixel budget must be positive",
             ));
         }
-        let detector_assets = PpOcrV5Assets::preflight(GraphRole::Detector, detector_dir)?;
-        let recognizer_assets = PpOcrV5Assets::preflight(GraphRole::Recognizer, recognizer_dir)?;
+        let detector_assets = PpOcrAssets::preflight(GraphRole::Detector, detector_dir)?;
+        let recognizer_assets = PpOcrAssets::preflight(GraphRole::Recognizer, recognizer_dir)?;
+        if detector_assets.variant != recognizer_assets.variant {
+            return Err(BackendFailure::asset(format!(
+                "detector variant {} does not match recognizer variant {}",
+                detector_assets.variant.label(),
+                recognizer_assets.variant.label()
+            )));
+        }
+        let variant = detector_assets.variant;
+        let postprocess = detector_assets.postprocess.ok_or_else(|| {
+            BackendFailure::asset("detector assets carry no DBPostProcess parameters")
+        })?;
         let characters = recognizer_assets.character_list.clone();
-        let detector = PpOcrV5Detector::load(&detector_assets, device).map_err(|error| {
-            BackendFailure::ocr(format!("load PP-OCRv5 detector graph: {error:#}"))
-        })?;
-        let recognizer = PpOcrV5Recognizer::load(&recognizer_assets, device).map_err(|error| {
-            BackendFailure::ocr(format!("load PP-OCRv5 recognizer graph: {error:#}"))
-        })?;
+        let detector = DetectorKind::load(&detector_assets, device)?;
+        let recognizer = RecognizerKind::load(&recognizer_assets, device)?;
         let detector_normalizer =
             ImageNormalizer::new([0.485, 0.456, 0.406], [0.229, 0.224, 0.225], device).map_err(
                 |error| {
                     BackendFailure::ocr(format!(
-                        "prepare PP-OCRv5 detector normalization: {error:#}"
+                        "prepare PP-OCR detector normalization: {error:#}"
                     ))
                 },
             )?;
@@ -117,13 +244,15 @@ impl PpOcrV5Provider {
             ImageNormalizer::new(RECOGNIZER_IMAGE_MEAN, RECOGNIZER_IMAGE_STD, device).map_err(
                 |error| {
                     BackendFailure::ocr(format!(
-                        "prepare PP-OCRv5 recognizer normalization: {error:#}"
+                        "prepare PP-OCR recognizer normalization: {error:#}"
                     ))
                 },
             )?;
         Ok(Self {
             detector,
             recognizer,
+            variant,
+            postprocess,
             characters,
             device: device.clone(),
             detector_normalizer,
@@ -142,7 +271,7 @@ impl PpOcrV5Provider {
             return Ok(());
         }
         let canvas = RgbImage::from_pixel(320, 96, Rgb([0, 0, 0]));
-        let image = DecodedImage::from_rgb_image(canvas, "ppocrv5-warmup", "English");
+        let image = DecodedImage::from_rgb_image(canvas, "ppocr-warmup", "English");
         let _ = <Self as OcrPort>::recognize(self, &image, cancellation)?;
         let _ =
             self.recognize_quad(&image, [[0, 0], [319, 0], [319, 95], [0, 95]], cancellation)?;
@@ -177,34 +306,47 @@ impl PpOcrV5Provider {
     }
 }
 
-impl OcrPort for PpOcrV5Provider {
+impl OcrPort for PpOcrProvider {
     fn recognize(
         &mut self,
         image: &DecodedImage,
         cancellation: &CancellationToken,
     ) -> std::result::Result<OcrDocument, BackendFailure> {
         cancellation.check()?;
+        let started = Instant::now();
         let canvas = image.canvas();
         let profile = DetectorProfile::for_image(canvas.width(), canvas.height())
             .map_err(|error| BackendFailure::ocr(format!("build detector profile: {error:#}")))?;
+        let detector_input_started = Instant::now();
         let detector_input =
             detector_tensor(canvas, profile, &self.device, &self.detector_normalizer).map_err(
                 |error| BackendFailure::ocr(format!("prepare detector input: {error:#}")),
             )?;
+        let detector_input_ms = detector_input_started.elapsed().as_millis();
         cancellation.check()?;
+        let detector_forward_started = Instant::now();
         let detector_output = self
             .detector
             .forward(&detector_input)
             .map_err(|error| BackendFailure::ocr(format!("run detector graph: {error:#}")))?;
-        let quads = detector_quads(&detector_output, profile).map_err(|error| {
-            BackendFailure::ocr(format!("postprocess detector output: {error:#}"))
-        })?;
+        let detector_forward_ms = detector_forward_started.elapsed().as_millis();
+        let detector_postprocess_started = Instant::now();
+        let quads = detector_quads(&detector_output, profile, self.postprocess).map_err(
+            |error| BackendFailure::ocr(format!("postprocess detector output: {error:#}")),
+        )?;
+        let detector_postprocess_ms = detector_postprocess_started.elapsed().as_millis();
         cancellation.check()?;
         if quads.is_empty() {
+            trace_ocr(format_args!(
+                "variant={} phase=main detector_input={detector_input_ms}ms detector_forward={detector_forward_ms}ms detector_postprocess={detector_postprocess_ms}ms recognize_total=0ms regions=0 total={}ms",
+                self.variant.label(),
+                started.elapsed().as_millis()
+            ));
             return Ok(OcrDocument {
                 regions: Vec::new(),
             });
         }
+        let recognize_started = Instant::now();
         let records = recognize_regions_with_retry(
             canvas,
             &quads,
@@ -217,13 +359,21 @@ impl OcrPort for PpOcrV5Provider {
             cancellation,
         )
         .map_err(|error| BackendFailure::ocr(format!("recognize OCR regions: {error:#}")))?;
+        let recognize_total_ms = recognize_started.elapsed().as_millis();
         cancellation.check()?;
-        Ok(OcrDocument {
+        let regions = records.len();
+        let document = OcrDocument {
             regions: records
                 .into_iter()
                 .map(PpOcrRegionRecord::into_contract)
                 .collect(),
-        })
+        };
+        trace_ocr(format_args!(
+            "variant={} phase=main detector_input={detector_input_ms}ms detector_forward={detector_forward_ms}ms detector_postprocess={detector_postprocess_ms}ms recognize_total={recognize_total_ms}ms regions={regions} total={}ms",
+            self.variant.label(),
+            started.elapsed().as_millis()
+        ));
+        Ok(document)
     }
 }
 
@@ -253,14 +403,17 @@ fn detector_tensor(
         profile.detector_height,
         imageops::FilterType::Triangle,
     );
-    let mut values = Vec::with_capacity((resized.width() * resized.height() * 3) as usize);
-    for channel in 0..3 {
-        for pixel in resized.pixels() {
-            // The processor normalizes RGB channels, then swaps to BGR CHW.
-            let source_channel = 2 - channel;
-            let value = pixel[source_channel];
-            let mean = [0.406_f32, 0.456, 0.485][source_channel];
-            let std = [0.225_f32, 0.224, 0.229][source_channel];
+    let pixel_count = resized.width() as usize * resized.height() as usize;
+    let pixels = resized.as_raw();
+    let mut values = Vec::with_capacity(pixel_count * 3);
+    let source_channels = [
+        (2_usize, 0.485_f32, 0.229_f32),
+        (1, 0.456, 0.224),
+        (0, 0.406, 0.225),
+    ];
+    for (source_channel, mean, std) in source_channels {
+        for index in 0..pixel_count {
+            let value = pixels[index * 3 + source_channel];
             values.push((f32::from(value) / 255.0 - mean) / std);
         }
     }
@@ -276,7 +429,6 @@ fn detector_tensor(
     )
     .context("construct detector input tensor")
 }
-
 fn resized_rgb_tensor(
     image: &RgbImage,
     output_height: usize,
@@ -305,6 +457,7 @@ fn detector_contours(
     probabilities: &[f32],
     width: usize,
     height: usize,
+    binary_thresh: f32,
 ) -> Result<Vec<Vec<(usize, usize)>>> {
     ensure!(
         width > 0 && height > 0,
@@ -321,7 +474,7 @@ fn detector_contours(
     let height_u32 = u32::try_from(height).context("detector height exceeds image limits")?;
     let bitmap = GrayImage::from_fn(width_u32, height_u32, |x, y| {
         let probability = probabilities[y as usize * width + x as usize];
-        if probability > DETECTOR_THRESHOLD {
+        if probability > binary_thresh {
             Luma([255_u8])
         } else {
             Luma([0_u8])
@@ -356,7 +509,6 @@ fn component_quad(component: &[(usize, usize)]) -> [[f32; 2]; 4] {
         let point = points.first().copied().unwrap_or([0.0, 0.0]);
         return [[point[0] as f32, point[1] as f32]; 4];
     }
-
     let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
         (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
     };
@@ -565,7 +717,11 @@ fn filled_quad_score(
     if count == 0 { 0.0 } else { sum / count as f32 }
 }
 
-fn detector_quads(output: &model::DetectorOutput, profile: DetectorProfile) -> Result<Vec<QuadI>> {
+fn detector_quads(
+    output: &DetectorOutput,
+    profile: DetectorProfile,
+    postprocess: DetectorPostProcess,
+) -> Result<Vec<QuadI>> {
     ensure!(
         output.shape.len() == 4
             && output.shape[0] == 1
@@ -586,29 +742,34 @@ fn detector_quads(output: &model::DetectorOutput, profile: DetectorProfile) -> R
     );
     let scale_x = profile.detector_width as f32 / width as f32;
     let scale_y = profile.detector_height as f32 / height as f32;
-    let mut quads = Vec::new();
-    for contour in detector_contours(&flat, width, height)?
+    let contours = detector_contours(&flat, width, height, postprocess.binary_thresh)?
         .into_iter()
-        .take(MAX_DETECTOR_CANDIDATES)
-    {
-        // DB's cv2.minAreaRect is applied to each contour before scoring.
-        let quad = component_quad(&contour);
-        if quad_short_side(quad) < MIN_BOX_SIDE {
-            continue;
-        }
-        let score = filled_quad_score(&flat, width, height, quad);
-        if !score.is_finite() || score < DETECTOR_BOX_THRESHOLD {
-            continue;
-        }
-        let unclipped = unclipped_quad(quad, UNCLIP_RATIO);
-        if quad_short_side(unclipped) < MIN_BOX_SIDE + 2.0 {
-            continue;
-        }
-        let clipped = clip_detector_quad(unclipped, profile);
-        let raw = clipped.map(|[x, y]| [x * scale_x, y * scale_y]);
-        quads.push(geometry::map_detector_quad(raw, profile)?);
-    }
-    Ok(quads)
+        .take(postprocess.max_candidates)
+        .collect::<Vec<_>>();
+    let processed = ocr_pool().install(|| {
+        contours
+            .par_iter()
+            .map(|contour| {
+                // DB's cv2.minAreaRect is applied to each contour before scoring.
+                let quad = component_quad(contour);
+                if quad_short_side(quad) < MIN_BOX_SIDE {
+                    return Ok(None);
+                }
+                let score = filled_quad_score(&flat, width, height, quad);
+                if !score.is_finite() || score < postprocess.box_thresh {
+                    return Ok(None);
+                }
+                let unclipped = unclipped_quad(quad, postprocess.unclip_ratio);
+                if quad_short_side(unclipped) < MIN_BOX_SIDE + 2.0 {
+                    return Ok(None);
+                }
+                let clipped = clip_detector_quad(unclipped, profile);
+                let raw = clipped.map(|[x, y]| [x * scale_x, y * scale_y]);
+                Ok(Some(geometry::map_detector_quad(raw, profile)?))
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    Ok(processed.into_iter().flatten().collect())
 }
 
 #[derive(Debug)]
@@ -704,15 +865,6 @@ fn fill_recognition_tensor(
     Ok(())
 }
 
-#[cfg(test)]
-fn recognition_tensor(crop: &RgbImage, device: &Device) -> Result<Tensor> {
-    let resized_width = recognizer_resize_width(crop.width(), crop.height())? as usize;
-    let tensor_width = resized_width.max(MIN_RECOGNIZER_WIDTH);
-    let mut values = vec![0.0_f32; 3usize * 48 * tensor_width];
-    fill_recognition_tensor(crop, resized_width, tensor_width, &mut values)?;
-    Tensor::from_vec(values, (1, 3, 48, tensor_width), device)
-        .context("construct recognizer input tensor")
-}
 
 fn recognition_batch_tensor(
     jobs: &[RecognitionJob],
@@ -785,18 +937,6 @@ fn decode_recognizer_token_ids(
     })
 }
 
-#[cfg(test)]
-fn decode_recognizer(output: &RecognizerOutput, characters: &[String]) -> Result<String> {
-    ensure!(
-        output.shape.len() == 3
-            && output.shape[0] == 1
-            && output.shape[1] > 0
-            && output.shape[2] > 0,
-        "recognizer output must be [1, T, V] with positive dimensions"
-    );
-    let mut decoded = decode_recognizer_batch_detailed(output, characters)?;
-    Ok(decoded.remove(0).text)
-}
 
 fn decode_recognizer_batch_detailed(
     output: &RecognizerOutput,
@@ -871,16 +1011,6 @@ fn decode_recognizer_batch_detailed(
     Ok(decoded)
 }
 
-#[cfg(test)]
-fn decode_recognizer_batch(
-    output: &RecognizerOutput,
-    characters: &[String],
-) -> Result<Vec<String>> {
-    Ok(decode_recognizer_batch_detailed(output, characters)?
-        .into_iter()
-        .map(|decoded| decoded.text)
-        .collect())
-}
 
 fn character_records(
     job: &RecognitionJob,
@@ -1029,56 +1159,47 @@ fn finalize_recognition_records(
 fn recognize_regions(
     image: &RgbImage,
     quads: &[QuadI],
-    recognizer: &PpOcrV5Recognizer,
+    recognizer: &RecognizerKind,
     characters: &[String],
     device: &Device,
     normalizer: &ImageNormalizer,
     region_parallelism: usize,
     max_batch_pixels: usize,
+    batch_mode: RecognitionBatchMode,
     cancellation: &CancellationToken,
 ) -> Result<Vec<PpOcrRegionRecord>> {
     ensure!(
         region_parallelism > 0,
         "region parallelism must be positive"
     );
-    let mut jobs = Vec::with_capacity(quads.len());
-    let mut total_crop_pixels = 0u64;
-    cancellation
-        .check()
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    for (index, &quad) in quads.iter().enumerate() {
-        let crop = geometry::crop_region(image, quad)
-            .with_context(|| format!("crop OCR region {}", index + 1))?;
-        let crop_pixels = u64::from(crop.image.width())
-            .checked_mul(u64::from(crop.image.height()))
-            .context("OCR crop pixel count overflowed")?;
-        total_crop_pixels = total_crop_pixels
-            .checked_add(crop_pixels)
-            .context("OCR crop pixel budget overflowed")?;
-        ensure!(
-            total_crop_pixels <= MAX_TOTAL_CROP_PIXELS,
-            "OCR crop pixel budget exceeded"
-        );
-        let resized_width =
-            recognizer_resize_width(crop.image.width(), crop.image.height())? as usize;
-        jobs.push(RecognitionJob {
-            index,
-            quad,
-            crop,
-            resized_width,
-        });
-    }
+    let phase = match batch_mode {
+        RecognitionBatchMode::Ratio => "main",
+        RecognitionBatchMode::ExactWidth => "rescue",
+    };
+    let jobs_started = Instant::now();
+    let mut jobs = build_recognition_jobs(image, quads, cancellation)?;
+    let crop_warp_ms = jobs_started.elapsed().as_millis();
     if jobs.is_empty() {
+        trace_ocr(format_args!(
+            "phase={phase} crop_warp={crop_warp_ms}ms forward=0ms regions=0"
+        ));
         return Ok(Vec::new());
     }
-    if region_parallelism > 1 {
-        jobs.sort_by(|left, right| {
-            right
-                .resized_width
-                .max(MIN_RECOGNIZER_WIDTH)
-                .cmp(&left.resized_width.max(MIN_RECOGNIZER_WIDTH))
-                .then_with(|| left.index.cmp(&right.index))
-        });
+    match batch_mode {
+        RecognitionBatchMode::Ratio => {
+            if region_parallelism > 1 {
+                jobs.sort_by(|left, right| {
+                    right
+                        .resized_width
+                        .max(MIN_RECOGNIZER_WIDTH)
+                        .cmp(&left.resized_width.max(MIN_RECOGNIZER_WIDTH))
+                        .then_with(|| left.index.cmp(&right.index))
+                });
+            }
+        }
+        RecognitionBatchMode::ExactWidth => {
+            jobs.sort_by_key(|job| (job.resized_width, job.index));
+        }
     }
 
     let mut records: Vec<Option<(QuadI, String, u16, Vec<PpOcrCharacterRecord>)>> =
@@ -1086,14 +1207,29 @@ fn recognize_regions(
     cancellation
         .check()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let forward_started = Instant::now();
     let mut batch_start = 0;
     while batch_start < jobs.len() {
-        let batch_len = recognition_batch_len(
-            jobs[batch_start..].iter().map(|job| job.resized_width),
-            region_parallelism,
-            max_batch_pixels,
-        );
-        let batch_end = batch_start + batch_len;
+        let batch_end = match batch_mode {
+            RecognitionBatchMode::Ratio => {
+                batch_start
+                    + recognition_batch_len(
+                        jobs[batch_start..].iter().map(|job| job.resized_width),
+                        region_parallelism,
+                        max_batch_pixels,
+                    )
+            }
+            RecognitionBatchMode::ExactWidth => {
+                let width = jobs[batch_start].resized_width;
+                let mut group_end = batch_start + 1;
+                while group_end < jobs.len() && jobs[group_end].resized_width == width {
+                    group_end += 1;
+                }
+                batch_start
+                    + exact_width_batch_len(width, region_parallelism, max_batch_pixels)
+                        .min(group_end - batch_start)
+            }
+        };
         let batch = &jobs[batch_start..batch_end];
         let batch_width = batch
             .iter()
@@ -1121,14 +1257,85 @@ fn recognize_regions(
         }
         batch_start = batch_end;
     }
+    let forward_ms = forward_started.elapsed().as_millis();
+    let records = finalize_recognition_records(records)?;
+    trace_ocr(format_args!(
+        "phase={phase} crop_warp={crop_warp_ms}ms forward={forward_ms}ms regions={}",
+        records.len()
+    ));
+    Ok(records)
+}
 
-    finalize_recognition_records(records)
+fn build_recognition_jobs(
+    image: &RgbImage,
+    quads: &[QuadI],
+    cancellation: &CancellationToken,
+) -> Result<Vec<RecognitionJob>> {
+    cancellation
+        .check()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let crops: Vec<RegionCrop> = if quads.len() >= PARALLEL_CROP_MIN_QUADS {
+        let results = ocr_pool().install(|| {
+            quads
+                .par_iter()
+                .enumerate()
+                .map(|(index, &quad)| {
+                    geometry::crop_region(image, quad)
+                        .with_context(|| format!("crop OCR region {}", index + 1))
+                })
+                .collect::<Vec<_>>()
+        });
+        results.into_iter().collect::<Result<Vec<_>>>()?
+    } else {
+        quads
+            .iter()
+            .enumerate()
+            .map(|(index, &quad)| {
+                geometry::crop_region(image, quad)
+                    .with_context(|| format!("crop OCR region {}", index + 1))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    cancellation
+        .check()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let mut jobs = Vec::with_capacity(quads.len());
+    let mut total_crop_pixels = 0u64;
+    for (index, (quad, crop)) in quads.iter().copied().zip(crops).enumerate() {
+        let crop_pixels = u64::from(crop.image.width())
+            .checked_mul(u64::from(crop.image.height()))
+            .context("OCR crop pixel count overflowed")?;
+        total_crop_pixels = total_crop_pixels
+            .checked_add(crop_pixels)
+            .context("OCR crop pixel budget overflowed")?;
+        ensure!(
+            total_crop_pixels <= MAX_TOTAL_CROP_PIXELS,
+            "OCR crop pixel budget exceeded"
+        );
+        let resized_width =
+            recognizer_resize_width(crop.image.width(), crop.image.height())? as usize;
+        jobs.push(RecognitionJob {
+            index,
+            quad,
+            crop,
+            resized_width,
+        });
+    }
+    Ok(jobs)
+}
+
+/// Batch size for a group of same-width rescue crops: pad-free batches never
+/// exceed the pixel budget, and every member keeps the `batch_width` a
+/// single-region forward would have used.
+fn exact_width_batch_len(width: usize, max_regions: usize, max_batch_pixels: usize) -> usize {
+    let cap = max_batch_pixels / (48 * width.max(MIN_RECOGNIZER_WIDTH));
+    cap.clamp(1, max_regions.max(1))
 }
 
 fn recognize_regions_with_retry(
     image: &RgbImage,
     quads: &[QuadI],
-    recognizer: &PpOcrV5Recognizer,
+    recognizer: &RecognizerKind,
     characters: &[String],
     device: &Device,
     normalizer: &ImageNormalizer,
@@ -1145,6 +1352,7 @@ fn recognize_regions_with_retry(
         normalizer,
         region_parallelism,
         max_batch_pixels,
+        RecognitionBatchMode::Ratio,
         cancellation,
     )?;
     let rescue_quads = recognition_rescue_quads(&records);
@@ -1152,6 +1360,7 @@ fn recognize_regions_with_retry(
         return Ok(records);
     }
 
+    let rescue_started = Instant::now();
     let rescues = recognize_regions(
         image,
         &rescue_quads,
@@ -1159,10 +1368,16 @@ fn recognize_regions_with_retry(
         characters,
         device,
         normalizer,
-        1,
+        region_parallelism,
         max_batch_pixels,
+        RecognitionBatchMode::ExactWidth,
         cancellation,
     )?;
+    trace_ocr(format_args!(
+        "phase=rescue rescue_candidates={} rescue_ms={}ms",
+        rescue_quads.len(),
+        rescue_started.elapsed().as_millis()
+    ));
     let mut replacements = Vec::new();
     for rescue in rescues {
         let rescue_index = rescue.order.saturating_sub(1) as usize;
@@ -1395,652 +1610,175 @@ fn recognition_text_needs_retry(text: &str) -> bool {
                 || !has_whitespace && ascii_letters >= 14)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        DEFAULT_MAX_RECOGNIZER_BATCH_PIXELS, DecodedRecognizer, DecodedToken, DetectorProfile,
-        ImageNormalizer, PpOcrRegionRecord, RecognitionJob, RecognizerOutput, bounding_quad,
-        character_records, clip_detector_quad, component_quad, decode_recognizer,
-        decode_recognizer_batch, decode_recognizer_batch_detailed, detector_contours,
-        detector_tensor, filled_quad_score, finalize_recognition_records, quad_area, quad_contains,
-        recognition_batch_len, recognition_has_lost_contraction, recognition_rescue_quads,
-        recognition_tensor, recognition_text_needs_retry, recognized_region_record,
-        recognizer_resize_width, rescue_improves_recognition, unclipped_quad,
-    };
-    use crate::{backend::contracts::OcrPort, models::ppocrv5::PpOcrV5Provider};
-    use candle_core::{Device, Tensor};
-    use image::{Rgb, RgbImage};
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_model_pair_tests {
+    use super::*;
+    use crate::backend::input::DecodedImage;
+    use std::path::{Path, PathBuf};
 
-    #[test]
-    fn detector_tensor_matches_processor_bgr_channel_order() {
-        let image = RgbImage::from_pixel(32, 32, Rgb([255, 128, 0]));
-        let profile = DetectorProfile::for_image(32, 32).unwrap();
-        let normalizer =
-            ImageNormalizer::new([0.485, 0.456, 0.406], [0.229, 0.224, 0.225], &Device::Cpu)
-                .unwrap();
-        let tensor = detector_tensor(&image, profile, &Device::Cpu, &normalizer).unwrap();
-        assert_eq!(tensor.dims(), &[1, 3, 32, 32]);
-        let values = tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let plane = 32 * 32;
-        assert!((values[0] - (0.0 - 0.485) / 0.229).abs() < 1e-6);
-        assert!((values[plane] - (128.0 / 255.0 - 0.456) / 0.224).abs() < 1e-6);
-        assert!((values[2 * plane] - (1.0 - 0.406) / 0.225).abs() < 1e-6);
+    const MODEL_PAIRS: [(&str, &str, &str); 5] = [
+        (
+            "v5-server",
+            "PP-OCRv5_server_det_safetensors",
+            "PP-OCRv5_server_rec_safetensors",
+        ),
+        (
+            "v5-mobile",
+            "PP-OCRv5_mobile_det_safetensors",
+            "PP-OCRv5_mobile_rec_safetensors",
+        ),
+        (
+            "v6-tiny",
+            "PP-OCRv6_tiny_det_safetensors",
+            "PP-OCRv6_tiny_rec_safetensors",
+        ),
+        (
+            "v6-small",
+            "PP-OCRv6_small_det_safetensors",
+            "PP-OCRv6_small_rec_safetensors",
+        ),
+        (
+            "v6-medium",
+            "PP-OCRv6_medium_det_safetensors",
+            "PP-OCRv6_medium_rec_safetensors",
+        ),
+    ];
+
+    fn local_model_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("PP-OCR")
+            .canonicalize()
+            .expect("canonicalize local PP-OCR model root")
     }
 
-    #[test]
-    fn detector_contours_use_strict_threshold() {
-        let contours = detector_contours(&[0.30, 0.3001], 2, 1).unwrap();
-        assert_eq!(contours, vec![vec![(1, 0)]]);
-    }
-
-    #[test]
-    fn detector_contours_are_deterministic() {
-        let values = [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0];
-        let first = detector_contours(&values, 6, 2).unwrap();
-        let second = detector_contours(&values, 6, 2).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 2);
-    }
-
-    #[test]
-    fn recognizer_tensor_matches_rec_resize_img_normalization() {
-        let crop = RgbImage::from_pixel(10, 10, Rgb([255, 0, 127]));
-        let tensor = recognition_tensor(&crop, &Device::Cpu).unwrap();
-        assert_eq!(tensor.dims(), &[1, 3, 48, 320]);
-        let values = tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let plane = 48 * 320;
-        assert!((values[0] - 1.0).abs() < 1e-6);
-        assert_eq!(values[48], 0.0);
-        assert!((values[plane] + 1.0).abs() < 1e-6);
-        assert!((values[2 * plane] - (127.0 / 255.0 - 0.5) / 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn recognizer_tensor_keeps_wide_target_width() {
-        let crop = RgbImage::from_pixel(1000, 100, Rgb([0, 0, 0]));
-        let tensor = recognition_tensor(&crop, &Device::Cpu).unwrap();
-        assert_eq!(tensor.dims(), &[1, 3, 48, 480]);
-    }
-    #[test]
-    fn recognizer_target_width_matches_processor_rounding() {
-        assert_eq!(recognizer_resize_width(10, 10).unwrap(), 48);
-        assert_eq!(recognizer_resize_width(101, 10).unwrap(), 484);
-        assert_eq!(recognizer_resize_width(667, 100).unwrap(), 320);
-    }
-
-    #[test]
-    fn recognizer_batch_planner_limits_width_padding_and_pixel_cost() {
-        assert_eq!(
-            recognition_batch_len(
-                [3200, 3000, 2800, 2700, 2600],
-                16,
-                DEFAULT_MAX_RECOGNIZER_BATCH_PIXELS,
-            ),
-            4,
-            "the pixel budget caps maximum-width batches",
-        );
-        assert_eq!(
-            recognition_batch_len([1200, 1100, 700], 16, DEFAULT_MAX_RECOGNIZER_BATCH_PIXELS,),
-            2,
-            "dissimilar widths start a new batch",
-        );
-        assert_eq!(
-            recognition_batch_len([300, 200, 100], 16, DEFAULT_MAX_RECOGNIZER_BATCH_PIXELS,),
-            3,
-            "sub-minimum widths share the same padded tensor width",
-        );
-    }
-
-    #[test]
-    fn contraction_rescue_targets_lost_apostrophe_regions() {
-        let top = [[254, 120], [574, 119], [574, 146], [254, 147]];
-        let bottom = [[253, 149], [491, 147], [491, 173], [253, 175]];
-        let records = vec![
-            PpOcrRegionRecord::new(
-                1,
-                top,
-                "Don't go causing any trouble. Ill tie",
-                904,
-                Vec::new(),
-            ),
-            PpOcrRegionRecord::new(2, bottom, "you up real tight if you do.", 950, Vec::new()),
-        ];
-
-        assert!(recognition_has_lost_contraction(&records[0].source_text));
-        assert_eq!(
-            recognition_rescue_quads(&records),
-            vec![bounding_quad(top, bottom)]
-        );
-        let combined = bounding_quad(top, bottom);
-        assert!(quad_contains(combined, records[0].quad_points));
-        assert!(quad_contains(combined, records[1].quad_points));
-        assert_eq!(combined, [[253, 119], [574, 119], [574, 175], [253, 175]]);
-
-        let rescue = PpOcrRegionRecord::new(
-            1,
-            combined,
-            "Don't go causing any trouble. I'll tie you up real tight if you do.",
-            800,
-            Vec::new(),
-        );
-        assert!(rescue_improves_recognition(&records, &rescue));
-    }
-
-    #[test]
-    fn nested_rescues_use_the_smallest_affected_region() {
-        let smaller = [[10, 10], [110, 10], [110, 40], [10, 40]];
-        let larger = [[5, 5], [200, 5], [200, 60], [5, 60]];
-        assert!(quad_contains(larger, smaller));
-        assert!(quad_area(smaller) < quad_area(larger));
-    }
-
-    #[test]
-    fn contraction_rescue_replaces_affected_regions_in_reading_order() {
-        let top = [[254, 120], [574, 119], [574, 146], [254, 147]];
-        let bottom = [[253, 149], [491, 147], [491, 173], [253, 175]];
-        let untouched = [[10, 200], [100, 200], [100, 230], [10, 230]];
-        let records = vec![
-            PpOcrRegionRecord::new(
-                1,
-                top,
-                "Don't go causing any trouble. Ill tie",
-                904,
-                Vec::new(),
-            ),
-            PpOcrRegionRecord::new(2, bottom, "you up real tight if you do.", 950, Vec::new()),
-            PpOcrRegionRecord::new(3, untouched, "Later.", 900, Vec::new()),
-        ];
-        let rescue = PpOcrRegionRecord::new(
-            1,
-            bounding_quad(top, bottom),
-            "Don't go causing any trouble. I'll tie you up real tight if you do.",
-            800,
-            Vec::new(),
-        );
-        let replacements = vec![(bounding_quad(top, bottom), rescue)];
-
-        let mut resolved = Vec::new();
-        let mut inserted = vec![false; replacements.len()];
-        for record in records {
-            let Some(replacement_index) = replacements
-                .iter()
-                .position(|(quad, _)| quad_contains(*quad, record.quad_points))
-            else {
-                resolved.push(record);
-                continue;
-            };
-            if !inserted[replacement_index] {
-                resolved.push(replacements[replacement_index].1.clone());
-                inserted[replacement_index] = true;
-            }
-        }
-        for (index, record) in resolved.iter_mut().enumerate() {
-            record.order = u32::try_from(index + 1).unwrap();
-        }
-
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(
-            resolved[0].source_text,
-            "Don't go causing any trouble. I'll tie you up real tight if you do."
-        );
-        assert_eq!(resolved[0].order, 1);
-        assert_eq!(resolved[1].source_text, "Later.");
-        assert_eq!(resolved[1].order, 2);
-    }
-
-    #[test]
-    fn repeated_letter_noise_triggers_a_bounded_rescue() {
-        for text in ["eeeee", "eere", "cereree eee", "Newspaperhalaaanaaa"] {
-            assert!(
-                recognition_text_needs_retry(text),
-                "{text:?} should request a rescue"
-            );
-        }
-        for text in ["Newspaper headlines", "committee", "Mad scientist"] {
-            assert!(
-                !recognition_text_needs_retry(text),
-                "{text:?} should remain unchanged"
-            );
-        }
-    }
-
-    #[test]
-    fn detector_quad_uses_minimum_area_orientation() {
-        let quad = component_quad(&[(0, 1), (1, 0), (2, 1), (1, 2)]);
-        let area = (0..4)
-            .map(|index| {
-                let next = (index + 1) % 4;
-                quad[index][0] * quad[next][1] - quad[next][0] * quad[index][1]
-            })
-            .sum::<f32>()
-            .abs()
-            * 0.5;
-        assert!(
-            (area - 2.0).abs() < 1e-4,
-            "minimum-area rectangle area: {area}"
-        );
-    }
-
-    #[test]
-    fn detector_db_score_and_unclip_are_deterministic() {
-        let mut probabilities = vec![0.0_f32; 25];
-        for y in 1..=3 {
-            for x in 1..=3 {
-                probabilities[y * 5 + x] = 0.75;
-            }
-        }
-        let quad = [[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]];
-        assert!((filled_quad_score(&probabilities, 5, 5, quad) - 0.75).abs() < 1e-6);
-
-        let expanded = unclipped_quad([[0.0, 0.0], [10.0, 0.0], [10.0, 4.0], [0.0, 4.0]], 1.5);
-        assert!(expanded[0][0] < -2.0 && expanded[0][1] < -2.0);
-        assert!(expanded[2][0] > 12.0 && expanded[2][1] > 6.0);
-        let mut fractional = vec![0.0_f32; 16];
-        fractional[0] = 1.0;
-        let fractional_quad = [[0.9, 0.9], [2.9, 0.9], [2.9, 2.9], [0.9, 2.9]];
-        let score = filled_quad_score(&fractional, 4, 4, fractional_quad);
-        assert!((score - (1.0 / 9.0)).abs() < 1e-6);
-    }
-
-    #[test]
-    fn detector_unclip_is_clipped_before_mapping_back_to_source() {
-        let profile = DetectorProfile::for_image(1920, 1080).unwrap();
-        let expanded = [[-8.0, 40.0], [968.0, 40.0], [968.0, 120.0], [-8.0, 120.0]];
-        let clipped = clip_detector_quad(expanded, profile);
-        assert_eq!(
-            clipped,
-            [[0.0, 40.0], [959.0, 40.0], [959.0, 120.0], [0.0, 120.0]]
-        );
-        let raw =
-            clipped.map(|[x, y]| [x * profile.scale_x() as f32, y * profile.scale_y() as f32]);
-        assert!(super::geometry::map_detector_quad(raw, profile).is_ok());
-    }
-
-    fn recognizer_output(rows: &[[f32; 3]]) -> RecognizerOutput {
-        let values = rows
-            .iter()
-            .flat_map(|row| row.iter().copied())
-            .collect::<Vec<_>>();
-        let tensor = Tensor::from_vec(values, (1, rows.len(), 3), &Device::Cpu).unwrap();
-        RecognizerOutput {
-            logits: tensor,
-            shape: vec![1, rows.len(), 3],
-        }
-    }
-    fn recognizer_batch_output(rows: &[&[[f32; 3]]]) -> RecognizerOutput {
-        let batch = rows.len();
-        let time = rows.first().map(|row| row.len()).unwrap();
-        let values = rows
-            .iter()
-            .flat_map(|row| row.iter().flat_map(|scores| scores.iter().copied()))
-            .collect::<Vec<_>>();
-        let tensor = Tensor::from_vec(values, (batch, time, 3), &Device::Cpu).unwrap();
-        RecognizerOutput {
-            logits: tensor,
-            shape: vec![batch, time, 3],
-        }
-    }
-
-    #[test]
-    fn ctc_batch_decode_preserves_row_order() {
-        let output = recognizer_batch_output(&[
-            &[[0.1, 0.9, 0.0], [0.1, 0.9, 0.0]],
-            &[[0.1, 0.0, 0.9], [0.1, 0.0, 0.9]],
-        ]);
-        let characters = vec!["blank".to_owned(), "A".to_owned(), "B".to_owned()];
-        let texts = decode_recognizer_batch(&output, &characters).unwrap();
-        assert_eq!(texts, vec!["A".to_owned(), "B".to_owned()]);
-    }
-
-    #[test]
-    fn ctc_batch_decode_reports_mean_emission_confidence() {
-        let output = recognizer_batch_output(&[
-            &[[0.0, 4.0, 0.0], [4.0, 0.0, 0.0], [0.0, 0.0, 2.0]],
-            &[[0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [4.0, 0.0, 0.0]],
-        ]);
-        let characters = vec!["blank".to_owned(), "A".to_owned(), "B".to_owned()];
-        let decoded = decode_recognizer_batch_detailed(&output, &characters).unwrap();
-
-        assert_eq!(decoded[0].text, "AB");
-        assert_eq!(decoded[0].confidence_milli, 876);
-        assert_eq!(decoded[1].text, "A");
-        assert_eq!(decoded[1].confidence_milli, 576);
-    }
-
-    #[test]
-    fn empty_recognition_text_is_skipped_without_character_geometry() {
-        let image = RgbImage::new(100, 40);
-        let crop =
-            super::geometry::crop_region(&image, [[10, 10], [90, 10], [90, 30], [10, 30]]).unwrap();
-        let job = RecognitionJob {
-            index: 0,
-            quad: [[10, 10], [90, 10], [90, 30], [10, 30]],
-            crop,
-            resized_width: 320,
-        };
-        let decoded = DecodedRecognizer {
-            text: " \n ".to_owned(),
-            tokens: Vec::new(),
-            time_steps: 1,
-            confidence_milli: 0,
-        };
-
-        let result =
-            recognized_region_record(&job, &decoded, &["blank".to_owned()], 320, 100, 40).unwrap();
-
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn finalizing_records_drops_unrecognized_region_slots() {
-        let quad = [[10, 10], [90, 10], [90, 30], [10, 30]];
-        let records = finalize_recognition_records(vec![
-            Some((quad, "first".to_owned(), 910, Vec::new())),
-            None,
-            Some((quad, "third".to_owned(), 820, Vec::new())),
-        ])
-        .unwrap();
-
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].order, 1);
-        assert_eq!(records[0].source_text, "first");
-        assert_eq!(records[1].order, 3);
-        assert_eq!(records[1].source_text, "third");
-    }
-
-    #[test]
-    fn ctc_decode_collapses_without_trimming_and_prefers_first_tie() {
-        let output = recognizer_output(&[
-            [0.1, 0.4, 0.4],
-            [0.1, 0.9, 0.1],
-            [0.9, 0.1, 0.1],
-            [0.1, 0.1, 0.9],
-            [0.1, 0.1, 0.9],
-        ]);
-        let characters = vec!["blank".to_owned(), " A ".to_owned(), "B ".to_owned()];
-        let text = decode_recognizer(&output, &characters).unwrap();
-        assert_eq!(text, " A B ");
-    }
-    #[test]
-    fn character_records_partition_the_source_region_in_ctc_order() {
-        let image = RgbImage::new(100, 40);
-        let crop =
-            super::geometry::crop_region(&image, [[10, 10], [90, 10], [90, 30], [10, 30]]).unwrap();
-        let job = RecognitionJob {
-            index: 0,
-            quad: [[10, 10], [90, 10], [90, 30], [10, 30]],
-            crop,
-            resized_width: 320,
-        };
-        let decoded = DecodedRecognizer {
-            text: "AB".to_owned(),
-            tokens: vec![
-                DecodedToken {
-                    token: 1,
-                    timestep: 5,
-                },
-                DecodedToken {
-                    token: 2,
-                    timestep: 25,
-                },
-            ],
-            time_steps: 40,
-            confidence_milli: 900,
-        };
-        let characters = vec!["blank".to_owned(), "A".to_owned(), "B".to_owned()];
-
-        let records = character_records(&job, &decoded, &characters, 320, 100, 40).unwrap();
-
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].source_text, "A");
-        assert_eq!(records[1].source_text, "B");
-        assert_eq!(records[0].quad_points[0], [10, 10]);
-        assert_eq!(records[0].quad_points[2], [41, 30]);
-        assert_eq!(records[1].quad_points[0], [41, 10]);
-    }
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
-    #[test]
-    #[ignore = "requires staged PP-OCRv5 assets, a supported CUDA device, and the newspaper-headlines fixture"]
-    fn cuda_newspaper_headline_fixture() {
-        assert_eq!(
-            std::env::var("SMODELTRANS_RUN_CUDA_E2E").as_deref(),
-            Ok("1"),
-            "set SMODELTRANS_RUN_CUDA_E2E=1 to run the native CUDA fixture"
-        );
-        let manifest_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let model_root = manifest_root.join("..").join("models").join("ppocrv5");
-        let device = Device::new_cuda(0).expect("CUDA device");
-        let mut provider = PpOcrV5Provider::load(
-            &model_root.join("detector"),
-            &model_root.join("recognizer"),
-            &device,
-            4,
-            DEFAULT_MAX_RECOGNIZER_BATCH_PIXELS,
-        )
-        .expect("PP-OCRv5 provider");
-        let cancellation = super::CancellationToken::new_for_test();
-
-        let newspaper_image =
-            image::open(manifest_root.join("tests/fixtures/ppocrv5/newspaper-headlines.png"))
-                .expect("newspaper fixture")
-                .to_rgb8();
-        let newspaper = super::DecodedImage::from_rgb_image(
-            newspaper_image,
-            "newspaper-headlines.png",
-            "English",
-        );
-        let newspaper_text = provider
-            .recognize(&newspaper, &cancellation)
-            .expect("newspaper OCR fixture")
-            .regions
-            .into_iter()
-            .map(|region| region.source_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        for expected in [
-            "Newspaper headlines",
-            "Adoptions wanted! How to help the..",
-            "Mad scientist on the loose! Townsfolks..",
-        ] {
-            assert!(
-                newspaper_text
-                    .lines()
-                    .any(|line| line.eq_ignore_ascii_case(expected)),
-                "missing {expected:?} in:\n{newspaper_text}"
-            );
-        }
-        assert!(
-            newspaper_text.lines().any(|line| {
-                line.to_ascii_lowercase()
-                    .starts_with("a tale of two cities: maids,")
-            }),
-            "missing final headline in:\n{newspaper_text}"
-        );
-        let rescued_header = provider
-            .recognize_quad(
-                &newspaper,
-                [[0, 0], [470, 0], [470, 36], [0, 36]],
-                &cancellation,
-            )
-            .expect("recognize framed headline")
-            .expect("framed headline text");
-        assert_eq!(rescued_header.source_text, "Newspaper headlines");
-    }
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
-    #[test]
-    #[ignore = "requires staged PP-OCRv5 assets and a supported CUDA device"]
-    fn cuda_italic_dialogue_fixture() {
-        assert_eq!(
-            std::env::var("SMODELTRANS_RUN_CUDA_E2E").as_deref(),
-            Ok("1"),
-            "set SMODELTRANS_RUN_CUDA_E2E=1 to run the native CUDA fixture"
-        );
-        let manifest_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let model_root = manifest_root.join("..").join("models").join("ppocrv5");
-        let device = Device::new_cuda(0).expect("CUDA device");
-        let mut provider = PpOcrV5Provider::load(
-            &model_root.join("detector"),
-            &model_root.join("recognizer"),
-            &device,
-            4,
-            DEFAULT_MAX_RECOGNIZER_BATCH_PIXELS,
-        )
-        .expect("PP-OCRv5 provider");
-        let cancellation = super::CancellationToken::new_for_test();
-        let image = image::open(manifest_root.join("tests/fixtures/ppocrv5/italic-dialogue.png"))
-            .expect("italic dialogue fixture")
+    fn fixture() -> DecodedImage {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("ppocrv5")
+            .join("italic-dialogue.png");
+        let image = image::open(&path)
+            .unwrap_or_else(|error| panic!("open {}: {error}", path.display()))
             .to_rgb8();
-        let decoded = super::DecodedImage::from_rgb_image(image, "italic-dialogue.png", "English");
-        let text = provider
-            .recognize(&decoded, &cancellation)
-            .expect("italic dialogue OCR fixture")
-            .regions
-            .into_iter()
-            .map(|region| region.source_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(
-            text.lines().any(|line| line
-                .eq_ignore_ascii_case("That's the only problem you have with this headline?!?!")),
-            "recognized text:\n{text}"
-        );
+        DecodedImage::from_rgb_image(image, "ppocr-cuda-fixture", "English")
     }
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
-    #[test]
-    #[ignore = "requires staged PP-OCRv5 assets, a supported CUDA device, and the low-contrast-newspaper fixture"]
-    fn cuda_low_contrast_multiline_newspaper_fixture() {
-        assert_eq!(
-            std::env::var("SMODELTRANS_RUN_CUDA_E2E").as_deref(),
-            Ok("1"),
-            "set SMODELTRANS_RUN_CUDA_E2E=1 to run the native CUDA fixture"
-        );
-        let manifest_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let model_root = manifest_root.join("..").join("models").join("ppocrv5");
-        let device = Device::new_cuda(0).expect("CUDA device");
-        let mut provider = PpOcrV5Provider::load(
-            &model_root.join("detector"),
-            &model_root.join("recognizer"),
-            &device,
-            4,
-            DEFAULT_MAX_RECOGNIZER_BATCH_PIXELS,
-        )
-        .expect("PP-OCRv5 provider");
-        let cancellation = super::CancellationToken::new_for_test();
-        let image =
-            image::open(manifest_root.join("tests/fixtures/ppocrv5/low-contrast-newspaper.png"))
-                .expect("low-contrast newspaper fixture")
-                .to_rgb8();
-        let decoded =
-            super::DecodedImage::from_rgb_image(image, "low-contrast-newspaper.png", "English");
-        let text = provider
-            .recognize(&decoded, &cancellation)
-            .expect("low-contrast newspaper OCR fixture")
-            .regions
-            .into_iter()
-            .map(|region| region.source_text)
-            .collect::<Vec<_>>()
-            .join("\n")
-            .to_ascii_lowercase();
-        println!("{text}");
 
-        for expected in [
-            "mad scientist on the loose",
-            "cantamille afraid to leave their",
-            "homes after local loon escapes prison",
-            "scantily-clad",
-            "accomplice",
-        ] {
-            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+    const EXPECTED_DIALOGUE: &str = "thatstheonlyproblemyouhavewiththisheadline";
+
+    fn normalized_alphanumeric(text: &str) -> String {
+        text.chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+
+    fn assert_expected_dialogue(
+        label: &str,
+        route: &str,
+        text: &str,
+    ) -> std::result::Result<(), String> {
+        if normalized_alphanumeric(text).contains(EXPECTED_DIALOGUE) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{route} OCR did not contain the fixture dialogue for {label}: {text:?}"
+            ))
         }
     }
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
-    #[test]
-    #[ignore = "requires staged PP-OCRv5 assets, a supported CUDA device, and the slanted-live-dialogue fixture"]
-    fn cuda_slanted_live_dialogue_fixture() {
-        assert_eq!(
-            std::env::var("SMODELTRANS_RUN_CUDA_E2E").as_deref(),
-            Ok("1"),
-            "set SMODELTRANS_RUN_CUDA_E2E=1 to run the native CUDA fixture"
-        );
-        let manifest_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let model_root = manifest_root.join("..").join("models").join("ppocrv5");
-        let device = Device::new_cuda(0).expect("CUDA device");
-        let mut provider = PpOcrV5Provider::load(
-            &model_root.join("detector"),
-            &model_root.join("recognizer"),
-            &device,
-            4,
-            DEFAULT_MAX_RECOGNIZER_BATCH_PIXELS,
-        )
-        .expect("PP-OCRv5 provider");
-        let cancellation = super::CancellationToken::new_for_test();
-        let image =
-            image::open(manifest_root.join("tests/fixtures/ppocrv5/slanted-live-dialogue.png"))
-                .expect("slanted live dialogue fixture")
-                .to_rgb8();
-        let decoded =
-            super::DecodedImage::from_rgb_image(image, "slanted-live-dialogue.png", "English");
-        let text = provider
-            .recognize(&decoded, &cancellation)
-            .expect("slanted live dialogue OCR fixture")
-            .regions
-            .into_iter()
-            .map(|region| region.source_text)
-            .collect::<Vec<_>>()
-            .join("\n")
-            .to_ascii_lowercase();
 
-        assert!(text.contains("boats are"), "recognized text:\n{text}");
-        assert!(
-            text.contains("not available for rental"),
-            "recognized text:\n{text}"
-        );
-    }
-    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
-    #[test]
-    #[ignore = "requires staged PP-OCRv5 assets and a supported CUDA device"]
-    fn cuda_live_dialogue_apostrophe_fixture() {
-        assert_eq!(
-            std::env::var("SMODELTRANS_RUN_CUDA_E2E").as_deref(),
-            Ok("1"),
-            "set SMODELTRANS_RUN_CUDA_E2E=1 to run the native CUDA fixture"
-        );
-        let manifest_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let model_root = manifest_root.join("..").join("models").join("ppocrv5");
-        let device = Device::new_cuda(0).expect("CUDA device");
-        let mut provider = PpOcrV5Provider::load(
-            &model_root.join("detector"),
-            &model_root.join("recognizer"),
-            &device,
-            4,
-            DEFAULT_MAX_RECOGNIZER_BATCH_PIXELS,
+
+    fn run_model_pair(
+        label: &str,
+        detector_dir: &str,
+        recognizer_dir: &str,
+        root: &Path,
+        image: &DecodedImage,
+        device: &Device,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<(String, String), String> {
+        let mut provider = PpOcrProvider::load(
+            &root.join(detector_dir),
+            &root.join(recognizer_dir),
+            device,
+            1,
+            48 * 320,
         )
-        .expect("PP-OCRv5 provider");
-        let cancellation = super::CancellationToken::new_for_test();
-        let image =
-            image::open(manifest_root.join("tests/fixtures/ppocrv5/live-dialogue-apostrophe.png"))
-                .expect("live dialogue fixture")
-                .to_rgb8();
-        let decoded =
-            super::DecodedImage::from_rgb_image(image, "live-dialogue-apostrophe.png", "English");
-        let detected = provider
-            .recognize(&decoded, &cancellation)
-            .expect("live dialogue OCR fixture")
-            .regions;
-        let text = detected
+        .map_err(|error| format!("load {label} on CUDA: {error:#}"))?;
+
+        let document = provider
+            .recognize(image, cancellation)
+            .map_err(|error| format!("run {label} image OCR on CUDA: {error:#}"))?;
+        let image_text = document
+            .regions
             .iter()
             .map(|region| region.source_text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let all = detected
-            .iter()
-            .flat_map(|region| region.characters.iter())
-            .map(|character| character.source_text.as_str())
             .collect::<String>();
+        if !image_text.chars().any(|character| character.is_alphanumeric()) {
+            return Err(format!(
+                "image OCR produced no recognized text: {image_text:?}"
+            ));
+        }
+        assert_expected_dialogue(label, "image", &image_text)?;
+
+        // The original fixed rectangle cut through the fixture's glyphs.  A
+        // detector-produced text quad is a valid real-time selection and keeps
+        // this regression independent of incidental fixture layout.
+        let live_quad = document
+            .regions
+            .iter()
+            .max_by_key(|region| region.source_text.chars().count())
+            .map(|region| region.quad_points)
+            .ok_or_else(|| "image OCR produced no selectable text region".to_owned())?;
+        let live_region = provider
+            .recognize_quad(image, live_quad, cancellation)
+            .map_err(|error| format!("run {label} live OCR on CUDA: {error:#}"))?
+            .ok_or_else(|| "live OCR produced no region".to_owned())?;
+        let live_text = live_region.source_text;
+        if !live_text.chars().any(|character| character.is_alphanumeric()) {
+            return Err(format!(
+                "live OCR produced no recognized text: {live_text:?}"
+            ));
+        }
+        assert_expected_dialogue(label, "live", &live_text)?;
+        Ok((image_text, live_text))
+    }
+
+    #[test]
+    #[ignore = "requires local PP-OCR assets and a CUDA device"]
+    fn cuda_all_supported_model_pairs_run_image_and_live_ocr() {
+        let device = Device::new_cuda(0).expect("create CUDA device; no CPU fallback is permitted");
+        assert!(matches!(device, Device::Cuda(_)));
+        let root = local_model_root();
+        let image = fixture();
+        let cancellation = CancellationToken::new_for_test();
+        let mut failures = Vec::new();
+
+        for (label, detector_dir, recognizer_dir) in MODEL_PAIRS {
+            match run_model_pair(
+                label,
+                detector_dir,
+                recognizer_dir,
+                &root,
+                &image,
+                &device,
+                &cancellation,
+            ) {
+                Ok((image_text, live_text)) => {
+                    eprintln!(
+                        "[cuda-ocr] {label}: image={image_text:?}; live={live_text:?}"
+                    );
+                }
+                Err(error) => failures.push(format!("{label}: {error}")),
+            }
+        }
+
         assert!(
-            all.contains("I'll"),
-            "apostrophe was lost before realtime grouping:\n{text}\nregions: {detected:#?}"
+            failures.is_empty(),
+            "CUDA OCR model-pair failures:\n{}",
+            failures.join("\n")
         );
     }
 }
+

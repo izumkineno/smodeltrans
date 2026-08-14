@@ -52,6 +52,8 @@ export interface BackendStatus {
   device: string;
   detectorModelDir: string;
   recognizerModelDir: string;
+  detectorVariant: string | null;
+  recognizerVariant: string | null;
   hyModel: string;
   fontPath: string | null;
   targetLanguage: string;
@@ -104,6 +106,35 @@ export interface BackendSettingsUpdate {
   generation: BackendGenerationSettings;
   memory: BackendMemorySettings;
   prompt: BackendPromptSettings;
+}
+
+export interface TranslationModelOption {
+  name: string;
+  path: string;
+}
+
+export interface OcrModelOption {
+  name: string;
+  detectorDir: string;
+  recognizerDir: string;
+  variant: string | null;
+}
+
+export interface FontModelOption {
+  name: string;
+  path: string | null;
+}
+
+export interface ModelCatalogOptions {
+  translation: TranslationModelOption[];
+  ocr: OcrModelOption[];
+  fonts: FontModelOption[];
+}
+
+export interface ModelCatalogUpdate {
+  translation: Array<{ name: string; path: string }>;
+  ocr: Array<{ name: string; detectorDir: string; recognizerDir: string }>;
+  fonts: Array<{ name: string; path: string }>;
 }
 
 export interface TranslationProvider {
@@ -282,6 +313,19 @@ export async function updateBackendSettings(
   invokeFn: InvokeFn = invoke,
 ): Promise<BackendStatus> {
   return invokeFn<BackendStatus>("update_backend_settings", { request: settings });
+}
+
+export async function getModelCatalog(
+  invokeFn: InvokeFn = invoke,
+): Promise<ModelCatalogOptions> {
+  return invokeFn<ModelCatalogOptions>("list_model_catalog");
+}
+
+export async function saveModelCatalog(
+  catalog: ModelCatalogUpdate,
+  invokeFn: InvokeFn = invoke,
+): Promise<BackendStatus> {
+  return invokeFn<BackendStatus>("save_model_catalog", { request: catalog });
 }
 
 export async function getModelRuntimeStatus(

@@ -4307,6 +4307,7 @@ dependencies = [
  "fontdb",
  "image",
  "imageproc",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",

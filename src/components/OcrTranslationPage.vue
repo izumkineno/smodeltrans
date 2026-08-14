@@ -329,7 +329,7 @@ async function startTranslation() {
       translation.isTranslated ? "success" : "warning",
       translation.isTranslated
         ? "翻译结果已准备好。"
-        : "PP-OCRv5 识别结果已准备好；Hy 翻译需要 CUDA。",
+        : "PP-OCR 识别结果已准备好；Hy 翻译需要 CUDA。",
     );
   } catch (error) {
     if (controller.signal.aborted || isTranslationCancellation(error)) {
@@ -743,7 +743,7 @@ onBeforeUnmount(() => {
             variant="result"
             :src="annotatedResultUrl"
             :preview-src="annotatedResultUrl"
-            :alt="resultIsTranslated ? 'OCR 标注后的翻译图片' : 'PP-OCRv5 标注识别图片'"
+            :alt="resultIsTranslated ? 'OCR 标注后的翻译图片' : 'PP-OCR 标注识别图片'"
             :render-toolbar="renderImageToolbar"
           >
             <template #actions>
@@ -766,7 +766,7 @@ onBeforeUnmount(() => {
           </div>
 
           <p v-if="!resultIsTranslated" class="result-mode-note">
-            当前使用 CPU，仅展示 PP-OCRv5 识别文本；切换 CUDA 后可启用 Hy-MT2 翻译。
+            当前使用 CPU，仅展示 PP-OCR 识别文本；切换 CUDA 后可启用 Hy-MT2 翻译。
           </p>
           <n-input
             class="result-input"
@@ -774,7 +774,7 @@ onBeforeUnmount(() => {
             :value="resultText"
             readonly
             :autosize="{ minRows: 9, maxRows: 16 }"
-            :aria-label="resultIsTranslated ? '翻译结果文本' : 'PP-OCRv5 识别文本'"
+            :aria-label="resultIsTranslated ? '翻译结果文本' : 'PP-OCR 识别文本'"
           />
           <div class="result-actions">
             <n-space :size="10" wrap>
@@ -816,7 +816,7 @@ onBeforeUnmount(() => {
     <footer class="workspace-footer">
       <span>Candle 本地推理</span>
       <span class="footer-separator" aria-hidden="true"></span>
-      <span>PP-OCRv5 · Hy-MT2 · Tauri</span>
+      <span>PP-OCR · Hy-MT2 · Tauri</span>
       <span class="footer-spacer"></span>
       <span>PNG · JPG · WEBP · GIF · BMP</span>
     </footer>

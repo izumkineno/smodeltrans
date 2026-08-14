@@ -7,18 +7,23 @@ import {
   NCard,
   NInput,
   NInputNumber,
+  NModal,
   NSelect,
   NSwitch,
   NTag,
   useMessage,
 } from "naive-ui";
 import {
+  getModelCatalog,
+  saveModelCatalog,
   updateBackendSettings,
 } from "../services/translation-provider";
 import type {
   BackendSettingsUpdate,
   BackendStatus,
   DeviceKind,
+  ModelCatalogOptions,
+  ModelCatalogUpdate,
 } from "../services/translation-provider";
 import {
   applySharedBackendStatus,
@@ -31,7 +36,7 @@ import {
 import { showWorkspaceToast, type WorkspaceToastType } from "../services/workspace-toast";
 
 type TagType = "default" | "success" | "warning" | "error" | "info";
-type ModelPathField = "detector" | "recognizer" | "hy" | "font";
+type ModelDialogMode = "translation" | "ocr" | "font" | null;
 
 const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const modelDetectorPath = ref("");
@@ -58,13 +63,14 @@ const memoryMaxTurns = ref(16);
 const systemPrompt = ref("");
 const userPrompt = ref("");
 const settingsMessage = ref("");
+const settingsMessageType = ref<WorkspaceToastType>("info");
 const settingsLoading = ref(false);
+const dialogSaving = ref(false);
+const catalogLoaded = ref(false);
 const deviceOptions: Array<{ label: string; value: DeviceKind }> = [
   { label: "CUDA", value: "cuda" },
   { label: "CPU（仅用于状态检查；Hy 翻译需要 CUDA）", value: "cpu" },
 ];
-
-
 const toast = useMessage();
 
 function setSettingsFeedback(
@@ -73,6 +79,7 @@ function setSettingsFeedback(
   notify = true,
 ) {
   settingsMessage.value = message;
+  settingsMessageType.value = type;
   if (notify) {
     showWorkspaceToast(toast, type, message);
   }
@@ -96,7 +103,6 @@ function applyBackendStatus(status: BackendStatus) {
   applySharedBackendStatus(status);
   modelDetectorPath.value = status.detectorModelDir;
   modelRecognizerPath.value = status.recognizerModelDir;
-  modelHyPath.value = status.hyModel;
   modelFontPath.value = status.fontPath;
   device.value = status.device === "cpu" ? "cpu" : "cuda";
   regionParallelism.value = status.regionParallelism;
@@ -128,6 +134,7 @@ async function refreshBackendStatus(notify = true) {
   try {
     const status = await fetchSharedBackendStatus();
     applyBackendStatus(status);
+    void loadModelCatalog();
     setSettingsFeedback(status.ready ? "success" : "warning", status.message, notify);
   } catch (error) {
     setSettingsFeedback("error", error instanceof Error ? error.message : "无法读取后端模型状态。", notify);
@@ -136,71 +143,304 @@ async function refreshBackendStatus(notify = true) {
   }
 }
 
-function modelPathFor(field: ModelPathField): string {
-  if (field === "detector") {
-    return modelDetectorPath.value;
+const modelCatalog = ref<ModelCatalogOptions>({ translation: [], ocr: [], fonts: [] });
+const modelDialogMode = ref<ModelDialogMode>(null);
+// Writable computed: the modal's v-model:show must be able to close it
+// (top-right X and mask clicks assign `false`).
+const modelDialogOpen = computed({
+  get: () => modelDialogMode.value !== null,
+  set: (open: boolean) => {
+    if (!open) {
+      modelDialogMode.value = null;
+    }
+  },
+});
+const modelDialogTitle = computed(() => {
+  if (modelDialogMode.value === "translation") {
+    return "配置翻译模型路径";
   }
-  if (field === "recognizer") {
-    return modelRecognizerPath.value;
+  if (modelDialogMode.value === "ocr") {
+    return "配置 OCR 模型路径";
   }
-  if (field === "hy") {
-    return modelHyPath.value;
-  }
-  return modelFontPath.value ?? "";
+  return "配置标注字体路径";
+});
+const dialogName = ref("");
+const dialogTranslationPath = ref("");
+const dialogOcrDetectorPath = ref("");
+const dialogOcrRecognizerPath = ref("");
+const dialogFontPath = ref("");
+
+type OcrModelType =
+  | "v5-server"
+  | "v5-mobile"
+  | "v6-tiny"
+  | "v6-small"
+  | "v6-medium";
+const OCR_MODEL_TYPES: Array<{ label: string; value: OcrModelType }> = [
+  { label: "PP-OCR v5 server（高精度，较慢）", value: "v5-server" },
+  { label: "PP-OCR v5 mobile（快速，适合实时翻译）", value: "v5-mobile" },
+  { label: "PP-OCR v6 tiny（轻量，最快）", value: "v6-tiny" },
+  { label: "PP-OCR v6 small（均衡）", value: "v6-small" },
+  { label: "PP-OCR v6 medium（高精度）", value: "v6-medium" },
+];
+const dialogOcrType = ref<OcrModelType>("v5-mobile");
+const UNCONFIGURED_OCR_PREFIX = "__unset__:";
+
+function pathBaseName(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  const separator = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  return separator >= 0 ? trimmed.slice(separator + 1) : trimmed;
 }
 
-async function chooseModelPath(field: ModelPathField) {
+// Translation dropdown only ever shows the one supported type, Hy-MT2.
+const translationModelPath = computed(
+  () => modelCatalog.value.translation[0]?.path ?? modelHyPath.value ?? "",
+);
+const translationModelOptionsWithCurrent = computed(() =>
+  translationModelPath.value
+    ? [{ label: "Hy-MT2", value: translationModelPath.value }]
+    : [],
+);
+const selectedTranslationValue = computed(() => modelHyPath.value || null);
+
+function resolveOcrEntry(type: OcrModelType): {
+  detectorDir: string;
+  recognizerDir: string;
+} | null {
+  const entry = modelCatalog.value.ocr.find((option) => option.variant === type);
+  if (entry) {
+    return { detectorDir: entry.detectorDir, recognizerDir: entry.recognizerDir };
+  }
+  if (
+    modelDetectorPath.value &&
+    modelRecognizerPath.value &&
+    backendStatus.value?.detectorVariant === type
+  ) {
+    return { detectorDir: modelDetectorPath.value, recognizerDir: modelRecognizerPath.value };
+  }
+  return null;
+}
+
+// OCR dropdown only ever shows the two supported variants, resolved to paths.
+// Unconfigured variants stay visible but disabled, with a clear hint.
+const ocrModelOptions = computed(() =>
+  OCR_MODEL_TYPES.map(({ label, value }) => {
+    const resolved = resolveOcrEntry(value);
+    return resolved
+      ? { label, value: `${resolved.detectorDir}|${resolved.recognizerDir}` }
+      : {
+          label: `${label}（未配置路径）`,
+          value: `${UNCONFIGURED_OCR_PREFIX}${value}`,
+          disabled: true,
+        };
+  }),
+);
+
+// 配置翻译模型弹窗里的模型下拉与页面下拉保持一致：只显示类型「Hy-MT2」，
+// 其取值跟随弹窗当前路径（选择新文件后仍显示 Hy-MT2，不细分文件名）。
+const translationDialogPath = computed(
+  () =>
+    dialogTranslationPath.value ||
+    modelCatalog.value.translation[0]?.path ||
+    modelHyPath.value ||
+    "",
+);
+const translationDialogOptions = computed(() =>
+  translationDialogPath.value
+    ? [{ label: "Hy-MT2", value: translationDialogPath.value }]
+    : [],
+);
+
+function selectDialogTranslationModel(value: string | null): void {
+  dialogTranslationPath.value = value ?? "";
+}
+const selectedOcrValue = computed(() =>
+  modelDetectorPath.value && modelRecognizerPath.value
+    ? `${modelDetectorPath.value}|${modelRecognizerPath.value}`
+    : null,
+);
+
+const SYSTEM_FONT_VALUE = "__system__";
+const fontModelOptions = computed(() => [
+  { label: "系统自动匹配", value: SYSTEM_FONT_VALUE },
+  ...modelCatalog.value.fonts.map((option) => ({
+    label: `${option.name}（${option.path ? pathBaseName(option.path) : ""}）`,
+    value: option.path ?? SYSTEM_FONT_VALUE,
+  })),
+]);
+const selectedFontValue = computed(() => modelFontPath.value ?? SYSTEM_FONT_VALUE);
+
+async function loadModelCatalog(): Promise<void> {
   if (!isDesktopRuntime) {
-    setSettingsFeedback("warning", "模型路径选择仅在 Tauri 桌面端可用。");
+    catalogLoaded.value = true;
     return;
   }
   try {
-    const currentPath = modelPathFor(field);
-    const selected =
-      field === "hy"
-        ? await openNativeDialog({
-            title: "选择 Hy-MT2 GGUF 模型",
-            defaultPath: currentPath || undefined,
-            multiple: false,
-            filters: [{ name: "GGUF 模型", extensions: ["gguf"] }],
-          })
-        : field === "font"
-          ? await openNativeDialog({
-              title: "选择标注字体",
-              defaultPath: currentPath || undefined,
-              multiple: false,
-              filters: [{ name: "字体文件", extensions: ["ttf", "otf"] }],
-            })
-          : await openNativeDialog({
-              title:
-                field === "detector"
-                  ? "选择 PP-OCRv5 detector 文件夹"
-                  : "选择 PP-OCRv5 recognizer 文件夹",
-              defaultPath: currentPath || undefined,
-              directory: true,
-              multiple: false,
-            });
-    if (typeof selected !== "string" || !selected.trim()) {
-      return;
-    }
-    if (field === "detector") {
-      modelDetectorPath.value = selected;
-    } else if (field === "recognizer") {
-      modelRecognizerPath.value = selected;
-    } else if (field === "hy") {
-      modelHyPath.value = selected;
-    } else {
-      modelFontPath.value = selected;
-    }
-    setSettingsFeedback("success", "路径已选择，点击保存模型设置后生效。");
-  } catch (error) {
-    setSettingsFeedback("error", error instanceof Error ? error.message : "无法打开模型路径选择器。");
+    modelCatalog.value = await getModelCatalog();
+  } catch {
+    modelCatalog.value = { translation: [], ocr: [], fonts: [] };
+  } finally {
+    catalogLoaded.value = true;
   }
 }
 
-function useSystemFont() {
-  modelFontPath.value = null;
-  setSettingsFeedback("info", "字体已切换为系统自动匹配，点击保存模型设置后生效。");
+function selectTranslationModel(path: string): void {
+  modelHyPath.value = path;
+  setSettingsFeedback("info", "已选择翻译模型 Hy-MT2，点击“保存设置”生效。");
+}
+
+function selectOcrModel(value: string): void {
+  if (value.startsWith(UNCONFIGURED_OCR_PREFIX)) {
+    setSettingsFeedback("error", "该模型类型尚未配置路径，请点击“配置路径…”设置。");
+    return;
+  }
+  const separator = value.indexOf("|");
+  if (separator < 0) {
+    return;
+  }
+  modelDetectorPath.value = value.slice(0, separator);
+  modelRecognizerPath.value = value.slice(separator + 1);
+  setSettingsFeedback("info", "已选择 OCR 模型，点击“保存设置”生效。");
+}
+
+function selectFontModel(value: string): void {
+  modelFontPath.value = value === SYSTEM_FONT_VALUE ? null : value;
+  setSettingsFeedback("info", "已选择标注字体，点击“保存设置”生效。");
+}
+
+function openModelDialog(mode: Exclude<ModelDialogMode, null>): void {
+  dialogName.value = "";
+  dialogTranslationPath.value = "";
+  dialogOcrDetectorPath.value = "";
+  dialogOcrRecognizerPath.value = "";
+  dialogFontPath.value = "";
+  dialogOcrType.value =
+    backendStatus.value?.detectorVariant === "v5-server" ? "v5-server" : "v5-mobile";
+  modelDialogMode.value = mode;
+}
+
+function closeModelDialog(): void {
+  modelDialogMode.value = null;
+}
+
+async function pickDialogTranslationPath(): Promise<void> {
+  const selected = await openNativeDialog({
+    title: "选择 Hy-MT2 GGUF 模型",
+    defaultPath: dialogTranslationPath.value || undefined,
+    multiple: false,
+    filters: [{ name: "GGUF 模型", extensions: ["gguf"] }],
+  });
+  if (typeof selected === "string" && selected.trim()) {
+    dialogTranslationPath.value = selected;
+  }
+}
+
+async function pickDialogOcrDetectorPath(): Promise<void> {
+  const selected = await openNativeDialog({
+    title: "选择 PP-OCR detector 文件夹",
+    defaultPath: dialogOcrDetectorPath.value || undefined,
+    directory: true,
+    multiple: false,
+  });
+  if (typeof selected === "string" && selected.trim()) {
+    dialogOcrDetectorPath.value = selected;
+  }
+}
+
+async function pickDialogOcrRecognizerPath(): Promise<void> {
+  const selected = await openNativeDialog({
+    title: "选择 PP-OCR recognizer 文件夹",
+    defaultPath: dialogOcrRecognizerPath.value || undefined,
+    directory: true,
+    multiple: false,
+  });
+  if (typeof selected === "string" && selected.trim()) {
+    dialogOcrRecognizerPath.value = selected;
+  }
+}
+
+async function pickDialogFontPath(): Promise<void> {
+  const selected = await openNativeDialog({
+    title: "选择标注字体",
+    defaultPath: dialogFontPath.value || undefined,
+    multiple: false,
+    filters: [{ name: "字体文件", extensions: ["ttf", "otf"] }],
+  });
+  if (typeof selected === "string" && selected.trim()) {
+    dialogFontPath.value = selected;
+  }
+}
+
+async function saveModelDialog(): Promise<void> {
+  if (dialogSaving.value) {
+    return;
+  }
+  const mode = modelDialogMode.value;
+  const next: ModelCatalogUpdate = {
+    translation: modelCatalog.value.translation.map((entry) => ({
+      name: entry.name,
+      path: entry.path,
+    })),
+    ocr: modelCatalog.value.ocr.map((entry) => ({
+      name: entry.name,
+      detectorDir: entry.detectorDir,
+      recognizerDir: entry.recognizerDir,
+    })),
+    fonts: modelCatalog.value.fonts
+      .filter((entry) => entry.path !== null)
+      .map((entry) => ({ name: entry.name, path: entry.path as string })),
+  };
+  let entryName = "";
+  if (mode === "translation") {
+    entryName = "Hy-MT2";
+    const path = dialogTranslationPath.value.trim();
+    if (!path) {
+      setSettingsFeedback("error", "请选择 GGUF 模型文件。");
+      return;
+    }
+    next.translation.push({ name: entryName, path });
+  } else if (mode === "ocr") {
+    entryName = dialogOcrType.value;
+    const detectorDir = dialogOcrDetectorPath.value.trim();
+    const recognizerDir = dialogOcrRecognizerPath.value.trim();
+    if (!detectorDir || !recognizerDir) {
+      setSettingsFeedback("error", "请选择 detector 与 recognizer 两个文件夹。");
+      return;
+    }
+    next.ocr.push({ name: entryName, detectorDir, recognizerDir });
+  } else if (mode === "font") {
+    entryName = dialogName.value.trim();
+    if (!entryName) {
+      setSettingsFeedback("error", "请输入字体名称。");
+      return;
+    }
+    const path = dialogFontPath.value.trim();
+    if (!path) {
+      setSettingsFeedback("error", "请选择字体文件。");
+      return;
+    }
+    next.fonts.push({ name: entryName, path });
+  } else {
+    return;
+  }
+  dialogSaving.value = true;
+  try {
+    await saveModelCatalog(next);
+    await loadModelCatalog();
+    if (mode === "translation") {
+      selectTranslationModel(dialogTranslationPath.value);
+    } else if (mode === "ocr") {
+      selectOcrModel(`${dialogOcrDetectorPath.value}|${dialogOcrRecognizerPath.value}`);
+    } else {
+      selectFontModel(dialogFontPath.value);
+    }
+    closeModelDialog();
+    setSettingsFeedback("success", `已配置「${entryName}」并选中，点击“保存设置”生效。`);
+  } catch (error) {
+    setSettingsFeedback("error", error instanceof Error ? error.message : "无法保存模型条目。");
+  } finally {
+    dialogSaving.value = false;
+  }
 }
 
 function requireInteger(value: number, min: number, max: number, label: string): number | null {
@@ -300,7 +540,7 @@ async function saveModelSettings() {
   const recognizerModelDir = modelRecognizerPath.value.trim();
   const hyModel = modelHyPath.value.trim();
   if (!detectorModelDir || !recognizerModelDir || !hyModel) {
-    setSettingsFeedback("error", "请选择完整的 PP-OCRv5 与 Hy-MT2 模型路径。");
+    setSettingsFeedback("error", "请选择完整的 PP-OCR 与 Hy-MT2 模型路径。");
     return;
   }
   const idleMinutes = requireInteger(idleUnloadMinutes.value ?? 0, 0, 1440, "模型空闲释放时间");
@@ -410,8 +650,8 @@ async function saveModelSettings() {
     setSettingsFeedback(
       "success",
       idleMinutes === 0
-        ? "模型设置已保存，下一次翻译会使用新的参数。自动释放已关闭。"
-        : "模型设置已保存，下一次翻译会使用新的参数。",
+        ? "设置已保存，下一次翻译会使用新的参数。自动释放已关闭。"
+        : "设置已保存，下一次翻译会使用新的参数。",
     );
   } catch (error) {
     setSettingsFeedback("error", error instanceof Error ? error.message : "无法保存模型设置。");
@@ -444,6 +684,7 @@ onMounted(() => {
   if (backendStatus.value) {
     applyBackendStatus(backendStatus.value);
   }
+  void loadModelCatalog();
   void refreshBackendStatus(false);
 });
 
@@ -452,126 +693,129 @@ onMounted(() => {
 <template>
   <section class="settings-page" aria-labelledby="settings-title">
     <div class="settings-grid">
-      <n-card class="settings-card" :bordered="false">
-        <div class="settings-card-heading">
-          <div>
-            <p class="panel-kicker">运行状态</p>
-            <h2>模型服务</h2>
-          </div>
-          <n-tag :type="settingsTagType" round size="small">{{ settingsStatusLabel }}</n-tag>
-        </div>
-        <p class="settings-card-copy">
-          这里显示后端实际读取到的设备与模型状态，不会伪造就绪结果。
-        </p>
-        <div class="settings-metrics">
-          <div>
-            <span>设备</span>
-            <strong>{{ backendStatus?.device ?? "未读取" }}</strong>
-          </div>
-          <div>
-            <span>翻译器</span>
-            <strong>{{ backendStatus?.translatorLoaded ? "已加载" : "按需加载" }}</strong>
-          </div>
-          <div>
-            <span>OCR 并发</span>
-            <strong>{{ backendStatus?.regionParallelism ?? regionParallelism }}</strong>
-          </div>
-          <div>
-            <span>Hy 批大小</span>
-            <strong>{{ backendStatus?.translationBatchSize ?? translationBatchSize }}</strong>
-          </div>
-        </div>
-        <n-alert v-if="settingsMessage" class="settings-alert" type="info" :show-icon="false">
-          {{ settingsMessage }}
-        </n-alert>
-      </n-card>
-
-      <n-card class="settings-card" :bordered="false">
-        <div class="settings-card-heading">
-          <div>
-            <p class="panel-kicker">翻译参数</p>
-            <h2>翻译默认值</h2>
-          </div>
-        </div>
-        <p class="settings-card-copy">目标语言、system 预设提示词和 user 预设提示词会作为下一次翻译请求的默认模型上下文。</p>
-        <div class="settings-field-grid">
-          <label class="settings-field">
-            <span>目标语言</span>
-            <n-input
-              v-model:value="targetLanguage"
-              maxlength="64"
-              placeholder="例如：Chinese"
-              aria-label="目标语言"
-            />
-          </label>
-          <label class="settings-field settings-field-wide settings-textarea">
-            <span>System 预设提示词</span>
-            <n-input
-              v-model:value="systemPrompt"
-              type="textarea"
-              maxlength="4096"
-              placeholder="可选：例如 Return concise JSON."
-              :autosize="{ minRows: 3, maxRows: 6 }"
-              aria-label="Hy system prompt"
-            />
-          </label>
-          <label class="settings-field settings-field-wide settings-textarea">
-            <span>User 预设提示词</span>
-            <n-input
-              v-model:value="userPrompt"
-              type="textarea"
-              maxlength="4096"
-              placeholder="可选：例如 Preserve product names and translate only visible text."
-              :autosize="{ minRows: 3, maxRows: 6 }"
-              aria-label="Hy user preset prompt"
-            />
-          </label>
-        </div>
-      </n-card>
 
 
       <n-card class="settings-card settings-card-wide" :bordered="false">
         <div class="settings-card-heading">
           <div>
             <p class="panel-kicker">模型资源</p>
-            <h2>本地模型路径</h2>
+            <h2>本地模型</h2>
           </div>
         </div>
         <p class="settings-card-copy">
-          选择后端实际使用的 PP-OCRv5 文件夹、Hy-MT2 GGUF 文件和可选字体；保存后立即应用，下一次翻译会按新路径加载。
+          下拉框选择翻译、OCR 模型与标注字体；点击"配置路径"可设置各类型对应的本地路径（持久化保存）。选择后点击"保存设置"生效。
         </p>
         <dl class="settings-path-list">
           <div>
-            <dt>PP-OCRv5 detector</dt>
-            <dd>
-              <span class="settings-path-value">{{ modelDetectorPath || "未读取" }}</span>
-              <n-button secondary size="small" @click="chooseModelPath('detector')">选择文件夹</n-button>
+            <dt>翻译模型（Hy-MT2）</dt>
+            <dd class="settings-model-select-row">
+              <n-select
+                :value="selectedTranslationValue"
+                :options="translationModelOptionsWithCurrent"
+                :placeholder="catalogLoaded ? '选择模型' : '加载模型列表…'"
+                size="small"
+                class="settings-model-select"
+                @update:value="selectTranslationModel"
+                aria-label="翻译模型"
+              />
+              <n-button secondary size="small" @click="openModelDialog('translation')">配置路径…</n-button>
+              <span class="settings-model-help">{{ modelHyPath || "未选择翻译模型" }}</span>
             </dd>
           </div>
           <div>
-            <dt>PP-OCRv5 recognizer</dt>
-            <dd>
-              <span class="settings-path-value">{{ modelRecognizerPath || "未读取" }}</span>
-              <n-button secondary size="small" @click="chooseModelPath('recognizer')">选择文件夹</n-button>
-            </dd>
-          </div>
-          <div>
-            <dt>Hy-MT2</dt>
-            <dd>
-              <span class="settings-path-value">{{ modelHyPath || "未读取" }}</span>
-              <n-button secondary size="small" @click="chooseModelPath('hy')">选择 GGUF</n-button>
+            <dt>OCR 模型（PP-OCR）</dt>
+            <dd class="settings-model-select-row">
+              <n-select
+                :value="selectedOcrValue"
+                :options="ocrModelOptions"
+                :placeholder="catalogLoaded ? '选择模型' : '加载模型列表…'"
+                size="small"
+                class="settings-model-select"
+                @update:value="selectOcrModel"
+                aria-label="OCR 模型"
+              />
+              <n-button secondary size="small" @click="openModelDialog('ocr')">配置路径…</n-button>
+              <span class="settings-model-help">
+                det: {{ modelDetectorPath || "未选择" }} · rec: {{ modelRecognizerPath || "未选择" }}
+              </span>
             </dd>
           </div>
           <div>
             <dt>标注字体</dt>
-            <dd>
-              <span class="settings-path-value">{{ modelFontPath || "系统自动匹配" }}</span>
-              <n-button secondary size="small" @click="chooseModelPath('font')">选择字体</n-button>
-              <n-button tertiary size="small" @click="useSystemFont">使用系统字体</n-button>
+            <dd class="settings-model-select-row">
+              <n-select
+                :value="selectedFontValue"
+                :options="fontModelOptions"
+                :placeholder="catalogLoaded ? '选择字体' : '加载字体列表…'"
+                size="small"
+                class="settings-model-select"
+                @update:value="selectFontModel"
+                aria-label="标注字体"
+              />
+              <n-button secondary size="small" @click="openModelDialog('font')">配置路径…</n-button>
+              <span class="settings-model-help">{{ modelFontPath || "系统自动匹配" }}</span>
             </dd>
           </div>
         </dl>
       </n-card>
+
+      <n-modal
+        v-model:show="modelDialogOpen"
+        preset="card"
+        :title="modelDialogTitle"
+        :mask-closable="true"
+        style="width: 520px; max-width: calc(100vw - 48px)"
+        class="model-path-dialog"
+      >
+        <div class="model-dialog-fields">
+          <template v-if="modelDialogMode === 'ocr'">
+            <n-select
+              v-model:value="dialogOcrType"
+              :options="OCR_MODEL_TYPES"
+              aria-label="OCR 模型类型"
+            />
+            <div class="model-dialog-path-row">
+              <span class="model-dialog-path-value" :title="dialogOcrDetectorPath">{{ dialogOcrDetectorPath || "未选择" }}</span>
+              <n-button secondary size="small" @click="pickDialogOcrDetectorPath">选择 detector 文件夹</n-button>
+            </div>
+            <div class="model-dialog-path-row">
+              <span class="model-dialog-path-value" :title="dialogOcrRecognizerPath">{{ dialogOcrRecognizerPath || "未选择" }}</span>
+              <n-button secondary size="small" @click="pickDialogOcrRecognizerPath">选择 recognizer 文件夹</n-button>
+            </div>
+          </template>
+          <template v-else-if="modelDialogMode === 'translation'">
+            <n-select
+              :value="translationDialogPath || null"
+              :options="translationDialogOptions"
+              placeholder="选择已发现或注册的 GGUF 模型"
+              clearable
+              @update:value="selectDialogTranslationModel"
+              aria-label="翻译模型文件"
+            />
+            <div class="model-dialog-path-row">
+              <span class="model-dialog-path-value" :title="dialogTranslationPath">{{ dialogTranslationPath || "未选择" }}</span>
+              <n-button secondary size="small" @click="pickDialogTranslationPath">选择 GGUF 文件</n-button>
+            </div>
+          </template>
+          <template v-else>
+            <n-input
+              v-model:value="dialogName"
+              maxlength="64"
+              placeholder="字体名称（用于下拉框显示）"
+            />
+            <div class="model-dialog-path-row">
+              <span class="model-dialog-path-value" :title="dialogFontPath">{{ dialogFontPath || "未选择" }}</span>
+              <n-button secondary size="small" @click="pickDialogFontPath">选择字体文件</n-button>
+            </div>
+          </template>
+        </div>
+        <template #footer>
+          <div class="model-dialog-footer">
+            <n-button secondary size="small" :disabled="dialogSaving" @click="closeModelDialog">取消</n-button>
+            <n-button type="primary" size="small" :loading="dialogSaving" @click="saveModelDialog">注册并选择</n-button>
+          </div>
+        </template>
+      </n-modal>
 
       <n-card class="settings-card settings-card-wide" :bordered="false">
         <div class="settings-card-heading">
@@ -618,6 +862,79 @@ onMounted(() => {
               :max="1440"
               :step="5"
               aria-label="模型空闲释放时间"
+            />
+          </label>
+        </div>
+      </n-card>
+      <n-card class="settings-card" :bordered="false">
+        <div class="settings-card-heading">
+          <div>
+            <p class="panel-kicker">运行状态</p>
+            <h2>模型服务</h2>
+          </div>
+          <n-tag :type="settingsTagType" round size="small">{{ settingsStatusLabel }}</n-tag>
+        </div>
+        <p class="settings-card-copy">
+          这里显示后端实际读取到的设备与模型状态，不会伪造就绪结果。
+        </p>
+        <div class="settings-metrics">
+          <div>
+            <span>设备</span>
+            <strong>{{ backendStatus?.device ?? "未读取" }}</strong>
+          </div>
+          <div>
+            <span>翻译器</span>
+            <strong>{{ backendStatus?.translatorLoaded ? "已加载" : "按需加载" }}</strong>
+          </div>
+          <div>
+            <span>OCR 并发</span>
+            <strong>{{ backendStatus?.regionParallelism ?? regionParallelism }}</strong>
+          </div>
+          <div>
+            <span>Hy 批大小</span>
+            <strong>{{ backendStatus?.translationBatchSize ?? translationBatchSize }}</strong>
+          </div>
+        </div>
+      </n-card>
+
+      <n-card class="settings-card" :bordered="false">
+        <div class="settings-card-heading">
+          <div>
+            <p class="panel-kicker">翻译参数</p>
+            <h2>翻译默认值</h2>
+          </div>
+        </div>
+        <p class="settings-card-copy">目标语言、system 预设提示词和 user 预设提示词会作为下一次翻译请求的默认模型上下文。</p>
+        <div class="settings-field-grid">
+          <label class="settings-field">
+            <span>目标语言</span>
+            <n-input
+              v-model:value="targetLanguage"
+              maxlength="64"
+              placeholder="例如：Chinese"
+              aria-label="目标语言"
+            />
+          </label>
+          <label class="settings-field settings-field-wide settings-textarea">
+            <span>System 预设提示词</span>
+            <n-input
+              v-model:value="systemPrompt"
+              type="textarea"
+              maxlength="4096"
+              placeholder="可选：例如 Return concise JSON."
+              :autosize="{ minRows: 3, maxRows: 6 }"
+              aria-label="Hy system prompt"
+            />
+          </label>
+          <label class="settings-field settings-field-wide settings-textarea">
+            <span>User 预设提示词</span>
+            <n-input
+              v-model:value="userPrompt"
+              type="textarea"
+              maxlength="4096"
+              placeholder="可选：例如 Preserve product names and translate only visible text."
+              :autosize="{ minRows: 3, maxRows: 6 }"
+              aria-label="Hy user preset prompt"
             />
           </label>
         </div>
@@ -761,10 +1078,11 @@ onMounted(() => {
       </n-card>
 
       <div class="settings-card-actions settings-page-actions settings-card-wide">
+        <n-alert v-if="settingsMessage" class="settings-actions-feedback" :type="settingsMessageType" :show-icon="false">
+          {{ settingsMessage }}
+        </n-alert>
         <n-button secondary :loading="settingsLoading" @click="refreshBackendStatus()">刷新状态</n-button>
-        <n-button type="primary" :loading="settingsLoading" @click="saveModelSettings">
-          保存模型设置
-        </n-button>
+        <n-button type="primary" :loading="settingsLoading" @click="saveModelSettings">保存设置</n-button>
       </div>
     </div>
   </section>
