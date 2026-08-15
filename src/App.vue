@@ -27,6 +27,7 @@ import {
   loadPersistedTargetLanguage,
   modelRuntimeStatus,
 } from "./services/workspace-settings";
+import { stopLiveSession } from "./services/live-translation-provider";
 import LiveSelectionWindow from "./components/LiveSelectionWindow.vue";
 import LiveSubtitleOverlay from "./components/LiveSubtitleOverlay.vue";
 
@@ -328,6 +329,8 @@ const isMainWorkspaceWindow = !isLiveSelectorWindow && !isLiveOverlayWindow;
 const isWindowMaximized = ref(false);
 let windowStateUnlisten: (() => void) | undefined;
 let windowStateListenerActive = true;
+let windowCloseUnlisten: (() => void) | undefined;
+let closeCleanupInFlight = false;
 
 const settingsStatusLabel = computed(() => {
   if (!backendStatus.value) {
@@ -453,6 +456,35 @@ async function bindWindowStateListener() {
   }
 }
 
+async function bindMainWindowCloseListener(): Promise<void> {
+  if (!appWindow || !isMainWorkspaceWindow) {
+    return;
+  }
+  try {
+    const unlisten = await appWindow.onCloseRequested((event) => {
+      event.preventDefault();
+      if (closeCleanupInFlight) {
+        return;
+      }
+      closeCleanupInFlight = true;
+      // Let the close event return first so backend window cleanup can use
+      // the Tauri main thread before destroying the main window.
+      void stopLiveSession()
+        .catch(() => undefined)
+        .finally(() => {
+          void appWindow.destroy().catch(() => undefined);
+        });
+    });
+    if (!windowStateListenerActive) {
+      unlisten();
+      return;
+    }
+    windowCloseUnlisten = unlisten;
+  } catch {
+    // Window close events are optional in the browser preview.
+  }
+}
+
 function minimizeWindow() {
   if (appWindow) {
     void appWindow.minimize().catch(() => undefined);
@@ -523,6 +555,7 @@ onMounted(() => {
   loadPersistedTargetLanguage();
   void syncWindowState();
   void bindWindowStateListener();
+  void bindMainWindowCloseListener();
   if (isDesktopRuntime) {
     void fetchSharedBackendStatus().catch(() => undefined);
     void fetchSharedModelRuntimeStatus().catch(() => undefined);
@@ -533,6 +566,8 @@ onBeforeUnmount(() => {
   windowStateListenerActive = false;
   windowStateUnlisten?.();
   windowStateUnlisten = undefined;
+  windowCloseUnlisten?.();
+  windowCloseUnlisten = undefined;
 });
 </script>
 
