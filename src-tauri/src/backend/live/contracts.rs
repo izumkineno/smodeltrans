@@ -118,6 +118,8 @@ impl LiveOverlaySizing {
 pub(crate) struct LiveOverlayContentSize {
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) minimum_width: u32,
+    pub(crate) minimum_height: u32,
 }
 
 impl Default for LiveOverlayContentSize {
@@ -125,6 +127,8 @@ impl Default for LiveOverlayContentSize {
         Self {
             width: default_live_overlay_manual_width(),
             height: default_live_overlay_manual_height(),
+            minimum_width: MIN_LIVE_OVERLAY_MANUAL_WIDTH,
+            minimum_height: MIN_LIVE_OVERLAY_MANUAL_HEIGHT,
         }
     }
 }
@@ -136,6 +140,12 @@ impl LiveOverlayContentSize {
         }
         if self.height == 0 || self.height > MAX_LIVE_OVERLAY_CONTENT_DIMENSION {
             return Err("字幕窗口测量高度无效");
+        }
+        if self.minimum_width == 0 || self.minimum_width > MAX_LIVE_OVERLAY_CONTENT_DIMENSION {
+            return Err("字幕窗口最小显示宽度无效");
+        }
+        if self.minimum_height == 0 || self.minimum_height > MAX_LIVE_OVERLAY_CONTENT_DIMENSION {
+            return Err("字幕窗口最小显示高度无效");
         }
         Ok(self)
     }
@@ -638,6 +648,18 @@ impl NormalizedRoi {
         })
     }
 }
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+pub(crate) struct LiveOverlayPosition {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct LiveOverlayPositionOffset {
+    pub(super) x: i32,
+    pub(super) y: i32,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct LiveConfig {
     pub(super) roi: NormalizedRoi,
@@ -647,6 +669,9 @@ pub(super) struct LiveConfig {
     pub(super) target_language: String,
     pub(super) overlay_settings: LiveOverlaySettings,
     pub(super) overlay_content_size: LiveOverlayContentSize,
+    pub(super) overlay_position_locked: bool,
+    pub(super) overlay_position_offset: Option<LiveOverlayPositionOffset>,
+    pub(super) overlay_resize_locked: bool,
     pub(super) recognition_settings: LiveRecognitionSettings,
     pub(super) translation_settings: LiveTranslationSettings,
 }

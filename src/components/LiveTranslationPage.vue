@@ -21,7 +21,7 @@ import {
   LIVE_MEMORY_TURNS_MIN,
   LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS,
   beginLiveRoiUpdate,
-  beginLiveSelection,
+  startLiveSession,
   cancelLiveSelection,
   getLiveSessionStatus,
   listCaptureWindows,
@@ -149,7 +149,7 @@ const liveTriggerKeyLabels: Record<string, string> = {
 
 const liveStatus = ref<LiveSessionStatus>({
   state: "idle",
-  message: isDesktopRuntime ? "请选择目标窗口并框选字幕区域。" : "实时翻译仅在 Windows 桌面端可用。",
+  message: isDesktopRuntime ? "请选择目标窗口并开始实时翻译。" : "实时翻译仅在 Windows 桌面端可用。",
   latestRevision: 0,
   metrics: emptyMetrics(),
 });
@@ -386,7 +386,7 @@ async function refreshWindows(notifyOnError = true): Promise<void> {
   }
 }
 
-async function startSelection(): Promise<void> {
+async function startSession(): Promise<void> {
   const targetId = selectedTargetId.value;
   const language = targetLanguage.value.trim();
   if (!canStart.value || !targetId || !language) {
@@ -412,7 +412,7 @@ async function startSelection(): Promise<void> {
       showWorkspaceToast(toast, "warning", translationPersistenceError);
     }
     applyStatus(
-      await beginLiveSelection(
+      await startLiveSession(
         targetId,
         language,
         liveOverlaySettings.value,
@@ -571,7 +571,7 @@ onBeforeUnmount(cleanupPage);
       <div>
         <p class="panel-kicker">Windows Graphics Capture</p>
         <h2 id="live-translation-page-title">窗口字幕实时翻译</h2>
-        <p>锁定一个窗口与一个字幕区域，在本地持续完成 OCR 和翻译。</p>
+        <p>选择一个窗口，默认翻译整个目标客户区，可在字幕工具栏中手动框选区域。</p>
       </div>
       <n-tag :type="stateTagType" round>{{ stateLabel }}</n-tag>
     </header>
@@ -587,7 +587,7 @@ onBeforeUnmount(cleanupPage);
             <span class="step-index">01</span>
             <div>
               <h3>捕获目标</h3>
-              <p>选择一个窗口；最小化窗口会在开始选择时自动恢复。</p>
+              <p>选择一个窗口；开始后默认捕获整个客户区，最小化窗口会自动恢复。</p>
             </div>
           </div>
           <n-button
@@ -616,7 +616,7 @@ onBeforeUnmount(cleanupPage);
           <n-empty
             v-if="isDesktopRuntime && windowsLoaded && captureWindows.length === 0"
             size="small"
-            description="没有找到可用于框选的窗口。请打开目标程序，然后刷新列表。"
+            description="没有找到可用于捕获的窗口。请打开目标程序，然后刷新列表。"
           />
           <label class="live-field">
             <span>目标语言</span>
@@ -647,8 +647,8 @@ onBeforeUnmount(cleanupPage);
           当前 server recognizer 不覆盖韩文；P1 建议用于中文、英文、日文与常见拉丁字符字幕。目标语言只控制 Hy-MT2 的翻译输出。
         </n-alert>
 
-        <n-button type="primary" :loading="activeAction === 'start'" :disabled="!canStart" @click="startSelection">
-          开始选择字幕区域
+        <n-button type="primary" :loading="activeAction === 'start'" :disabled="!canStart" @click="startSession">
+          开始实时翻译
         </n-button>
       </n-card>
 
@@ -658,7 +658,7 @@ onBeforeUnmount(cleanupPage);
             <span class="step-index">02</span>
             <div>
               <h3>会话控制</h3>
-              <p>选区确认后，字幕浮层会按实时显示设置创建并跟随目标窗口。</p>
+              <p>启动后默认翻译整个目标客户区；可在字幕工具栏或此处重新框选区域。</p>
             </div>
           </div>
           <n-spin v-if="liveStatus.state === 'warming' || liveStatus.state === 'stopping'" size="small" />

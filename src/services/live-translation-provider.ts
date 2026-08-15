@@ -84,6 +84,12 @@ export type LiveOverlaySizing = Pick<
 export interface LiveOverlayContentSize {
   width: number;
   height: number;
+  minimumWidth: number;
+  minimumHeight: number;
+}
+export interface LiveOverlayPosition {
+  x: number;
+  y: number;
 }
 
 export type LiveRecognitionMode = "automatic" | "key_trigger";
@@ -191,7 +197,7 @@ export function listCaptureWindows(invokeFn: InvokeFn = invoke): Promise<Capture
   return invokeFn<CaptureWindowInfo[]>("list_capture_windows");
 }
 
-export function beginLiveSelection(
+export function startLiveSession(
   targetId: string,
   targetLanguage: string,
   overlaySettings: LiveOverlaySettings,
@@ -199,7 +205,7 @@ export function beginLiveSelection(
   translationSettings: LiveTranslationSettings,
   invokeFn: InvokeFn = invoke,
 ): Promise<LiveSessionStatus> {
-  return invokeFn<LiveSessionStatus>("begin_live_selection", {
+  return invokeFn<LiveSessionStatus>("start_live_session", {
     targetId,
     targetLanguage,
     overlaySettings,
@@ -272,6 +278,34 @@ export function updateLiveOverlayLayout(
   invokeFn: InvokeFn = invoke,
 ): Promise<void> {
   return invokeFn<void>("update_live_overlay_layout", { sessionId, sizing, contentSize });
+}
+export function beginLiveOverlayDrag(
+  sessionId: string,
+  invokeFn: InvokeFn = invoke,
+): Promise<void> {
+  return invokeFn<void>("begin_live_overlay_drag", { sessionId });
+}
+export function beginLiveOverlayResize(
+  sessionId: string,
+  invokeFn: InvokeFn = invoke,
+): Promise<void> {
+  return invokeFn<void>("begin_live_overlay_resize", { sessionId });
+}
+
+export function finishLiveOverlayResize(
+  sessionId: string,
+  invokeFn: InvokeFn = invoke,
+): Promise<void> {
+  return invokeFn<void>("finish_live_overlay_resize", { sessionId });
+}
+
+
+export function updateLiveOverlayPosition(
+  sessionId: string,
+  position: LiveOverlayPosition,
+  invokeFn: InvokeFn = invoke,
+): Promise<void> {
+  return invokeFn<void>("update_live_overlay_position", { sessionId, position });
 }
 
 export function listenLiveStatus(

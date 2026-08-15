@@ -6,10 +6,11 @@ use self::{
     contracts::{
         CaptureWindowInfo, LiveConfig, LiveDebugOutcome, LiveDebugRecord, LiveDebugStage,
         LiveMetrics, LiveOverlayAttachment, LiveOverlayContentSize, LiveOverlayMode,
-        LiveOverlaySettings, LiveOverlaySizing, LiveRecognitionMode, LiveRecognitionSettings,
-        LiveRecognitionTrigger, LiveRoi, LiveSessionState, LiveSessionStatus, LiveSubtitle,
-        LiveSubtitleRegion, LiveSubtitleRegionBounds, LiveTranslationSettings,
-        NormalizedRoi, MIN_LIVE_OVERLAY_MANUAL_HEIGHT, MIN_LIVE_OVERLAY_MANUAL_WIDTH,
+        LiveOverlayPosition, LiveOverlayPositionOffset, LiveOverlaySettings, LiveOverlaySizing,
+        LiveRecognitionMode, LiveRecognitionSettings, LiveRecognitionTrigger, LiveRoi,
+        LiveSessionState, LiveSessionStatus, LiveSubtitle, LiveSubtitleRegion,
+        LiveSubtitleRegionBounds, LiveTranslationSettings, MIN_LIVE_OVERLAY_MANUAL_HEIGHT,
+        MIN_LIVE_OVERLAY_MANUAL_WIDTH, NormalizedRoi,
     },
     scheduler::{
         LatestFrameSlot, OwnedFrame, StabilityScheduler, finalize_live_regions,
@@ -140,7 +141,7 @@ impl LiveSessionManager {
         Ok(())
     }
 
-    fn begin_selection(
+    fn start_session(
         &self,
         app: &tauri::AppHandle,
         target_id: String,
@@ -166,20 +167,30 @@ impl LiveSessionManager {
         target.width = geometry.width;
         target.height = geometry.height;
         target.is_minimized = false;
+        let display_roi = LiveRoi {
+            x: 0,
+            y: 0,
+            width: geometry.width,
+            height: geometry.height,
+            client_width: geometry.width,
+            client_height: geometry.height,
+        };
+        let roi = display_roi
+            .normalized()
+            .map_err(BackendFailure::arguments)?;
         trace_live(format_args!(
-            "selector request target={target_id} language={target_language} mode={:?} trigger={} stability_wait_ms={}",
+            "session start target={target_id} language={target_language} mode={:?} trigger={} stability_wait_ms={} roi={}x{}",
             recognition_settings.mode,
             recognition_settings.trigger_key,
-            recognition_settings.stability_wait_ms
+            recognition_settings.stability_wait_ms,
+            geometry.width,
+            geometry.height,
         ));
         if self.backend.runs.is_busy()? {
             return Err(BackendFailure::arguments(
                 "请等待当前图片或文本任务结束后再启动实时翻译",
             ));
         }
-        trace_live(format_args!(
-            "target window restored and activated target={target_id}"
-        ));
         if self
             .backend
             .live_active
@@ -210,25 +221,20 @@ impl LiveSessionManager {
             inner.selection_previous_state = None;
             inner.overlay_content_size = LiveOverlayContentSize::default();
         }
-        trace_live(format_args!(
-            "selector status published session={session_id}; dispatching selector window"
-        ));
-        let status = LiveSessionStatus {
-            state: LiveSessionState::Selecting,
-            session_id: Some(session_id),
-            target: Some(target),
-            roi: None,
-            message: "请在目标窗口上框选字幕区域。".to_owned(),
-            latest_revision: 0,
-            metrics: LiveMetrics::default(),
-        };
-        replace_status(&self.status, app, status.clone());
-        if let Err(error) = create_selector_window(app, geometry) {
-            trace_live(format_args!("selector setup failed: {error}"));
-            self.reset(app);
-            return Err(error);
-        }
-        Ok(status)
+        replace_status(
+            &self.status,
+            app,
+            LiveSessionStatus {
+                state: LiveSessionState::Warming,
+                session_id: Some(session_id.clone()),
+                target: Some(target.clone()),
+                roi: Some(display_roi),
+                message: "正在准备 PP-OCR、Hy-MT2 模型与窗口捕获。".to_owned(),
+                latest_revision: 0,
+                metrics: LiveMetrics::default(),
+            },
+        );
+        self.start_runtime(app, &session_id, target, roi, display_roi, geometry)
     }
 
     fn update_overlay_layout(
@@ -239,13 +245,11 @@ impl LiveSessionManager {
         content_size: LiveOverlayContentSize,
     ) -> Result<(), BackendFailure> {
         let sizing = sizing.validate().map_err(BackendFailure::arguments)?;
-        let content_size = content_size
-            .validate()
-            .map_err(BackendFailure::arguments)?;
+        let content_size = content_size.validate().map_err(BackendFailure::arguments)?;
         let current = self.current_status()?;
         require_session(&current, session_id)?;
         let target_id = current.target.as_ref().map(|target| target.id.clone());
-        let (settings, content_size, has_runtime) = {
+        let (settings, content_size, position_locked, position_offset, resize_locked, has_runtime) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -269,17 +273,165 @@ impl LiveSessionManager {
                     .map_err(|_| BackendFailure::internal("实时配置锁已损坏"))?;
                 config.overlay_settings = settings;
                 config.overlay_content_size = content_size;
-                (settings, content_size, true)
+                (
+                    settings,
+                    content_size,
+                    config.overlay_position_locked,
+                    config.overlay_position_offset,
+                    config.overlay_resize_locked,
+                    true,
+                )
             } else {
-                (settings, content_size, false)
+                (settings, content_size, false, None, false, false)
             }
         };
         if has_runtime {
             let target_id =
                 target_id.ok_or_else(|| BackendFailure::internal("实时会话缺少目标窗口"))?;
             let geometry = platform::target_geometry(&target_id)?;
-            position_overlay(app, geometry, settings, content_size);
+            position_overlay(
+                app,
+                geometry,
+                settings,
+                content_size,
+                position_locked,
+                position_offset,
+                resize_locked,
+            );
         }
+        Ok(())
+    }
+    fn begin_overlay_drag(&self, session_id: &str) -> Result<(), BackendFailure> {
+        let current = self.current_status()?;
+        require_session(&current, session_id)?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+        if inner.session_id.as_deref() != Some(session_id) {
+            return Err(BackendFailure::arguments("实时会话标识已过期"));
+        }
+        let runtime = inner
+            .runtime
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("实时运行时已丢失"))?;
+        let mut config = runtime
+            .config
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时配置锁已损坏"))?;
+        config.overlay_position_locked = true;
+        config.overlay_position_offset = None;
+        Ok(())
+    }
+
+    fn update_overlay_position(
+        &self,
+        session_id: &str,
+        position: LiveOverlayPosition,
+    ) -> Result<(), BackendFailure> {
+        let current = self.current_status()?;
+        require_session(&current, session_id)?;
+        let target_id = current
+            .target
+            .as_ref()
+            .map(|target| target.id.clone())
+            .ok_or_else(|| BackendFailure::internal("实时会话缺少目标窗口"))?;
+        let geometry = platform::target_geometry(&target_id)?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+        if inner.session_id.as_deref() != Some(session_id) {
+            return Err(BackendFailure::arguments("实时会话标识已过期"));
+        }
+        let runtime = inner
+            .runtime
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("实时运行时已丢失"))?;
+        let mut config = runtime
+            .config
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时配置锁已损坏"))?;
+        let (default_x, default_y, _, _) = overlay_bounds(
+            geometry,
+            config.overlay_settings,
+            config.overlay_content_size,
+        );
+        config.overlay_position_locked = true;
+        config.overlay_position_offset = Some(LiveOverlayPositionOffset {
+            x: position.x.saturating_sub(default_x),
+            y: position.y.saturating_sub(default_y),
+        });
+        Ok(())
+    }
+    fn begin_overlay_resize(&self, session_id: &str) -> Result<(), BackendFailure> {
+        let current = self.current_status()?;
+        require_session(&current, session_id)?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+        if inner.session_id.as_deref() != Some(session_id) {
+            return Err(BackendFailure::arguments("实时会话标识已过期"));
+        }
+        let runtime = inner
+            .runtime
+            .as_mut()
+            .ok_or_else(|| BackendFailure::internal("实时运行时已丢失"))?;
+        let mut config = runtime
+            .config
+            .lock()
+            .map_err(|_| BackendFailure::internal("实时配置锁已损坏"))?;
+        config.overlay_resize_locked = true;
+        Ok(())
+    }
+
+    fn finish_overlay_resize(
+        &self,
+        app: &tauri::AppHandle,
+        session_id: &str,
+    ) -> Result<(), BackendFailure> {
+        let current = self.current_status()?;
+        require_session(&current, session_id)?;
+        let target_id = current
+            .target
+            .as_ref()
+            .map(|target| target.id.clone())
+            .ok_or_else(|| BackendFailure::internal("实时会话缺少目标窗口"))?;
+        let (settings, content_size, position_locked, position_offset) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+            if inner.session_id.as_deref() != Some(session_id) {
+                return Err(BackendFailure::arguments("实时会话标识已过期"));
+            }
+            let runtime = inner
+                .runtime
+                .as_mut()
+                .ok_or_else(|| BackendFailure::internal("实时运行时已丢失"))?;
+            let mut config = runtime
+                .config
+                .lock()
+                .map_err(|_| BackendFailure::internal("实时配置锁已损坏"))?;
+            config.overlay_resize_locked = false;
+            (
+                config.overlay_settings,
+                config.overlay_content_size,
+                config.overlay_position_locked,
+                config.overlay_position_offset,
+            )
+        };
+        let geometry = platform::target_geometry(&target_id)?;
+        position_overlay(
+            app,
+            geometry,
+            settings,
+            content_size,
+            position_locked,
+            position_offset,
+            false,
+        );
         Ok(())
     }
 
@@ -296,66 +448,82 @@ impl LiveSessionManager {
         if current.state != LiveSessionState::Selecting {
             return Err(BackendFailure::arguments("当前会话不在区域选择状态"));
         }
-        let mut target = current
+        let target_id = current
             .target
-            .clone()
+            .as_ref()
+            .map(|target| target.id.clone())
             .ok_or_else(|| BackendFailure::internal("实时会话缺少目标窗口"))?;
-        platform::activate_target_window(&target.id)?;
-        let geometry = platform::target_geometry(&target.id)?;
-        target.width = geometry.width;
-        target.height = geometry.height;
-        target.is_minimized = false;
+        platform::activate_target_window(&target_id)?;
+        let geometry = platform::target_geometry(&target_id)?;
         let display_roi = normalized
             .to_physical(geometry.width, geometry.height)
             .ok_or_else(|| BackendFailure::arguments("ROI 无法映射到当前目标客户区"))?;
-        let has_runtime = self
-            .inner
-            .lock()
-            .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?
-            .runtime
-            .is_some();
-        if has_runtime {
-            let (state, overlay_settings, overlay_content_size) = {
-                let mut inner = self
-                    .inner
-                    .lock()
-                    .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
-                let state = inner
-                    .selection_previous_state
-                    .take()
-                    .unwrap_or(LiveSessionState::Running);
-                let runtime = inner
-                    .runtime
-                    .as_mut()
-                    .ok_or_else(|| BackendFailure::internal("实时运行时已丢失"))?;
-                let mut config = runtime
-                    .config
-                    .lock()
-                    .map_err(|_| BackendFailure::internal("实时 ROI 锁已损坏"))?;
-                config.roi = normalized;
-                config.client_width = display_roi.client_width;
-                config.client_height = display_roi.client_height;
-                config.roi_version = config.roi_version.saturating_add(1);
-                runtime
-                    .paused
-                    .store(state == LiveSessionState::Paused, Ordering::SeqCst);
-                runtime.latest.clear();
-                runtime.latest.wake();
-                (state, config.overlay_settings, config.overlay_content_size)
+        let (
+            state,
+            overlay_settings,
+            overlay_content_size,
+            overlay_position_locked,
+            overlay_position_offset,
+            overlay_resize_locked,
+        ) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+            let state = inner
+                .selection_previous_state
+                .take()
+                .ok_or_else(|| BackendFailure::internal("实时会话缺少重新选区前状态"))?;
+            let runtime = inner
+                .runtime
+                .as_mut()
+                .ok_or_else(|| BackendFailure::internal("实时运行时已丢失"))?;
+            let mut config = runtime
+                .config
+                .lock()
+                .map_err(|_| BackendFailure::internal("实时 ROI 锁已损坏"))?;
+            config.roi = normalized;
+            config.client_width = display_roi.client_width;
+            config.client_height = display_roi.client_height;
+            config.roi_version = config.roi_version.saturating_add(1);
+            runtime
+                .paused
+                .store(state == LiveSessionState::Paused, Ordering::SeqCst);
+            runtime.latest.clear();
+            runtime.latest.wake();
+            (
+                state,
+                config.overlay_settings,
+                config.overlay_content_size,
+                config.overlay_position_locked,
+                config.overlay_position_offset,
+                config.overlay_resize_locked,
+            )
+        };
+        close_window(app, SELECTOR_LABEL);
+        position_overlay(
+            app,
+            geometry,
+            overlay_settings,
+            overlay_content_size,
+            overlay_position_locked,
+            overlay_position_offset,
+            overlay_resize_locked,
+        );
+        update_status(&self.status, app, |status| {
+            status.state = state;
+            status.roi = Some(display_roi);
+            if let Some(target) = status.target.as_mut() {
+                target.width = geometry.width;
+                target.height = geometry.height;
+                target.is_minimized = false;
+            }
+            status.message = if state == LiveSessionState::Paused {
+                "已更新翻译区域，会话保持暂停。".to_owned()
+            } else {
+                "已更新翻译区域，实时翻译继续运行。".to_owned()
             };
-            close_window(app, SELECTOR_LABEL);
-            position_overlay(app, geometry, overlay_settings, overlay_content_size);
-            return update_status(&self.status, app, |status| {
-                status.state = state;
-                status.roi = Some(display_roi);
-                status.message = if state == LiveSessionState::Paused {
-                    "已更新字幕区域，会话保持暂停。".to_owned()
-                } else {
-                    "已更新字幕区域，实时翻译继续运行。".to_owned()
-                };
-            });
-        }
-        self.start_runtime(app, session_id, target, normalized, display_roi, geometry)
+        })
     }
 
     fn start_runtime(
@@ -397,13 +565,22 @@ impl LiveSessionManager {
                     .ok_or_else(|| BackendFailure::internal("实时会话缺少翻译提示设置"))?,
             )
         };
-        create_overlay_window(
+        if let Err(error) = create_overlay_window(
             app,
             session_id,
             geometry,
             overlay_settings,
             overlay_content_size,
-        )?;
+        ) {
+            self.fail(
+                app,
+                session_id,
+                target.clone(),
+                display_roi,
+                error.message(),
+            );
+            return Err(error);
+        }
         let config = Arc::new(Mutex::new(LiveConfig {
             roi,
             roi_version: 1,
@@ -412,6 +589,9 @@ impl LiveSessionManager {
             target_language,
             overlay_settings,
             overlay_content_size,
+            overlay_position_locked: false,
+            overlay_position_offset: None,
+            overlay_resize_locked: false,
             recognition_settings,
             translation_settings,
         }));
@@ -470,13 +650,7 @@ impl LiveSessionManager {
             });
         }
         close_window(app, SELECTOR_LABEL);
-        update_status(&self.status, app, |status| {
-            status.state = LiveSessionState::Warming;
-            status.target = Some(target);
-            status.roi = Some(display_roi);
-            status.message =
-                "正在连接 Windows Graphics Capture，并预热 PP-OCR 与 Hy-MT2 模型。".to_owned();
-        })
+        self.current_status()
     }
 
     fn begin_roi_update(
@@ -544,19 +718,18 @@ impl LiveSessionManager {
             let restored = inner
                 .selection_previous_state
                 .take()
-                .unwrap_or(LiveSessionState::Idle);
-            if let Some(runtime) = inner.runtime.as_mut() {
-                runtime
-                    .paused
-                    .store(restored == LiveSessionState::Paused, Ordering::SeqCst);
-                runtime.latest.wake();
-            }
+                .ok_or_else(|| BackendFailure::internal("实时会话缺少重新选区前状态"))?;
+            let runtime = inner
+                .runtime
+                .as_mut()
+                .ok_or_else(|| BackendFailure::internal("实时运行时已丢失"))?;
+            runtime
+                .paused
+                .store(restored == LiveSessionState::Paused, Ordering::SeqCst);
+            runtime.latest.wake();
             restored
         };
         close_window(app, SELECTOR_LABEL);
-        if restored == LiveSessionState::Idle {
-            return Ok(self.reset(app));
-        }
         update_status(&self.status, app, |status| {
             status.state = restored;
             status.message = if restored == LiveSessionState::Paused {
@@ -787,6 +960,13 @@ impl SessionLoop {
                 return;
             }
         };
+        let _ = update_status(&self.status, &self.app, |status| {
+            if status.state == LiveSessionState::Warming {
+                status.state = LiveSessionState::Running;
+                status.message = "模型准备完成，等待翻译".to_owned();
+            }
+            status.metrics = self.metrics_snapshot();
+        });
         self.run_capture(capture);
     }
 
@@ -991,11 +1171,21 @@ impl SessionLoop {
             if last_geometry_sync.elapsed() >= Duration::from_millis(500) {
                 match platform::target_geometry(&self.target_id) {
                     Ok(geometry) => {
+                        let (
+                            overlay_settings,
+                            overlay_content_size,
+                            overlay_position_locked,
+                            overlay_position_offset,
+                            overlay_resize_locked,
+                        ) = self.config_overlay_layout();
                         position_overlay(
                             &self.app,
                             geometry,
-                            config.overlay_settings,
-                            config.overlay_content_size,
+                            overlay_settings,
+                            overlay_content_size,
+                            overlay_position_locked,
+                            overlay_position_offset,
+                            overlay_resize_locked,
                         );
                         if geometry.width != config.client_width
                             || geometry.height != config.client_height
@@ -1106,10 +1296,6 @@ impl SessionLoop {
                 continue;
             }
             let _ = update_status(&self.status, &self.app, |status| {
-                if status.state == LiveSessionState::Warming {
-                    status.state = LiveSessionState::Running;
-                    status.message = "实时翻译正在运行。".to_owned();
-                }
                 status.metrics = self.metrics_snapshot();
             });
             let confirmed_text = recognized.source_text.clone();
@@ -1372,8 +1558,22 @@ impl SessionLoop {
             self.latest.clear();
             self.latest.wake();
         }
-        let (overlay_settings, overlay_content_size) = self.config_overlay_layout();
-        position_overlay(&self.app, geometry, overlay_settings, overlay_content_size);
+        let (
+            overlay_settings,
+            overlay_content_size,
+            overlay_position_locked,
+            overlay_position_offset,
+            overlay_resize_locked,
+        ) = self.config_overlay_layout();
+        position_overlay(
+            &self.app,
+            geometry,
+            overlay_settings,
+            overlay_content_size,
+            overlay_position_locked,
+            overlay_position_offset,
+            overlay_resize_locked,
+        );
         set_overlay_visible(&self.app, true);
         let _ = update_status(&self.status, &self.app, |status| {
             if auto_resume {
@@ -1391,11 +1591,26 @@ impl SessionLoop {
         });
         Ok(())
     }
-
-    fn config_overlay_layout(&self) -> (LiveOverlaySettings, LiveOverlayContentSize) {
+    fn config_overlay_layout(
+        &self,
+    ) -> (
+        LiveOverlaySettings,
+        LiveOverlayContentSize,
+        bool,
+        Option<LiveOverlayPositionOffset>,
+        bool,
+    ) {
         self.config
             .lock()
-            .map(|config| (config.overlay_settings, config.overlay_content_size))
+            .map(|config| {
+                (
+                    config.overlay_settings,
+                    config.overlay_content_size,
+                    config.overlay_position_locked,
+                    config.overlay_position_offset,
+                    config.overlay_resize_locked,
+                )
+            })
             .unwrap_or_default()
     }
 
@@ -1829,8 +2044,9 @@ fn overlay_bounds(
             MIN_LIVE_OVERLAY_MANUAL_WIDTH,
             geometry.width,
         )
+        .max(content_size.minimum_width)
     } else {
-        settings.manual_width
+        settings.manual_width.max(content_size.minimum_width)
     };
     let height = if settings.auto_height {
         automatic_overlay_dimension(
@@ -1838,8 +2054,9 @@ fn overlay_bounds(
             MIN_LIVE_OVERLAY_MANUAL_HEIGHT,
             geometry.height,
         )
+        .max(content_size.minimum_height)
     } else {
-        settings.manual_height
+        settings.manual_height.max(content_size.minimum_height)
     };
     let offset = i32::try_from(settings.offset).unwrap_or(i32::MAX);
     match settings.attachment {
@@ -1918,7 +2135,7 @@ fn create_overlay_window(
             .shadow(false)
             .always_on_top(true)
             .skip_taskbar(true)
-            .resizable(false)
+            .resizable(true)
             // Bounds are applied as physical pixels below. Logical builder
             // bounds are incorrect on a display whose scale factor is not 1.
             .visible(false)
@@ -1935,13 +2152,9 @@ fn create_overlay_window(
                 BackendFailure::internal(format!("设置实时字幕窗口尺寸失败: {error}"))
             })?;
         if settings.mode == LiveOverlayMode::RegionReplace {
-            window
-                .set_ignore_cursor_events(true)
-                .map_err(|error| {
-                    BackendFailure::internal(format!(
-                        "设置坐标替换浮层鼠标穿透失败: {error}"
-                    ))
-                })?;
+            window.set_ignore_cursor_events(true).map_err(|error| {
+                BackendFailure::internal(format!("设置坐标替换浮层鼠标穿透失败: {error}"))
+            })?;
         }
         window
             .show()
@@ -2018,6 +2231,9 @@ fn position_overlay(
     geometry: platform::TargetGeometry,
     settings: LiveOverlaySettings,
     content_size: LiveOverlayContentSize,
+    position_locked: bool,
+    position_offset: Option<LiveOverlayPositionOffset>,
+    resize_locked: bool,
 ) {
     let app = app.clone();
     let window_app = app.clone();
@@ -2025,8 +2241,19 @@ fn position_overlay(
         let Some(window) = window_app.get_webview_window(OVERLAY_LABEL) else {
             return Ok(());
         };
-        let (x, y, width, height) = overlay_bounds(geometry, settings, content_size);
-        let _ = window.set_position(PhysicalPosition::new(x, y));
+        if resize_locked {
+            return Ok(());
+        }
+        let (default_x, default_y, width, height) =
+            overlay_bounds(geometry, settings, content_size);
+        if !position_locked {
+            let _ = window.set_position(PhysicalPosition::new(default_x, default_y));
+        } else if let Some(offset) = position_offset {
+            let _ = window.set_position(PhysicalPosition::new(
+                default_x.saturating_add(offset.x),
+                default_y.saturating_add(offset.y),
+            ));
+        }
         let _ = window.set_size(PhysicalSize::new(width, height));
         Ok(())
     });
@@ -2092,7 +2319,7 @@ where
 }
 
 #[tauri::command]
-pub(crate) async fn begin_live_selection(
+pub(crate) async fn start_live_session(
     app: tauri::AppHandle,
     target_id: String,
     target_language: String,
@@ -2102,11 +2329,11 @@ pub(crate) async fn begin_live_selection(
     manager: State<'_, LiveSessionManager>,
 ) -> Result<LiveSessionStatus, BackendError> {
     trace_live(format_args!(
-        "begin_live_selection received target={target_id} language={target_language}"
+        "start_live_session received target={target_id} language={target_language}"
     ));
     let manager = manager.inner().clone();
     run_live_operation(move || {
-        manager.begin_selection(
+        manager.start_session(
             &app,
             target_id,
             target_language,
@@ -2131,6 +2358,42 @@ pub(crate) async fn update_live_overlay_layout(
         manager.update_overlay_layout(&app, &session_id, sizing, content_size)
     })
     .await
+}
+#[tauri::command]
+pub(crate) async fn begin_live_overlay_drag(
+    session_id: String,
+    manager: State<'_, LiveSessionManager>,
+) -> Result<(), BackendError> {
+    let manager = manager.inner().clone();
+    run_live_operation(move || manager.begin_overlay_drag(&session_id)).await
+}
+#[tauri::command]
+pub(crate) async fn begin_live_overlay_resize(
+    session_id: String,
+    manager: State<'_, LiveSessionManager>,
+) -> Result<(), BackendError> {
+    let manager = manager.inner().clone();
+    run_live_operation(move || manager.begin_overlay_resize(&session_id)).await
+}
+
+#[tauri::command]
+pub(crate) async fn finish_live_overlay_resize(
+    app: tauri::AppHandle,
+    session_id: String,
+    manager: State<'_, LiveSessionManager>,
+) -> Result<(), BackendError> {
+    let manager = manager.inner().clone();
+    run_live_operation(move || manager.finish_overlay_resize(&app, &session_id)).await
+}
+
+#[tauri::command]
+pub(crate) async fn update_live_overlay_position(
+    session_id: String,
+    position: LiveOverlayPosition,
+    manager: State<'_, LiveSessionManager>,
+) -> Result<(), BackendError> {
+    let manager = manager.inner().clone();
+    run_live_operation(move || manager.update_overlay_position(&session_id, position)).await
 }
 
 #[tauri::command]
@@ -2221,7 +2484,10 @@ pub(crate) fn get_live_session_status(
 mod tests {
     use super::{
         await_capture_start_result,
-        contracts::{LiveOverlayAttachment, LiveOverlayMode, LiveOverlaySettings, LiveRoi},
+        contracts::{
+            LiveOverlayAttachment, LiveOverlayContentSize, LiveOverlayMode, LiveOverlaySettings,
+            LiveRoi,
+        },
         key_trigger_timeout_reached, live_subtitle_region, live_translated_region_text,
         normalized_live_region_text, overlay_bounds, overlay_url_path,
         platform::TargetGeometry,
@@ -2301,8 +2567,12 @@ mod tests {
             offset: 25,
             ..LiveOverlaySettings::default()
         };
+        let content_size = LiveOverlayContentSize::default();
 
-        assert_eq!(overlay_bounds(geometry, settings), (100, 825, 800, 168));
+        assert_eq!(
+            overlay_bounds(geometry, settings, content_size),
+            (100, 825, 800, 168)
+        );
         assert_eq!(
             overlay_bounds(
                 geometry,
@@ -2310,6 +2580,7 @@ mod tests {
                     attachment: LiveOverlayAttachment::Top,
                     ..settings
                 },
+                content_size,
             ),
             (100, 7, 800, 168),
         );
@@ -2320,6 +2591,7 @@ mod tests {
                     attachment: LiveOverlayAttachment::Left,
                     ..settings
                 },
+                content_size,
             ),
             (-93, 200, 168, 600),
         );
@@ -2330,6 +2602,7 @@ mod tests {
                     attachment: LiveOverlayAttachment::Right,
                     ..settings
                 },
+                content_size,
             ),
             (925, 200, 168, 600),
         );
@@ -2349,9 +2622,13 @@ mod tests {
             offset: 2_048,
             show_source: false,
             show_region_boxes: false,
+            ..LiveOverlaySettings::default()
         };
 
-        assert_eq!(overlay_bounds(geometry, settings), (100, 200, 800, 600));
+        assert_eq!(
+            overlay_bounds(geometry, settings, LiveOverlayContentSize::default()),
+            (100, 200, 800, 600)
+        );
     }
 
     #[test]
@@ -2362,10 +2639,16 @@ mod tests {
             show_region_boxes: true,
             ..LiveOverlaySettings::default()
         };
+        let geometry = TargetGeometry {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
 
         assert_eq!(
-            overlay_url_path("live-42", settings),
-            "index.html?liveSessionId=live-42&liveOverlayMode=region_replace&showSource=0&showRegionBoxes=1"
+            overlay_url_path("live-42", geometry, settings),
+            "index.html?liveSessionId=live-42&liveOverlayMode=region_replace&showSource=0&showRegionBoxes=1&overlayMaxWidth=800&overlayMaxHeight=600"
         );
     }
     #[test]

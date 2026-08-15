@@ -5,4 +5,4 @@ mod generation;
 pub(crate) mod model;
 mod session;
 pub(crate) mod translation;
-pub(crate) use translation::{HyTranslator, load_with_config};
+pub(crate) use translation::{HyTranslator, load_with_config, translation_text_is_usable};

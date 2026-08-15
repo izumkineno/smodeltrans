@@ -5,7 +5,7 @@ import {
   LIVE_STATUS_EVENT,
   LIVE_SUBTITLE_EVENT,
   beginLiveRoiUpdate,
-  beginLiveSelection,
+  startLiveSession,
   cancelLiveSelection,
   confirmLiveSelection,
   getLiveSessionStatus,
@@ -22,6 +22,10 @@ import {
   setLiveRegionBoxesVisible,
   shouldApplyLiveSubtitle,
   stopLiveSession,
+  beginLiveOverlayDrag,
+  beginLiveOverlayResize,
+  finishLiveOverlayResize,
+  updateLiveOverlayPosition,
   updateLiveOverlayLayout,
 } from "./live-translation-provider";
 import type {
@@ -92,6 +96,8 @@ const overlaySizing = {
 const overlayContentSize = {
   width: 512,
   height: 96,
+  minimumWidth: 320,
+  minimumHeight: 72,
 };
 
 const status: LiveSessionStatus = {
@@ -129,7 +135,7 @@ describe("live translation command adapter", () => {
     };
 
     await listCaptureWindows(invokeFn);
-    await beginLiveSelection(
+    await startLiveSession(
       target.id,
       "English",
       overlaySettings,
@@ -147,11 +153,15 @@ describe("live translation command adapter", () => {
     await stopLiveSession(undefined, invokeFn);
     await getLiveSessionStatus(invokeFn);
     await updateLiveOverlayLayout("live-1", overlaySizing, overlayContentSize, invokeFn);
+    await beginLiveOverlayDrag("live-1", invokeFn);
+    await beginLiveOverlayResize("live-1", invokeFn);
+    await finishLiveOverlayResize("live-1", invokeFn);
+    await updateLiveOverlayPosition("live-1", { x: 320, y: 240 }, invokeFn);
 
     expect(calls).toEqual([
       { command: "list_capture_windows", args: undefined },
       {
-        command: "begin_live_selection",
+        command: "start_live_session",
         args: {
           targetId: "778899",
           targetLanguage: "English",
@@ -196,6 +206,25 @@ describe("live translation command adapter", () => {
           sessionId: "live-1",
           sizing: overlaySizing,
           contentSize: overlayContentSize,
+        },
+      },
+      {
+        command: "begin_live_overlay_drag",
+        args: { sessionId: "live-1" },
+      },
+      {
+        command: "begin_live_overlay_resize",
+        args: { sessionId: "live-1" },
+      },
+      {
+        command: "finish_live_overlay_resize",
+        args: { sessionId: "live-1" },
+      },
+      {
+        command: "update_live_overlay_position",
+        args: {
+          sessionId: "live-1",
+          position: { x: 320, y: 240 },
         },
       },
     ]);

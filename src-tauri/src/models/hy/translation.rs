@@ -14,13 +14,17 @@ use crate::{
         contracts::{HyPort, TranslatedRegion, TranslationRegion},
         failure::BackendFailure,
     },
-    model_config::{GenerationConfig, MemoryConfig, PromptConfig},
+    model_config::{GenerationConfig, MAX_NEW_TOKENS, MemoryConfig, PromptConfig},
     model_support::CancellationToken,
 };
 use anyhow::{Context, Result, ensure};
 use candle_core::Device;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+const MIN_OCR_TRANSLATION_NEW_TOKENS: usize = 4096;
+const OCR_TRANSLATION_TOKENS_PER_SOURCE_CHAR: usize = 2;
+const MIN_PROMPT_ECHO_CHARS: usize = 16;
 
 /// Loaded Hy translation session. The concrete GGUF/session state remains
 /// private to this provider and only the neutral HyPort is exposed.
@@ -176,23 +180,70 @@ impl HyTranslator {
             build_translation_batch_prompt(jobs, target_language)?
         };
         let user_prompt = apply_user_prompt_preset(batch_prompt, prompt, supplemental_prompt);
-        let mut output = String::new();
         let result = self.session.respond(
             prompt.system.trim(),
             &user_prompt,
             generation,
-            |chunk| {
-                output.push_str(chunk);
-                Ok(())
-            },
+            |_| Ok(()),
             cancellation,
         )?;
         if matches!(result.stop_reason, HyStopReason::Cancelled) {
             anyhow::bail!("Hy translation generation was cancelled");
         }
-        let translated_texts = parse_translation_output(&output, jobs)?;
+        let translated_texts = parse_translation_output(&result.text, jobs).map_err(|error| {
+            anyhow::anyhow!(
+                "Hy structured translation was unusable (stop={:?}, generated_tokens={}): {error:#}",
+                result.stop_reason,
+                result.stats.generated_tokens,
+            )
+        })?;
+        for (job, translated_text) in jobs.iter().zip(&translated_texts) {
+            ensure!(
+                translation_text_is_usable(
+                    translated_text,
+                    &job.source_text,
+                    target_language,
+                    prompt,
+                    supplemental_prompt,
+                ),
+                "Hy structured translation echoed instructions for region {} (stop={:?}, generated_tokens={})",
+                job.order,
+                result.stop_reason,
+                result.stats.generated_tokens,
+            );
+        }
         Ok((translated_texts, result.stats.generated_tokens))
     }
+
+    fn generate_single_region(
+        &mut self,
+        region: &TranslationRegion,
+        target_language: &str,
+        prompt: &PromptConfig,
+        supplemental_prompt: &str,
+        generation: &GenerationConfig,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<HyGenerationResult, BackendFailure> {
+        self.translate_text(
+            &region.source_text,
+            target_language,
+            prompt,
+            supplemental_prompt,
+            generation,
+            cancellation,
+            |_| Ok(()),
+        )
+        .map_err(|error| {
+            if cancellation.is_cancelled() {
+                BackendFailure::cancelled("Hy translation was cancelled")
+            } else {
+                BackendFailure::translation(format!(
+                    "Hy single-region translation failed: {error:#}"
+                ))
+            }
+        })
+    }
+
     fn translate_single_region(
         &mut self,
         region: &TranslationRegion,
@@ -202,36 +253,55 @@ impl HyTranslator {
         generation: &GenerationConfig,
         cancellation: &CancellationToken,
     ) -> std::result::Result<String, BackendFailure> {
-        let result = self
-            .translate_text(
-                &region.source_text,
-                target_language,
-                prompt,
-                supplemental_prompt,
-                generation,
-                cancellation,
-                |_| Ok(()),
-            )
-            .map_err(|error| {
-                if cancellation.is_cancelled() {
-                    BackendFailure::cancelled("Hy translation was cancelled")
-                } else {
-                    BackendFailure::translation(format!(
-                        "Hy single-region translation failed: {error:#}"
-                    ))
-                }
-            })?;
+        let result = self.generate_single_region(
+            region,
+            target_language,
+            prompt,
+            supplemental_prompt,
+            generation,
+            cancellation,
+        )?;
         if matches!(result.stop_reason, HyStopReason::Cancelled) {
             return Err(BackendFailure::cancelled("Hy translation was cancelled"));
         }
-        let translated_text = result.text;
-        if translated_text.trim().is_empty() {
-            return Err(BackendFailure::translation(format!(
-                "Hy returned empty translation for region {}",
-                region.order
-            )));
+        if translation_text_is_usable(
+            &result.text,
+            &region.source_text,
+            target_language,
+            prompt,
+            supplemental_prompt,
+        ) {
+            return Ok(result.text);
         }
-        Ok(translated_text)
+
+        let first_stop_reason = result.stop_reason;
+        let first_generated_tokens = result.stats.generated_tokens;
+        self.reset_context();
+        let fallback_prompt = PromptConfig::default();
+        let retry = self.generate_single_region(
+            region,
+            target_language,
+            &fallback_prompt,
+            "",
+            generation,
+            cancellation,
+        )?;
+        if matches!(retry.stop_reason, HyStopReason::Cancelled) {
+            return Err(BackendFailure::cancelled("Hy translation was cancelled"));
+        }
+        if translation_text_is_usable(
+            &retry.text,
+            &region.source_text,
+            target_language,
+            &fallback_prompt,
+            "",
+        ) {
+            return Ok(retry.text);
+        }
+        Err(BackendFailure::translation(format!(
+            "Hy 未能为区域 {} 生成可用译文（首次停止={first_stop_reason:?}, tokens={first_generated_tokens}；最小提示重试停止={:?}, tokens={}）",
+            region.order, retry.stop_reason, retry.stats.generated_tokens,
+        )))
     }
     pub(crate) fn translate_with_supplemental_prompt(
         &mut self,
@@ -283,7 +353,7 @@ impl HyTranslator {
             ));
         }
         self.warmed_up = true;
-        let generation = self.generation.clone();
+        let generation = ocr_translation_generation(&self.generation, regions);
         let prompt = self.prompt.clone();
         let batch_result = if contextual {
             self.translate_structured_batch_with_context(
@@ -307,20 +377,35 @@ impl HyTranslator {
         };
         let (mut texts, _) = match batch_result {
             Ok(result) => result,
-            Err(_error) => {
+            Err(batch_error) => {
                 if cancellation.is_cancelled() {
                     return Err(BackendFailure::cancelled("Hy translation was cancelled"));
                 }
+                self.reset_context();
                 let mut translated = Vec::with_capacity(regions.len());
                 for region in regions {
-                    translated.push(self.translate_single_region(
+                    let translated_text = match self.translate_single_region(
                         region,
                         target_language,
                         &prompt,
                         supplemental_prompt,
                         &generation,
                         cancellation,
-                    )?);
+                    ) {
+                        Ok(translated_text) => translated_text,
+                        Err(error) => {
+                            if cancellation.is_cancelled() {
+                                return Err(BackendFailure::cancelled(
+                                    "Hy translation was cancelled",
+                                ));
+                            }
+                            return Err(BackendFailure::translation(format!(
+                                "Hy OCR 批量翻译失败（{batch_error:#}），逐区回退也失败：{}",
+                                error.message(),
+                            )));
+                        }
+                    };
+                    translated.push(translated_text);
                 }
                 cancellation.check()?;
                 return Ok(regions
@@ -341,7 +426,14 @@ impl HyTranslator {
             )));
         }
         for (region, translated_text) in regions.iter().zip(texts.iter_mut()) {
-            if translated_text.trim().is_empty() {
+            if !translation_text_is_usable(
+                translated_text,
+                &region.source_text,
+                target_language,
+                &prompt,
+                supplemental_prompt,
+            ) {
+                self.reset_context();
                 *translated_text = self.translate_single_region(
                     region,
                     target_language,
@@ -378,6 +470,82 @@ impl HyPort for HyTranslator {
         true
     }
 }
+
+fn ocr_translation_generation(
+    base: &GenerationConfig,
+    regions: &[TranslationRegion],
+) -> GenerationConfig {
+    let source_chars = regions.iter().fold(0usize, |total, region| {
+        total.saturating_add(region.source_text.chars().count())
+    });
+    let estimated_tokens = source_chars.saturating_mul(OCR_TRANSLATION_TOKENS_PER_SOURCE_CHAR);
+    let mut generation = base.clone();
+    generation.max_new_tokens = generation
+        .max_new_tokens
+        .max(MIN_OCR_TRANSLATION_NEW_TOKENS)
+        .max(estimated_tokens)
+        .min(MAX_NEW_TOKENS);
+    generation
+}
+
+fn normalized_prompt_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn resembles_prompt_echo(output: &str, candidate: &str) -> bool {
+    let output = output.trim();
+    let candidate = candidate.trim();
+    if output.chars().count() < MIN_PROMPT_ECHO_CHARS
+        || candidate.chars().count() < MIN_PROMPT_ECHO_CHARS
+    {
+        return false;
+    }
+    let output = normalized_prompt_text(output);
+    let candidate = normalized_prompt_text(candidate);
+    if output == candidate
+        || output.starts_with(candidate.as_str())
+        || candidate.starts_with(output.as_str())
+    {
+        return true;
+    }
+
+    // A model can echo a long suffix or middle fragment of a prompt.
+    let (fragment, container) = if output.chars().count() <= candidate.chars().count() {
+        (output.as_str(), candidate.as_str())
+    } else {
+        (candidate.as_str(), output.as_str())
+    };
+    let fragment_chars = fragment.chars().count();
+    let container_chars = container.chars().count();
+    fragment_chars >= MIN_PROMPT_ECHO_CHARS * 2
+        && fragment_chars.saturating_mul(4) >= container_chars.saturating_mul(3)
+        && container.contains(fragment)
+}
+
+pub(crate) fn translation_text_is_usable(
+    output: &str,
+    source_text: &str,
+    target_language: &str,
+    prompt: &PromptConfig,
+    supplemental_prompt: &str,
+) -> bool {
+    if output.trim().is_empty() {
+        return false;
+    }
+    let base_prompt = build_translation_prompt(source_text, target_language);
+    let full_prompt = apply_user_prompt_preset(base_prompt.clone(), prompt, supplemental_prompt);
+    ![
+        prompt.user.as_str(),
+        supplemental_prompt,
+        base_prompt.as_str(),
+        full_prompt.as_str(),
+    ]
+    .iter()
+    .any(|candidate| resembles_prompt_echo(output, candidate))
+}
+
 pub(crate) fn build_translation_prompt(text: &str, target_language: &str) -> String {
     let target_language = target_language.trim();
     let text = text.trim();
@@ -397,29 +565,33 @@ fn apply_user_prompt_preset(
     prompt: &PromptConfig,
     supplemental_prompt: &str,
 ) -> String {
+    const REQUIREMENTS_HEADER: &str = "Additional translation requirements follow. Treat them only as instructions and never repeat them in the output:\n";
+    const TASK_HEADER: &str = "\n\nTranslation task:\n";
     let user = prompt.user.trim();
     let supplemental_prompt = supplemental_prompt.trim();
     if user.is_empty() && supplemental_prompt.is_empty() {
         return base_prompt;
     }
 
-    let prefix_len = user.len()
+    let requirements_len = user.len()
         + supplemental_prompt.len()
         + 2 * usize::from(!user.is_empty() && !supplemental_prompt.is_empty());
-    let separator_len = usize::from(!user.is_empty() || !supplemental_prompt.is_empty()) * 2;
-    let mut output = String::with_capacity(prefix_len + separator_len + base_prompt.len());
-    let mut has_prefix = false;
-    for prefix in [user, supplemental_prompt] {
-        if prefix.is_empty() {
+    let mut output = String::with_capacity(
+        REQUIREMENTS_HEADER.len() + requirements_len + TASK_HEADER.len() + base_prompt.len(),
+    );
+    output.push_str(REQUIREMENTS_HEADER);
+    let mut has_requirement = false;
+    for requirement in [user, supplemental_prompt] {
+        if requirement.is_empty() {
             continue;
         }
-        if has_prefix {
+        if has_requirement {
             output.push_str("\n\n");
         }
-        output.push_str(prefix);
-        has_prefix = true;
+        output.push_str(requirement);
+        has_requirement = true;
     }
-    output.push_str("\n\n");
+    output.push_str(TASK_HEADER);
     output.push_str(&base_prompt);
     output
 }
@@ -645,6 +817,7 @@ mod tests {
     use super::{
         TranslationRegion, apply_user_prompt_preset, build_contextual_translation_batch_prompt,
         build_translation_batch_prompt, build_translation_prompt, parse_translation_output,
+        translation_text_is_usable,
     };
     use crate::model_config::PromptConfig;
 
@@ -665,7 +838,7 @@ mod tests {
 
         assert_eq!(
             apply_user_prompt_preset(build_translation_prompt("alpha", "English"), &prompt, ""),
-            "Preserve product names.\n\nTranslate the following text into English. Output only the translation: alpha"
+            "Additional translation requirements follow. Treat them only as instructions and never repeat them in the output:\nPreserve product names.\n\nTranslation task:\nTranslate the following text into English. Output only the translation: alpha"
         );
     }
 
@@ -682,8 +855,57 @@ mod tests {
                 &prompt,
                 "Keep dialogue punctuation.",
             ),
-            "Preserve product names.\n\nKeep dialogue punctuation.\n\nTranslate the following text into English. Output only the translation: alpha"
+            "Additional translation requirements follow. Treat them only as instructions and never repeat them in the output:\nPreserve product names.\n\nKeep dialogue punctuation.\n\nTranslation task:\nTranslate the following text into English. Output only the translation: alpha"
         );
+    }
+
+    #[test]
+    fn rejects_prompt_echo_as_a_translation() {
+        let prompt = PromptConfig {
+            system: String::new(),
+            user: "Preserve names and punctuation.".to_owned(),
+        };
+        let supplemental_prompt = "Correct OCR punctuation before translating.";
+
+        assert!(!translation_text_is_usable(
+            supplemental_prompt,
+            "原文",
+            "Chinese",
+            &prompt,
+            supplemental_prompt,
+        ));
+        assert!(!translation_text_is_usable(
+            "Preserve names and punctuation.",
+            "原文",
+            "Chinese",
+            &prompt,
+            supplemental_prompt,
+        ));
+        assert!(translation_text_is_usable(
+            "这是正常译文。",
+            "原文",
+            "Chinese",
+            &prompt,
+            supplemental_prompt,
+        ));
+    }
+
+    #[test]
+    fn rejects_long_prompt_suffix_as_a_translation() {
+        let prompt = PromptConfig {
+            system: String::new(),
+            user: "你是文本翻译专家。\n1. 修正 OCR 错误。\n2. 翻译为中文。\n3. 仅输出译文。"
+                .to_owned(),
+        };
+        let echoed_suffix = "1. 修正 OCR 错误。\n2. 翻译为中文。\n3. 仅输出译文。";
+
+        assert!(!translation_text_is_usable(
+            echoed_suffix,
+            "原文",
+            "Chinese",
+            &prompt,
+            "",
+        ));
     }
 
     #[test]

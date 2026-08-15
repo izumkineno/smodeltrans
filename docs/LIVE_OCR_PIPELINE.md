@@ -42,7 +42,7 @@ flowchart LR
 
 | 阶段 | 主要文件 | 核心对象/函数 |
 | --- | --- | --- |
-| 前端配置与 IPC | `src/components/LiveTranslationPage.vue`、`src/services/live-translation-provider.ts` | `beginLiveSelection`、`confirmLiveSelection`、`LiveRecognitionSettings`、`LiveTranslationSettings` |
+| 前端配置与 IPC | `src/components/LiveTranslationPage.vue`、`src/services/live-translation-provider.ts` | `startLiveSession`、`beginLiveRoiUpdate`、`confirmLiveSelection`、`LiveRecognitionSettings`、`LiveTranslationSettings` |
 | 会话生命周期 | `src-tauri/src/backend/live/mod.rs` | `LiveSessionManager`、`SessionLoop`、`prepare_models`、`run_capture` |
 | Windows 捕获 | `src-tauri/src/backend/live/platform_windows.rs` | `start_capture`、`CaptureHandler::on_frame_arrived` |
 | ROI 与设置契约 | `src-tauri/src/backend/live/contracts.rs` | `LiveRoi`、`NormalizedRoi`、`LiveConfig` |
@@ -97,7 +97,7 @@ RegionRecord
 
 | 参数 | 默认值 | 有效范围/说明 |
 | --- | ---: | --- |
-| `LiveRoi.width/height` | 由用户框选 | 至少 `24 × 24` 物理像素，必须完全位于客户区 |
+| `LiveRoi.width/height` | 目标窗口客户区的完整尺寸 | 启动时默认覆盖整个目标客户区；可从字幕 toolbar 打开当前选框重新限定区域，手动选区至少 `24 × 24` 物理像素 |
 | `mode` | `automatic` | `automatic` 或 `key_trigger` |
 | `triggerKey` | `F8` | 支持录入的标准键盘键，也支持 `vk:<number>|<code>` |
 | `triggerEvent` | `press` | `press` 或 `release` |
@@ -111,19 +111,20 @@ RegionRecord
 
 旧版前端持久化配置缺少新字段时，前端和 Rust serde 会补默认值。会话运行中配置编辑受到限制，修改后应重新启动或重新选择会话。
 
-### 3.3 目标窗口、最小化状态与 ROI 版本
+### 3.3 目标窗口、默认全客户区与 ROI 版本
 
 1. 前端调用 `list_capture_windows` 获取可捕获的顶级窗口。已最小化但仍存活的窗口也会列出；此时后端返回 `isMinimized=true` 且尺寸为 `0×0`，前端标注“已最小化，可直接恢复”。
-2. `begin_live_selection` 校验目标语言、覆盖层、识别和翻译设置，先调用 `activate_target_window` 恢复并激活目标窗口，再读取客户区几何。
-3. 用户在选择器窗口中框选 CSS 区域；前端根据设备像素比换算为物理像素，并保证最小 ROI 尺寸。
-4. `confirm_live_selection` 再次校验 ROI，转换为 `NormalizedRoi`：
+2. `start_live_session` 校验目标语言、覆盖层、识别和翻译设置，先调用 `activate_target_window` 恢复并激活目标窗口，再读取客户区几何。
+3. 会话启动时后端构造 `x=0`、`y=0`、`width=client_width`、`height=client_height` 的完整客户区 ROI，并直接启动模型预热与 Windows Graphics Capture；不再要求首次启动前打开选择器。
+4. 模型与捕获准备完成后，会话状态进入 `Running`，字幕浮层先显示“模型准备完成，等待翻译”，不依赖第一次 OCR 或按键触发才显示就绪状态。
+5. 字幕浮层 toolbar 的手动框选按钮调用 `begin_live_roi_update` 打开现有选择器；用户确认后，`confirm_live_selection` 再次校验 ROI 并转换为 `NormalizedRoi`：
    - `left = x / client_width`
    - `top = y / client_height`
    - `right = (x + width) / client_width`
    - `bottom = (y + height) / client_height`
-5. 捕获线程根据每一帧的实际客户区尺寸将归一化 ROI 四舍五入回物理像素。
-6. 运行中每约 `250 ms` 检查目标是否最小化；每约 `500 ms` 同步客户区几何。窗口尺寸改变时 `roi_version` 自增、清空最新帧并重置稳定检测；任何旧版本 OCR/翻译结果都会被丢弃。
-7. 目标运行中被最小化时，会话自动进入暂停状态、清空待处理帧并隐藏覆盖层。窗口恢复后重新定位覆盖层并自动继续；若此前是手动暂停，则只恢复几何和覆盖层，不解除手动暂停。手动点击“继续”时目标仍最小化会返回错误。
+6. 捕获线程根据每一帧的实际客户区尺寸将归一化 ROI 四舍五入回物理像素。
+7. 运行中每约 `250 ms` 检查目标是否最小化；每约 `500 ms` 同步客户区几何。窗口尺寸改变时 `roi_version` 自增、清空最新帧并重置稳定检测；任何旧版本 OCR/翻译结果都会被丢弃。
+8. 目标运行中被最小化时，会话自动进入暂停状态、清空待处理帧并隐藏覆盖层。窗口恢复后重新定位覆盖层并自动继续；若此前是手动暂停，则只恢复几何和覆盖层，不解除手动暂停。手动点击“继续”时目标仍最小化会返回错误。
 
 归一化 ROI 的意义是窗口缩放时保留相对位置；它不是对图像做缩放或压缩。Windows Graphics Capture 对最小化窗口通常不能提供可用画面，因此这里采用暂停/恢复，而不是声称可以在最小化状态下持续 OCR。
 
@@ -586,7 +587,11 @@ Hy 会话的记忆由 `HyConversationMemory` 管理：
 覆盖层行为：
 
 - **字幕模式**：将最终/流式文本放到目标窗口外侧的上、下、左或右附着区域；不使用 OCR 区域框定位翻译。
+- 字幕 toolbar 默认仅在悬停或键盘聚焦时显示；Pin 按钮可保持显示。Toolbar 使用内容宽度，不随字幕宽高拉伸；窗口尺寸会保留 toolbar 的完整显示空间。
+- 只有 toolbar 的拖动按钮可移动字幕窗口。前端先锁定自动定位，拖动结束后把物理位置发送给后端；后端保存相对默认附着位置的偏移，因此目标窗口移动或字幕尺寸变化时仍保持该偏移。
+- 独立宽度/高度按钮使用系统原生窗口拉伸，拉伸期间暂停后端布局覆盖，结束后回写物理尺寸并恢复自动布局。
 - **逐区替换模式**：把 ROI 局部区域转换回客户区坐标，翻译文本按原区域 bounds 贴合显示。
+- 字幕模式把 Hy-MT2 的增量字符累积成完整 partial 后发布；单次字幕生成预算至少为 2048 tokens，并按源字符数扩展，最高不超过 4096 tokens。
 - `showRegionBoxes` 可用于观察后端区域分组结果，辅助判断拆行或错位问题。
 - `live-debug-record` 分开报告 OCR 和 translation 阶段，包含 `regionCount`、`roiVersion`、耗时和结果摘要。
 

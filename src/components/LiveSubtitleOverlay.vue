@@ -1,16 +1,22 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import type { ComponentPublicInstance, CSSProperties } from "vue";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
+  beginLiveOverlayDrag,
+  beginLiveOverlayResize,
+  beginLiveRoiUpdate,
+  finishLiveOverlayResize,
   getLiveSessionStatus,
   groupLiveSubtitleRegions,
-  resolveLiveSubtitleRegionVerticalAnchor,
   listenLiveRegionBoxesVisible,
   listenLiveStatus,
   listenLiveSubtitle,
+  resolveLiveSubtitleRegionVerticalAnchor,
   shouldApplyLiveSubtitle,
   updateLiveOverlayLayout,
+  updateLiveOverlayPosition,
 } from "../services/live-translation-provider";
 import type {
   LiveOverlayContentSize,
@@ -34,13 +40,8 @@ import {
 const HORIZONTAL_OVERLAY_PADDING = 36;
 const VERTICAL_OVERLAY_PADDING = 30;
 
-interface ManualResizeState {
-  pointerId: number;
-  startX: number;
-  startY: number;
-  startWidth: number;
-  startHeight: number;
-}
+type ManualResizeAxis = "width" | "height";
+
 
 const query = new URLSearchParams(window.location.search);
 const sessionId = query.get("liveSessionId") ?? undefined;
@@ -51,9 +52,15 @@ const subtitle = ref<LiveSubtitle>();
 const state = ref<LiveSessionState>("warming");
 const subtitleOverlay = ref<HTMLElement | null>(null);
 const subtitlePanel = ref<HTMLElement | null>(null);
+const subtitleToolbar = ref<HTMLElement | null>(null);
 const sizingEditorOpen = ref(false);
 const layoutError = ref("");
-const manualResizeActive = ref(false);
+const selectionOpening = ref(false);
+const toolbarPinned = ref(false);
+const overlayDragging = ref(false);
+const manualResizeAxis = ref<ManualResizeAxis | null>(null);
+const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const overlayWindow = isDesktopRuntime ? getCurrentWindow() : null;
 let lastRevision = -1;
 let listenersActive = true;
 let layoutSyncInFlight = false;
@@ -61,7 +68,6 @@ let layoutSyncPending = false;
 let layoutAnimationFrame: number | undefined;
 let lastLayoutSignature = "";
 let panelResizeObserver: ResizeObserver | undefined;
-let manualResize: ManualResizeState | undefined;
 const unlisteners: UnlistenFn[] = [];
 
 function queryPhysicalDimension(name: string, fallback: number): number {
@@ -82,28 +88,62 @@ const automaticPanelHeightLimit = Math.max(
   ) - VERTICAL_OVERLAY_PADDING,
 );
 
-const visible = computed(
-  () =>
-    state.value === "warming" ||
-    (isRegionReplace
-      ? (subtitle.value?.regions.length ?? 0) > 0
-      : !!subtitle.value?.isStreaming || !!subtitle.value?.translatedText.trim()),
+const hasLiveSubtitle = computed(
+  () => !!subtitle.value?.isStreaming || !!subtitle.value?.translatedText.trim(),
 );
+const visible = computed(() =>
+  isRegionReplace
+    ? (subtitle.value?.regions.length ?? 0) > 0
+    : state.value === "warming" ||
+      state.value === "running" ||
+      state.value === "paused" ||
+      hasLiveSubtitle.value,
+);
+const standbyText = computed(() => {
+  if (state.value === "warming") {
+    return "正在准备模型与窗口捕获…";
+  }
+  if (state.value === "paused") {
+    return "实时翻译已暂停";
+  }
+  return "模型准备完成，等待翻译";
+});
 const regionGroups = computed(() =>
   groupLiveSubtitleRegions(subtitle.value?.regions ?? []),
 );
 const sizingEnabled = computed(() => !isRegionReplace && sessionId !== undefined);
-const subtitlePanelStyle = computed<CSSProperties>(() => ({
-  width: liveOverlaySettings.value.autoWidth ? "max-content" : "100%",
-  height: liveOverlaySettings.value.autoHeight ? "fit-content" : "100%",
-  maxWidth: liveOverlaySettings.value.autoWidth
-    ? `${automaticPanelWidthLimit}px`
-    : "100%",
-  maxHeight: liveOverlaySettings.value.autoHeight
-    ? `${automaticPanelHeightLimit}px`
-    : "100%",
-  flex: liveOverlaySettings.value.autoWidth ? "0 0 auto" : "0 1 auto",
-}));
+const canOpenRegionSelector = computed(
+  () =>
+    !!sessionId &&
+    !selectionOpening.value &&
+    (state.value === "running" || state.value === "paused"),
+);
+const manualResizeActive = computed(() => manualResizeAxis.value !== null);
+const subtitlePanelStyle = computed<CSSProperties>(() => {
+  const manualPanelWidth = Math.max(
+    1,
+    liveOverlaySettings.value.manualWidth / deviceScaleFactor - HORIZONTAL_OVERLAY_PADDING,
+  );
+  const manualPanelHeight = Math.max(
+    1,
+    liveOverlaySettings.value.manualHeight / deviceScaleFactor - VERTICAL_OVERLAY_PADDING,
+  );
+  return {
+    width: liveOverlaySettings.value.autoWidth
+      ? "max-content"
+      : `${manualPanelWidth}px`,
+    height: liveOverlaySettings.value.autoHeight
+      ? "fit-content"
+      : `${manualPanelHeight}px`,
+    maxWidth: liveOverlaySettings.value.autoWidth
+      ? `${automaticPanelWidthLimit}px`
+      : `${manualPanelWidth}px`,
+    maxHeight: liveOverlaySettings.value.autoHeight
+      ? `${automaticPanelHeightLimit}px`
+      : `${manualPanelHeight}px`,
+    flex: "0 0 auto",
+  };
+});
 
 function percent(value: number, total: number): string {
   return `${(value / total) * 100}%`;
@@ -182,12 +222,28 @@ function measuredContentSize(): LiveOverlayContentSize | undefined {
   const verticalPadding =
     cssPixel(overlayStyle.paddingTop, VERTICAL_OVERLAY_PADDING / 2) +
     cssPixel(overlayStyle.paddingBottom, VERTICAL_OVERLAY_PADDING / 2);
+  const toolbar = subtitleToolbar.value;
+  const toolbarBounds = toolbar?.getBoundingClientRect();
+  const toolbarWidth = toolbar
+    ? Math.max(toolbar.scrollWidth, toolbarBounds?.width ?? 0)
+    : 0;
+  const toolbarHeight = toolbar
+    ? Math.max(toolbar.scrollHeight, toolbarBounds?.height ?? 0)
+    : 0;
   const width = Math.max(bounds.width, panel.scrollWidth);
   const height = Math.max(bounds.height, panel.scrollHeight);
   const scaleFactor = Math.max(window.devicePixelRatio || 1, 1);
   return {
     width: Math.max(1, Math.ceil((width + horizontalPadding) * scaleFactor)),
     height: Math.max(1, Math.ceil((height + verticalPadding) * scaleFactor)),
+    minimumWidth: Math.max(
+      LIVE_SUBTITLE_MANUAL_WIDTH_MIN,
+      Math.ceil((toolbarWidth + 12 + horizontalPadding) * scaleFactor),
+    ),
+    minimumHeight: Math.max(
+      LIVE_SUBTITLE_MANUAL_HEIGHT_MIN,
+      Math.ceil((toolbarHeight + 8 + verticalPadding) * scaleFactor),
+    ),
   };
 }
 
@@ -197,6 +253,10 @@ function scheduleLayoutSync(force = false): void {
   }
   if (force) {
     lastLayoutSignature = "";
+  }
+  if (manualResizeActive.value) {
+    layoutSyncPending = true;
+    return;
   }
   if (layoutAnimationFrame !== undefined) {
     layoutSyncPending = true;
@@ -209,6 +269,10 @@ function scheduleLayoutSync(force = false): void {
 }
 
 async function syncOverlayLayout(): Promise<void> {
+  if (manualResizeActive.value) {
+    layoutSyncPending = true;
+    return;
+  }
   const contentSize = measuredContentSize();
   if (!sessionId || !contentSize) {
     return;
@@ -221,6 +285,8 @@ async function syncOverlayLayout(): Promise<void> {
     sizing.manualHeight,
     contentSize.width,
     contentSize.height,
+    contentSize.minimumWidth,
+    contentSize.minimumHeight,
   ].join(":");
   if (signature === lastLayoutSignature) {
     return;
@@ -281,6 +347,52 @@ function toggleSizingEditor(): void {
   sizingEditorOpen.value = !sizingEditorOpen.value;
   void nextTick().then(() => scheduleLayoutSync());
 }
+function toggleToolbarPinned(): void {
+  toolbarPinned.value = !toolbarPinned.value;
+}
+
+
+async function startOverlayDrag(event: MouseEvent): Promise<void> {
+  if (
+    event.button !== 0 ||
+    !sessionId ||
+    !overlayWindow ||
+    overlayDragging.value
+  ) {
+    return;
+  }
+  event.preventDefault();
+  overlayDragging.value = true;
+  try {
+    await beginLiveOverlayDrag(sessionId);
+    await overlayWindow.startDragging();
+    const position = await overlayWindow.outerPosition();
+    await updateLiveOverlayPosition(sessionId, {
+      x: position.x,
+      y: position.y,
+    });
+    layoutError.value = "";
+  } catch (error) {
+    layoutError.value = `拖动字幕失败：${errorText(error)}`;
+  } finally {
+    overlayDragging.value = false;
+  }
+}
+
+async function openRegionSelector(): Promise<void> {
+  if (!sessionId || !canOpenRegionSelector.value) {
+    return;
+  }
+  selectionOpening.value = true;
+  try {
+    await beginLiveRoiUpdate(sessionId);
+    layoutError.value = "";
+  } catch (error) {
+    layoutError.value = `区域选择失败：${errorText(error)}`;
+  } finally {
+    selectionOpening.value = false;
+  }
+}
 
 function commitManualDimension(axis: "width" | "height", event: Event): void {
   const input = event.target as HTMLInputElement;
@@ -322,68 +434,71 @@ function clampManualDimension(value: number, minimum: number, maximum: number): 
   return Math.min(maximum, Math.max(minimum, Math.round(value)));
 }
 
-function beginManualResize(event: PointerEvent): void {
-  if (event.button !== 0 || !subtitleOverlay.value) {
+async function beginManualResize(
+  axis: ManualResizeAxis,
+  event: PointerEvent,
+): Promise<void> {
+  if (
+    event.button !== 0 ||
+    !sessionId ||
+    !overlayWindow ||
+    manualResizeActive.value
+  ) {
     return;
   }
-  const overlayBounds = subtitleOverlay.value.getBoundingClientRect();
-  const scaleFactor = Math.max(window.devicePixelRatio || 1, 1);
-  const handle = event.currentTarget as HTMLElement;
-  manualResize = {
-    pointerId: event.pointerId,
-    startX: event.clientX,
-    startY: event.clientY,
-    startWidth: clampManualDimension(
-      overlayBounds.width * scaleFactor,
-      LIVE_SUBTITLE_MANUAL_WIDTH_MIN,
-      LIVE_SUBTITLE_MANUAL_WIDTH_MAX,
-    ),
-    startHeight: clampManualDimension(
-      overlayBounds.height * scaleFactor,
-      LIVE_SUBTITLE_MANUAL_HEIGHT_MIN,
-      LIVE_SUBTITLE_MANUAL_HEIGHT_MAX,
-    ),
-  };
-  liveOverlaySettings.value.manualWidth = manualResize.startWidth;
-  liveOverlaySettings.value.manualHeight = manualResize.startHeight;
-  liveOverlaySettings.value.autoWidth = false;
-  liveOverlaySettings.value.autoHeight = false;
-  layoutError.value = "";
-  manualResizeActive.value = true;
-  handle.setPointerCapture(event.pointerId);
-  scheduleLayoutSync(true);
-}
-
-function resizeManually(event: PointerEvent): void {
-  const activeResize = manualResize;
-  if (!activeResize || activeResize.pointerId !== event.pointerId) {
-    return;
+  event.preventDefault();
+  manualResizeAxis.value = axis;
+  let resizeLocked = false;
+  try {
+    await beginLiveOverlayResize(sessionId);
+    resizeLocked = true;
+    await overlayWindow.startResizeDragging(axis === "width" ? "East" : "South");
+    const size = await overlayWindow.outerSize();
+    const minimum =
+      axis === "width"
+        ? LIVE_SUBTITLE_MANUAL_WIDTH_MIN
+        : LIVE_SUBTITLE_MANUAL_HEIGHT_MIN;
+    const maximum =
+      axis === "width"
+        ? LIVE_SUBTITLE_MANUAL_WIDTH_MAX
+        : LIVE_SUBTITLE_MANUAL_HEIGHT_MAX;
+    const value = clampManualDimension(
+      axis === "width" ? size.width : size.height,
+      minimum,
+      maximum,
+    );
+    if (axis === "width") {
+      liveOverlaySettings.value.manualWidth = value;
+      liveOverlaySettings.value.autoWidth = false;
+    } else {
+      liveOverlaySettings.value.manualHeight = value;
+      liveOverlaySettings.value.autoHeight = false;
+    }
+    const persistenceError = savePersistedLiveOverlaySettings();
+    await nextTick();
+    const contentSize = measuredContentSize();
+    if (!contentSize) {
+      throw new Error("无法读取字幕窗口尺寸");
+    }
+    await updateLiveOverlayLayout(sessionId, currentSizing(), contentSize);
+    lastLayoutSignature = "";
+    layoutError.value = persistenceError ?? "";
+  } catch (error) {
+    layoutError.value = `调整字幕${axis === "width" ? "宽度" : "高度"}失败：${errorText(error)}`;
+  } finally {
+    if (resizeLocked) {
+      try {
+        await finishLiveOverlayResize(sessionId);
+      } catch (error) {
+        const message = `结束字幕拉伸失败：${errorText(error)}`;
+        layoutError.value = layoutError.value
+          ? `${layoutError.value} ${message}`
+          : message;
+      }
+    }
+    manualResizeAxis.value = null;
+    scheduleLayoutSync(true);
   }
-  const scaleFactor = Math.max(window.devicePixelRatio || 1, 1);
-  liveOverlaySettings.value.manualWidth = clampManualDimension(
-    activeResize.startWidth + (event.clientX - activeResize.startX) * scaleFactor,
-    LIVE_SUBTITLE_MANUAL_WIDTH_MIN,
-    LIVE_SUBTITLE_MANUAL_WIDTH_MAX,
-  );
-  liveOverlaySettings.value.manualHeight = clampManualDimension(
-    activeResize.startHeight + (event.clientY - activeResize.startY) * scaleFactor,
-    LIVE_SUBTITLE_MANUAL_HEIGHT_MIN,
-    LIVE_SUBTITLE_MANUAL_HEIGHT_MAX,
-  );
-  scheduleLayoutSync(true);
-}
-
-function finishManualResize(event: PointerEvent): void {
-  if (!manualResize || manualResize.pointerId !== event.pointerId) {
-    return;
-  }
-  manualResize = undefined;
-  manualResizeActive.value = false;
-  const handle = event.currentTarget as HTMLElement;
-  if (handle.hasPointerCapture(event.pointerId)) {
-    handle.releasePointerCapture(event.pointerId);
-  }
-  persistSizingChange();
 }
 
 function applySubtitle(next: LiveSubtitle): void {
@@ -438,8 +553,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  manualResize = undefined;
-  manualResizeActive.value = false;
+  manualResizeAxis.value = null;
   listenersActive = false;
   if (layoutAnimationFrame !== undefined) {
     window.cancelAnimationFrame(layoutAnimationFrame);
@@ -464,10 +578,45 @@ onBeforeUnmount(() => {
       :class="{
         'subtitle-panel-warming': state === 'warming',
         'is-manual-resizing': manualResizeActive,
+        'is-resizing-width': manualResizeAxis === 'width',
+        'is-resizing-height': manualResizeAxis === 'height',
+        'is-toolbar-pinned': toolbarPinned,
       }"
       :style="subtitlePanelStyle"
     >
-      <div v-if="sizingEnabled" class="subtitle-panel-toolbar" aria-label="字幕窗口尺寸设置">
+      <div
+        v-if="sizingEnabled"
+        ref="subtitleToolbar"
+        class="subtitle-panel-toolbar"
+        aria-label="实时字幕工具栏"
+      >
+        <button
+          type="button"
+          class="subtitle-tool-button subtitle-toolbar-drag-handle"
+          :class="{ 'is-active': overlayDragging }"
+          :aria-busy="overlayDragging"
+          aria-label="拖动字幕窗口"
+          title="拖动字幕窗口"
+          @mousedown.left.stop.prevent="startOverlayDrag"
+        >
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M5 4.5h6M5 8h6M5 11.5h6" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="subtitle-tool-button"
+          :class="{ 'is-active': state === 'selecting' }"
+          :disabled="!canOpenRegionSelector"
+          :aria-busy="selectionOpening"
+          aria-label="手动框选翻译区域"
+          title="手动框选翻译区域"
+          @click="openRegionSelector"
+        >
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M2.5 6V3.5h2.5M13.5 6V3.5H11M2.5 10v2.5H5M13.5 10v2.5H11" />
+          </svg>
+        </button>
         <button
           type="button"
           class="subtitle-tool-button"
@@ -512,21 +661,42 @@ onBeforeUnmount(() => {
         </button>
         <button
           type="button"
-          class="subtitle-tool-button subtitle-resize-handle"
-          :class="{ 'is-active': manualResizeActive }"
-          aria-label="拖动调整字幕窗口宽度和高度"
-          title="拖动调整字幕窗口宽度和高度"
-          @pointerdown.prevent="beginManualResize"
-          @pointermove.prevent="resizeManually"
-          @pointerup.prevent="finishManualResize"
-          @pointercancel.prevent="finishManualResize"
-          @lostpointercapture="finishManualResize"
+          class="subtitle-tool-button subtitle-width-resize-handle"
+          :class="{ 'is-active': manualResizeAxis === 'width' }"
+          aria-label="拖动调整字幕窗口宽度"
+          title="拖动调整字幕窗口宽度"
+          @pointerdown.prevent="beginManualResize('width', $event)"
         >
           <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="m5 11 6-6M8 11l3-3M5 8l3-3" />
+            <path d="M2 8h12M4.5 5.5 2 8l2.5 2.5M11.5 5.5 14 8l-2.5 2.5" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="subtitle-tool-button subtitle-height-resize-handle"
+          :class="{ 'is-active': manualResizeAxis === 'height' }"
+          aria-label="拖动调整字幕窗口高度"
+          title="拖动调整字幕窗口高度"
+          @pointerdown.prevent="beginManualResize('height', $event)"
+        >
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 2v12M5.5 4.5 8 2l2.5 2.5M5.5 11.5 8 14l2.5-2.5" />
           </svg>
         </button>
 
+        <button
+          type="button"
+          class="subtitle-tool-button subtitle-pin-button"
+          :class="{ 'is-active': toolbarPinned }"
+          :aria-pressed="toolbarPinned"
+          :aria-label="toolbarPinned ? '取消固定工具栏' : '固定工具栏'"
+          :title="toolbarPinned ? '取消固定工具栏' : '固定工具栏'"
+          @click="toggleToolbarPinned"
+        >
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M5 2.5h6l-.8 3.1 2.3 2.3v1H8.5v4.2L7.5 14V8.9H4.5v-1l2.3-2.3L6 2.5Z" />
+          </svg>
+        </button>
         <div v-if="sizingEditorOpen" class="subtitle-sizing-editor" aria-label="手动字幕尺寸">
           <label class="subtitle-size-field" title="手动宽度（物理像素）">
             <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -561,11 +731,11 @@ onBeforeUnmount(() => {
             />
           </label>
         </div>
-        <p v-if="layoutError" class="subtitle-layout-error" role="status">{{ layoutError }}</p>
       </div>
+      <p v-if="layoutError" class="subtitle-layout-error" role="status">{{ layoutError }}</p>
 
       <div class="subtitle-panel-content">
-        <p v-if="state === 'warming'" class="translated-text">正在连接窗口捕获…</p>
+        <p v-if="!hasLiveSubtitle" class="translated-text">{{ standbyText }}</p>
         <template v-else>
           <p class="translated-text">{{ subtitle?.translatedText || "翻译中…" }}</p>
           <p v-if="showSource && subtitle?.sourceText" class="source-text">
@@ -640,7 +810,7 @@ body,
   flex-direction: column;
   width: max-content;
   max-width: 100%;
-  overflow: hidden;
+  overflow: visible;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 8px;
   color: #ffffff;
@@ -656,32 +826,48 @@ body,
 }
 
 .subtitle-panel-toolbar {
-  position: sticky;
-  top: 0;
-  z-index: 1;
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  z-index: 3;
   display: flex;
-  width: 100%;
+  width: max-content;
+  max-width: calc(100vw - 12px);
   min-width: 0;
   flex: 0 0 auto;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
   padding: 4px 6px;
-  border-bottom: 1px solid transparent;
-  background: rgba(6, 12, 24, 0.56);
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  border-radius: 7px;
+  background: rgba(51, 65, 85, 0.97);
+  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.28);
   opacity: 0;
+  visibility: hidden;
   pointer-events: none;
-  transition: opacity 150ms ease, background 150ms ease;
+  transform: translate(-50%, -4px);
+  transition: opacity 150ms ease, transform 150ms ease, visibility 0s linear 150ms;
+  scrollbar-color: rgba(148, 163, 184, 0.72) transparent;
+  scrollbar-width: thin;
 }
 
 .subtitle-panel:hover .subtitle-panel-toolbar,
 .subtitle-panel:focus-within .subtitle-panel-toolbar,
+.subtitle-panel.is-toolbar-pinned .subtitle-panel-toolbar,
 .subtitle-panel.is-manual-resizing .subtitle-panel-toolbar {
-  border-bottom-color: rgba(226, 232, 240, 0.2);
-  background: rgba(6, 12, 24, 0.94);
   opacity: 1;
+  visibility: visible;
   pointer-events: auto;
+  transform: translate(-50%, 0);
+  transition-delay: 0s;
+}
+
+.subtitle-panel.is-toolbar-pinned .subtitle-panel-content {
+  padding-top: 43px;
 }
 
 .subtitle-panel-content {
@@ -696,8 +882,12 @@ body,
   padding: 9px 20px 10px;
 }
 
-.subtitle-panel.is-manual-resizing {
-  cursor: nwse-resize;
+.subtitle-panel.is-resizing-width {
+  cursor: ew-resize;
+}
+
+.subtitle-panel.is-resizing-height {
+  cursor: ns-resize;
 }
 
 .subtitle-panel.is-manual-resizing .subtitle-panel-content {
@@ -713,8 +903,8 @@ body,
   padding: 0;
   border: 1px solid rgba(226, 232, 240, 0.32);
   border-radius: 5px;
-  color: rgba(226, 232, 240, 0.84);
-  background: rgba(6, 12, 24, 0.88);
+  color: rgba(226, 232, 240, 0.9);
+  background: rgba(15, 23, 42, 0.94);
   cursor: pointer;
 }
 
@@ -732,8 +922,24 @@ body,
   background: rgba(30, 64, 175, 0.88);
 }
 
-.subtitle-resize-handle {
-  cursor: nwse-resize;
+.subtitle-tool-button:disabled {
+  border-color: rgba(226, 232, 240, 0.18);
+  color: rgba(226, 232, 240, 0.4);
+  background: rgba(15, 23, 42, 0.6);
+  cursor: not-allowed;
+}
+
+.subtitle-toolbar-drag-handle {
+  cursor: move;
+  touch-action: none;
+}
+.subtitle-width-resize-handle {
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.subtitle-height-resize-handle {
+  cursor: ns-resize;
   touch-action: none;
 }
 
@@ -749,13 +955,14 @@ body,
 
 .subtitle-sizing-editor {
   display: flex;
-  width: 100%;
-  flex: 1 0 100%;
-  flex-wrap: wrap;
+  width: auto;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: flex-end;
   gap: 4px;
-  padding-top: 2px;
+  padding: 0;
+  white-space: nowrap;
   user-select: text;
 }
 
@@ -787,16 +994,15 @@ body,
 }
 
 .subtitle-layout-error {
-  width: 100%;
-  flex: 1 0 100%;
-  margin: 0;
+  width: calc(100% - 16px);
+  margin: 6px 8px 0;
   padding: 5px 7px;
   border: 1px solid rgba(252, 165, 165, 0.6);
   border-radius: 5px;
   color: #fee2e2;
   background: rgba(127, 29, 29, 0.9);
   font: 500 11px/1.35 "Microsoft YaHei", "Segoe UI", sans-serif;
-  text-align: right;
+  text-align: left;
   white-space: normal;
 }
 

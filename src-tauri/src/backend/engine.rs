@@ -5,7 +5,7 @@ use crate::{
         input::DecodedImage,
         settings::{BackendSettings, DeviceKind},
     },
-    model_config::{MemoryConfig, ModelConfig},
+    model_config::{GenerationConfig, MAX_NEW_TOKENS, MemoryConfig, ModelConfig, PromptConfig},
     model_support::CancellationToken,
     models::{hy, ppocr::PpOcrProvider},
     output::ImageOutput,
@@ -17,6 +17,8 @@ const MIB: usize = 1024 * 1024;
 const GPU_RESIDENT_TOTAL_MIB: usize = 8 * 1024;
 const GPU_RESIDENT_FREE_MIB: usize = 4 * 1024;
 const GPU_BALANCED_FREE_MIB: usize = 2_500;
+const LIVE_TRANSLATION_MIN_NEW_TOKENS: usize = 2_048;
+const LIVE_TRANSLATION_TOKENS_PER_SOURCE_CHAR: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GpuExecutionPolicy {
@@ -343,7 +345,7 @@ impl BackendEngine {
         cancellation.check()?;
         self.load_translator_with_memory(target_language, memory)?;
         let prompt = self.settings.prompt.clone();
-        let generation = self.settings.generation.clone();
+        let base_generation = self.settings.generation.clone();
         let translator = self
             .hy
             .as_mut()
@@ -351,37 +353,17 @@ impl BackendEngine {
         for record in records.iter_mut() {
             let order = record.order;
             let source_text = record.source_text.clone();
-            let mut streamed_text = String::new();
-            let result = translator
-                .translate_text(
-                    &source_text,
-                    target_language,
-                    &prompt,
-                    supplemental_prompt,
-                    &generation,
-                    cancellation,
-                    |chunk| {
-                        streamed_text.push_str(chunk);
-                        on_chunk(order, &streamed_text);
-                        Ok(())
-                    },
-                )
-                .map_err(|error| {
-                    if cancellation.is_cancelled() {
-                        BackendFailure::cancelled("Hy translation was cancelled")
-                    } else {
-                        BackendFailure::translation(format!(
-                            "Hy live region translation failed: {error:#}"
-                        ))
-                    }
-                })?;
-            cancellation.check()?;
-            if result.text.trim().is_empty() {
-                return Err(BackendFailure::translation(format!(
-                    "Hy returned empty translation for region {order}"
-                )));
-            }
-            record.translated_text = result.text;
+            let generation = live_translation_generation(&base_generation, &source_text);
+            record.translated_text = translate_live_text_with_recovery(
+                translator,
+                &source_text,
+                target_language,
+                &prompt,
+                supplemental_prompt,
+                &generation,
+                cancellation,
+                |partial| on_chunk(order, partial),
+            )?;
             on_chunk(order, &record.translated_text);
         }
         cancellation.check()
@@ -399,35 +381,22 @@ impl BackendEngine {
         cancellation.check()?;
         self.load_translator_with_memory(target_language, memory)?;
         let prompt = self.settings.prompt.clone();
-        let generation = self.settings.generation.clone();
+        let generation = live_translation_generation(&self.settings.generation, source_text);
         let translator = self
             .hy
             .as_mut()
             .ok_or_else(|| BackendFailure::internal("Hy provider was not initialized"))?;
-        let result = translator
-            .translate_text(
-                source_text,
-                target_language,
-                &prompt,
-                supplemental_prompt,
-                &generation,
-                cancellation,
-                |chunk| {
-                    on_chunk(chunk);
-                    Ok(())
-                },
-            )
-            .map_err(|error| {
-                if cancellation.is_cancelled() {
-                    BackendFailure::cancelled("Hy translation was cancelled")
-                } else {
-                    BackendFailure::translation(format!(
-                        "Hy live subtitle translation failed: {error:#}"
-                    ))
-                }
-            })?;
-        cancellation.check()?;
-        validate_live_subtitle_translation_output(result.text)
+        let text = translate_live_text_with_recovery(
+            translator,
+            source_text,
+            target_language,
+            &prompt,
+            supplemental_prompt,
+            &generation,
+            cancellation,
+            |partial| on_chunk(partial),
+        )?;
+        validate_live_subtitle_translation_output(text)
     }
 
     fn translate_regions_with_progress(
@@ -608,15 +577,111 @@ fn validate_live_subtitle_translation_output(text: String) -> Result<String, Bac
     Ok(text)
 }
 
+fn live_translation_generation(base: &GenerationConfig, source_text: &str) -> GenerationConfig {
+    let mut generation = base.clone();
+    generation.max_new_tokens = generation
+        .max_new_tokens
+        .max(LIVE_TRANSLATION_MIN_NEW_TOKENS)
+        .max(
+            source_text
+                .chars()
+                .count()
+                .saturating_mul(LIVE_TRANSLATION_TOKENS_PER_SOURCE_CHAR),
+        )
+        .min(MAX_NEW_TOKENS);
+    generation
+}
+
+fn translate_live_text_with_recovery(
+    translator: &mut hy::HyTranslator,
+    source_text: &str,
+    target_language: &str,
+    prompt: &PromptConfig,
+    supplemental_prompt: &str,
+    generation: &GenerationConfig,
+    cancellation: &CancellationToken,
+    mut on_chunk: impl FnMut(&str),
+) -> Result<String, BackendFailure> {
+    let mut streamed_text = String::new();
+    let initial = translator
+        .translate_text(
+            source_text,
+            target_language,
+            prompt,
+            supplemental_prompt,
+            generation,
+            cancellation,
+            |chunk| {
+                streamed_text.push_str(chunk);
+                on_chunk(&streamed_text);
+                Ok(())
+            },
+        )
+        .map_err(|error| {
+            if cancellation.is_cancelled() {
+                BackendFailure::cancelled("Hy translation was cancelled")
+            } else {
+                BackendFailure::translation(format!("Hy live translation failed: {error:#}"))
+            }
+        })?;
+    cancellation.check()?;
+    if hy::translation_text_is_usable(
+        &initial.text,
+        source_text,
+        target_language,
+        prompt,
+        supplemental_prompt,
+    ) {
+        return Ok(initial.text);
+    }
+
+    let initial_stop_reason = initial.stop_reason;
+    let initial_generated_tokens = initial.stats.generated_tokens;
+    translator.reset_context();
+    streamed_text.clear();
+    on_chunk("");
+    let retry_prompt = PromptConfig::default();
+    let retry = translator
+        .translate_text(
+            source_text,
+            target_language,
+            &retry_prompt,
+            "",
+            generation,
+            cancellation,
+            |chunk| {
+                streamed_text.push_str(chunk);
+                on_chunk(&streamed_text);
+                Ok(())
+            },
+        )
+        .map_err(|error| {
+            if cancellation.is_cancelled() {
+                BackendFailure::cancelled("Hy translation was cancelled")
+            } else {
+                BackendFailure::translation(format!(
+                    "Hy minimal-prompt live translation retry failed: {error:#}"
+                ))
+            }
+        })?;
+    cancellation.check()?;
+    if hy::translation_text_is_usable(&retry.text, source_text, target_language, &retry_prompt, "")
+    {
+        return Ok(retry.text);
+    }
+    Err(BackendFailure::translation(format!(
+        "Hy 未生成可用实时译文（首次停止={initial_stop_reason:?}, tokens={initial_generated_tokens}；最小提示重试停止={:?}, tokens={}）",
+        retry.stop_reason, retry.stats.generated_tokens,
+    )))
+}
+
 fn create_device(kind: DeviceKind) -> Result<CandleDevice, BackendFailure> {
     match kind {
         DeviceKind::Cpu => Ok(CandleDevice::Cpu),
         DeviceKind::Cuda => {
             #[cfg(not(feature = "cuda"))]
             {
-                return Err(BackendFailure::device(
-                    "CUDA 模式需要编译 feature `cuda`",
-                ));
+                return Err(BackendFailure::device("CUDA 模式需要编译 feature `cuda`"));
             }
             #[cfg(feature = "cuda")]
             {
