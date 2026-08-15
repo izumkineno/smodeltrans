@@ -175,9 +175,9 @@ onBeforeUnmount(stopPolling);
   <section class="model-monitor-page" aria-labelledby="model-monitor-page-title">
     <header class="monitor-toolbar">
       <div class="monitor-title-group">
-        <p class="panel-kicker">Candle Runtime</p>
-        <h2 id="model-monitor-page-title">运行概览</h2>
-        <p>查看模型驻留、毫秒级性能指标和最近运行记录。</p>
+        <p class="panel-kicker">Operations / Model Runtime</p>
+        <h2 id="model-monitor-page-title">模型运行监控</h2>
+        <p>管理本地 OCR 与 Hy-MT2 的驻留状态；运行指标和记录用于诊断。常用模型与目标语言准备请先在设置中完成。</p>
       </div>
       <div class="monitor-toolbar-actions">
         <n-tag :type="runtimeTagType" round size="small">{{ runtimeLabel }}</n-tag>

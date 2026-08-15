@@ -266,7 +266,7 @@ onBeforeUnmount(() => {
       <div class="selector-copy">
         <strong>框选字幕区域</strong>
         <span>{{ status?.target?.title || "正在读取目标窗口…" }}</span>
-        <p>按住鼠标左键拖动。坐标会按目标客户区转换为物理像素。</p>
+        <p class="selector-guidance">首次使用：按住鼠标左键拖动框选字幕区域；完成后点击“确认选区”，不需要时点击“取消”。</p>
       </div>
       <div class="selector-state">
         <span>{{ selectionLabel }}</span>

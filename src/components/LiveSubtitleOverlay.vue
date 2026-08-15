@@ -37,10 +37,8 @@ import {
   savePersistedLiveOverlaySettings,
 } from "../services/workspace-settings";
 
-const HORIZONTAL_OVERLAY_PADDING = 36;
-const VERTICAL_OVERLAY_PADDING = 30;
-
-type ManualResizeAxis = "width" | "height";
+const HORIZONTAL_OVERLAY_PADDING = 0;
+const VERTICAL_OVERLAY_PADDING = 0;
 
 
 const query = new URLSearchParams(window.location.search);
@@ -58,7 +56,7 @@ const layoutError = ref("");
 const selectionOpening = ref(false);
 const toolbarPinned = ref(false);
 const overlayDragging = ref(false);
-const manualResizeAxis = ref<ManualResizeAxis | null>(null);
+const nativeResizeActive = ref(false);
 const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const overlayWindow = isDesktopRuntime ? getCurrentWindow() : null;
 let lastRevision = -1;
@@ -68,6 +66,16 @@ let layoutSyncPending = false;
 let layoutAnimationFrame: number | undefined;
 let lastLayoutSignature = "";
 let panelResizeObserver: ResizeObserver | undefined;
+type PhysicalWindowSize = { width: number; height: number };
+const nativeWindowSize = ref<PhysicalWindowSize>();
+let lastWindowSize: PhysicalWindowSize | undefined;
+let expectedWindowSize: PhysicalWindowSize | undefined;
+let nativeResizeBaseSize: PhysicalWindowSize | undefined;
+let nativeResizeFinishTimer: number | undefined;
+let nativeResizeLockTask: Promise<void> | undefined;
+let nativeResizeLockError: string | undefined;
+let nativeResizeLocked = false;
+let nativeResizeFinalizing = false;
 const unlisteners: UnlistenFn[] = [];
 
 function queryPhysicalDimension(name: string, fallback: number): number {
@@ -118,7 +126,6 @@ const canOpenRegionSelector = computed(
     !selectionOpening.value &&
     (state.value === "running" || state.value === "paused"),
 );
-const manualResizeActive = computed(() => manualResizeAxis.value !== null);
 const subtitlePanelStyle = computed<CSSProperties>(() => {
   const manualPanelWidth = Math.max(
     1,
@@ -128,19 +135,35 @@ const subtitlePanelStyle = computed<CSSProperties>(() => {
     1,
     liveOverlaySettings.value.manualHeight / deviceScaleFactor - VERTICAL_OVERLAY_PADDING,
   );
+  const nativePanelWidth = nativeWindowSize.value
+    ? Math.max(1, nativeWindowSize.value.width / deviceScaleFactor - HORIZONTAL_OVERLAY_PADDING)
+    : undefined;
+  const nativePanelHeight = nativeWindowSize.value
+    ? Math.max(1, nativeWindowSize.value.height / deviceScaleFactor - VERTICAL_OVERLAY_PADDING)
+    : undefined;
+  const useNativeWindowSize =
+    nativeResizeActive.value && nativePanelWidth !== undefined && nativePanelHeight !== undefined;
   return {
-    width: liveOverlaySettings.value.autoWidth
-      ? "max-content"
-      : `${manualPanelWidth}px`,
-    height: liveOverlaySettings.value.autoHeight
-      ? "fit-content"
-      : `${manualPanelHeight}px`,
-    maxWidth: liveOverlaySettings.value.autoWidth
-      ? `${automaticPanelWidthLimit}px`
-      : `${manualPanelWidth}px`,
-    maxHeight: liveOverlaySettings.value.autoHeight
-      ? `${automaticPanelHeightLimit}px`
-      : `${manualPanelHeight}px`,
+    width: useNativeWindowSize
+      ? `${nativePanelWidth}px`
+      : liveOverlaySettings.value.autoWidth
+        ? "max-content"
+        : `${manualPanelWidth}px`,
+    height: useNativeWindowSize
+      ? `${nativePanelHeight}px`
+      : liveOverlaySettings.value.autoHeight
+        ? "fit-content"
+        : `${manualPanelHeight}px`,
+    maxWidth: useNativeWindowSize
+      ? `${nativePanelWidth}px`
+      : liveOverlaySettings.value.autoWidth
+        ? `${automaticPanelWidthLimit}px`
+        : `${manualPanelWidth}px`,
+    maxHeight: useNativeWindowSize
+      ? `${nativePanelHeight}px`
+      : liveOverlaySettings.value.autoHeight
+        ? `${automaticPanelHeightLimit}px`
+        : `${manualPanelHeight}px`,
     flex: "0 0 auto",
   };
 });
@@ -254,7 +277,7 @@ function scheduleLayoutSync(force = false): void {
   if (force) {
     lastLayoutSignature = "";
   }
-  if (manualResizeActive.value) {
+  if (nativeResizeActive.value) {
     layoutSyncPending = true;
     return;
   }
@@ -269,7 +292,7 @@ function scheduleLayoutSync(force = false): void {
 }
 
 async function syncOverlayLayout(): Promise<void> {
-  if (manualResizeActive.value) {
+  if (nativeResizeActive.value) {
     layoutSyncPending = true;
     return;
   }
@@ -298,7 +321,19 @@ async function syncOverlayLayout(): Promise<void> {
   layoutSyncInFlight = true;
   try {
     await updateLiveOverlayLayout(sessionId, sizing, contentSize);
+    if (overlayWindow) {
+      try {
+        const size = await overlayWindow.outerSize();
+        const nextSize = { width: size.width, height: size.height };
+        lastWindowSize = nextSize;
+        nativeWindowSize.value = nextSize;
+        expectedWindowSize = nextSize;
+      } catch {
+        // The overlay may close while the backend finishes the layout update.
+      }
+    }
     lastLayoutSignature = signature;
+
     layoutError.value = "";
   } catch (error) {
     layoutError.value = `尺寸同步失败：${errorText(error)}`;
@@ -308,6 +343,146 @@ async function syncOverlayLayout(): Promise<void> {
       layoutSyncPending = false;
       scheduleLayoutSync();
     }
+  }
+}
+function samePhysicalWindowSize(
+  left: PhysicalWindowSize | undefined,
+  right: PhysicalWindowSize,
+): boolean {
+  return left?.width === right.width && left.height === right.height;
+}
+
+function requestNativeResizeLock(): void {
+  if (
+    !sessionId ||
+    !overlayWindow ||
+    nativeResizeLocked ||
+    nativeResizeLockTask
+  ) {
+    return;
+  }
+  nativeResizeLockError = undefined;
+  nativeResizeLockTask = beginLiveOverlayResize(sessionId)
+    .then(() => {
+      nativeResizeLocked = true;
+    })
+    .catch((error) => {
+      nativeResizeLockError = `锁定字幕窗口拉伸失败：${errorText(error)}`;
+    });
+}
+
+function handleNativeWindowResize(width: number, height: number): void {
+  const nextSize = { width, height };
+  const previousSize = lastWindowSize;
+  lastWindowSize = nextSize;
+  nativeWindowSize.value = nextSize;
+
+  if (!sizingEnabled.value || nativeResizeFinalizing || layoutSyncInFlight) {
+    return;
+  }
+  if (samePhysicalWindowSize(expectedWindowSize, nextSize)) {
+    expectedWindowSize = undefined;
+    return;
+  }
+  expectedWindowSize = undefined;
+  const widthChanged = previousSize === undefined || previousSize.width !== width;
+  const heightChanged = previousSize === undefined || previousSize.height !== height;
+  if (!widthChanged && !heightChanged) {
+    return;
+  }
+  if (!nativeResizeActive.value) {
+    nativeResizeActive.value = true;
+    nativeResizeBaseSize = previousSize;
+    requestNativeResizeLock();
+  }
+  if (nativeResizeFinishTimer !== undefined) {
+    window.clearTimeout(nativeResizeFinishTimer);
+  }
+  nativeResizeFinishTimer = window.setTimeout(() => {
+    nativeResizeFinishTimer = undefined;
+    void finishNativeWindowResize();
+  }, 160);
+}
+
+async function finishNativeWindowResize(): Promise<void> {
+  if (!nativeResizeActive.value) {
+    return;
+  }
+  nativeResizeFinalizing = true;
+  const finalSize = nativeWindowSize.value;
+  const baseSize = nativeResizeBaseSize;
+  const lockTask = nativeResizeLockTask;
+  let resizeError = nativeResizeLockError ?? "";
+  let persistenceError: string | null = null;
+  try {
+    if (lockTask) {
+      await lockTask;
+    }
+    const widthChanged =
+      finalSize !== undefined &&
+      (baseSize === undefined || finalSize.width !== baseSize.width);
+    const heightChanged =
+      finalSize !== undefined &&
+      (baseSize === undefined || finalSize.height !== baseSize.height);
+    if (finalSize && widthChanged) {
+      liveOverlaySettings.value.manualWidth = clampManualDimension(
+        finalSize.width,
+        LIVE_SUBTITLE_MANUAL_WIDTH_MIN,
+        LIVE_SUBTITLE_MANUAL_WIDTH_MAX,
+      );
+      liveOverlaySettings.value.autoWidth = false;
+    }
+    if (finalSize && heightChanged) {
+      liveOverlaySettings.value.manualHeight = clampManualDimension(
+        finalSize.height,
+        LIVE_SUBTITLE_MANUAL_HEIGHT_MIN,
+        LIVE_SUBTITLE_MANUAL_HEIGHT_MAX,
+      );
+      liveOverlaySettings.value.autoHeight = false;
+    }
+    persistenceError = savePersistedLiveOverlaySettings();
+    await nextTick();
+    const contentSize = measuredContentSize();
+    if (sessionId && contentSize && nativeResizeLocked) {
+      await updateLiveOverlayLayout(sessionId, currentSizing(), contentSize);
+      lastLayoutSignature = "";
+    }
+    if (sessionId && overlayWindow && nativeResizeLocked) {
+      const position = await overlayWindow.outerPosition();
+      await updateLiveOverlayPosition(sessionId, {
+        x: position.x,
+        y: position.y,
+      });
+    }
+  } catch (error) {
+    resizeError = resizeError || `调整字幕窗口尺寸失败：${errorText(error)}`;
+  } finally {
+    if (nativeResizeLocked && sessionId) {
+      try {
+        await finishLiveOverlayResize(sessionId);
+      } catch (error) {
+        resizeError = resizeError || `结束字幕拉伸失败：${errorText(error)}`;
+      }
+      nativeResizeLocked = false;
+    }
+    if (overlayWindow) {
+      try {
+        const size = await overlayWindow.outerSize();
+        const nextSize = { width: size.width, height: size.height };
+        lastWindowSize = nextSize;
+        nativeWindowSize.value = nextSize;
+        expectedWindowSize = nextSize;
+      } catch {
+        // The overlay may close while the native resize is being finalized.
+      }
+    }
+    nativeResizeLockTask = undefined;
+    nativeResizeLockError = undefined;
+    nativeResizeBaseSize = undefined;
+    nativeResizeFinalizing = false;
+    nativeResizeActive.value = false;
+    layoutError.value = resizeError || persistenceError || "";
+    scheduleLayoutSync(true);
   }
 }
 function setSubtitlePanel(element: Element | ComponentPublicInstance | null): void {
@@ -434,72 +609,6 @@ function clampManualDimension(value: number, minimum: number, maximum: number): 
   return Math.min(maximum, Math.max(minimum, Math.round(value)));
 }
 
-async function beginManualResize(
-  axis: ManualResizeAxis,
-  event: PointerEvent,
-): Promise<void> {
-  if (
-    event.button !== 0 ||
-    !sessionId ||
-    !overlayWindow ||
-    manualResizeActive.value
-  ) {
-    return;
-  }
-  event.preventDefault();
-  manualResizeAxis.value = axis;
-  let resizeLocked = false;
-  try {
-    await beginLiveOverlayResize(sessionId);
-    resizeLocked = true;
-    await overlayWindow.startResizeDragging(axis === "width" ? "East" : "South");
-    const size = await overlayWindow.outerSize();
-    const minimum =
-      axis === "width"
-        ? LIVE_SUBTITLE_MANUAL_WIDTH_MIN
-        : LIVE_SUBTITLE_MANUAL_HEIGHT_MIN;
-    const maximum =
-      axis === "width"
-        ? LIVE_SUBTITLE_MANUAL_WIDTH_MAX
-        : LIVE_SUBTITLE_MANUAL_HEIGHT_MAX;
-    const value = clampManualDimension(
-      axis === "width" ? size.width : size.height,
-      minimum,
-      maximum,
-    );
-    if (axis === "width") {
-      liveOverlaySettings.value.manualWidth = value;
-      liveOverlaySettings.value.autoWidth = false;
-    } else {
-      liveOverlaySettings.value.manualHeight = value;
-      liveOverlaySettings.value.autoHeight = false;
-    }
-    const persistenceError = savePersistedLiveOverlaySettings();
-    await nextTick();
-    const contentSize = measuredContentSize();
-    if (!contentSize) {
-      throw new Error("无法读取字幕窗口尺寸");
-    }
-    await updateLiveOverlayLayout(sessionId, currentSizing(), contentSize);
-    lastLayoutSignature = "";
-    layoutError.value = persistenceError ?? "";
-  } catch (error) {
-    layoutError.value = `调整字幕${axis === "width" ? "宽度" : "高度"}失败：${errorText(error)}`;
-  } finally {
-    if (resizeLocked) {
-      try {
-        await finishLiveOverlayResize(sessionId);
-      } catch (error) {
-        const message = `结束字幕拉伸失败：${errorText(error)}`;
-        layoutError.value = layoutError.value
-          ? `${layoutError.value} ${message}`
-          : message;
-      }
-    }
-    manualResizeAxis.value = null;
-    scheduleLayoutSync(true);
-  }
-}
 
 function applySubtitle(next: LiveSubtitle): void {
   if (!shouldApplyLiveSubtitle(next, sessionId, lastRevision)) {
@@ -511,6 +620,16 @@ function applySubtitle(next: LiveSubtitle): void {
 }
 
 async function initialize(): Promise<void> {
+  if (overlayWindow && sizingEnabled.value) {
+    try {
+      const size = await overlayWindow.outerSize();
+      const initialSize = { width: size.width, height: size.height };
+      lastWindowSize = initialSize;
+      nativeWindowSize.value = initialSize;
+    } catch {
+      // The native overlay may not be ready before its first layout pass.
+    }
+  }
   const registered = await Promise.all([
     listenLiveSubtitle(applySubtitle),
     listenLiveStatus((status) => {
@@ -528,6 +647,16 @@ async function initialize(): Promise<void> {
     return;
   }
   unlisteners.push(...registered);
+  if (overlayWindow && sizingEnabled.value) {
+    const resizeUnlisten = await overlayWindow.onResized(({ payload }) => {
+      handleNativeWindowResize(payload.width, payload.height);
+    });
+    if (!listenersActive) {
+      resizeUnlisten();
+      return;
+    }
+    unlisteners.push(resizeUnlisten);
+  }
   const status = await getLiveSessionStatus();
   if (!sessionId || status.sessionId === sessionId || status.state === "idle") {
     state.value = status.state;
@@ -553,8 +682,27 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  manualResizeAxis.value = null;
   listenersActive = false;
+  nativeResizeActive.value = false;
+  if (nativeResizeFinishTimer !== undefined) {
+    window.clearTimeout(nativeResizeFinishTimer);
+  }
+  const lockTask = nativeResizeLockTask;
+  if (sessionId && (lockTask || nativeResizeLocked)) {
+    void (async () => {
+      if (lockTask) {
+        await lockTask;
+      }
+      if (nativeResizeLocked) {
+        try {
+          await finishLiveOverlayResize(sessionId);
+        } catch {
+          // The session may already be stopping while the overlay unmounts.
+        }
+        nativeResizeLocked = false;
+      }
+    })();
+  }
   if (layoutAnimationFrame !== undefined) {
     window.cancelAnimationFrame(layoutAnimationFrame);
   }
@@ -577,9 +725,7 @@ onBeforeUnmount(() => {
       class="subtitle-panel"
       :class="{
         'subtitle-panel-warming': state === 'warming',
-        'is-manual-resizing': manualResizeActive,
-        'is-resizing-width': manualResizeAxis === 'width',
-        'is-resizing-height': manualResizeAxis === 'height',
+        'is-native-resizing': nativeResizeActive,
         'is-toolbar-pinned': toolbarPinned,
       }"
       :style="subtitlePanelStyle"
@@ -657,30 +803,6 @@ onBeforeUnmount(() => {
           <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
             <rect x="2.5" y="2.5" width="11" height="11" rx="1.5" />
             <path d="M5 11 11 5M8.5 4.8H11.2v2.7" />
-          </svg>
-        </button>
-        <button
-          type="button"
-          class="subtitle-tool-button subtitle-width-resize-handle"
-          :class="{ 'is-active': manualResizeAxis === 'width' }"
-          aria-label="拖动调整字幕窗口宽度"
-          title="拖动调整字幕窗口宽度"
-          @pointerdown.prevent="beginManualResize('width', $event)"
-        >
-          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M2 8h12M4.5 5.5 2 8l2.5 2.5M11.5 5.5 14 8l-2.5 2.5" />
-          </svg>
-        </button>
-        <button
-          type="button"
-          class="subtitle-tool-button subtitle-height-resize-handle"
-          :class="{ 'is-active': manualResizeAxis === 'height' }"
-          aria-label="拖动调整字幕窗口高度"
-          title="拖动调整字幕窗口高度"
-          @pointerdown.prevent="beginManualResize('height', $event)"
-        >
-          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M8 2v12M5.5 4.5 8 2l2.5 2.5M5.5 11.5 8 14l2.5-2.5" />
           </svg>
         </button>
 
@@ -790,7 +912,7 @@ body,
   height: 100%;
   align-items: flex-end;
   justify-content: center;
-  padding: 12px 18px 18px;
+  padding: 0;
   pointer-events: auto;
   user-select: none;
 }
@@ -815,7 +937,7 @@ body,
   border-radius: 8px;
   color: #ffffff;
   background: rgba(6, 12, 24, 0.82);
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.34);
+  box-shadow: none;
   text-align: center;
   backdrop-filter: blur(10px);
 }
@@ -845,7 +967,7 @@ body,
   border: 1px solid rgba(148, 163, 184, 0.4);
   border-radius: 7px;
   background: rgba(51, 65, 85, 0.97);
-  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.28);
+  box-shadow: none;
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
@@ -858,7 +980,7 @@ body,
 .subtitle-panel:hover .subtitle-panel-toolbar,
 .subtitle-panel:focus-within .subtitle-panel-toolbar,
 .subtitle-panel.is-toolbar-pinned .subtitle-panel-toolbar,
-.subtitle-panel.is-manual-resizing .subtitle-panel-toolbar {
+.subtitle-panel.is-native-resizing .subtitle-panel-toolbar {
   opacity: 1;
   visibility: visible;
   pointer-events: auto;
@@ -882,15 +1004,7 @@ body,
   padding: 9px 20px 10px;
 }
 
-.subtitle-panel.is-resizing-width {
-  cursor: ew-resize;
-}
-
-.subtitle-panel.is-resizing-height {
-  cursor: ns-resize;
-}
-
-.subtitle-panel.is-manual-resizing .subtitle-panel-content {
+.subtitle-panel.is-native-resizing .subtitle-panel-content {
   pointer-events: none;
 }
 
@@ -931,15 +1045,6 @@ body,
 
 .subtitle-toolbar-drag-handle {
   cursor: move;
-  touch-action: none;
-}
-.subtitle-width-resize-handle {
-  cursor: ew-resize;
-  touch-action: none;
-}
-
-.subtitle-height-resize-handle {
-  cursor: ns-resize;
   touch-action: none;
 }
 

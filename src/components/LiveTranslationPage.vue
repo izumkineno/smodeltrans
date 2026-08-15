@@ -580,6 +580,14 @@ onBeforeUnmount(cleanupPage);
       浏览器预览仅展示完整操作界面。窗口捕获、区域选择和字幕浮层需要在 Windows Tauri 桌面端运行。
     </n-alert>
 
+    <section class="live-primary-section" aria-labelledby="live-primary-section-title">
+      <div class="live-section-heading">
+        <div>
+          <p class="panel-kicker">Primary workflow</p>
+          <h3 id="live-primary-section-title">开始实时翻译</h3>
+          <p>先选择目标窗口与目标语言，再开始实时会话；运行中的暂停、重选区和停止操作集中在会话控制中。</p>
+        </div>
+      </div>
     <div class="live-workspace-grid">
       <n-card class="live-card" :bordered="false">
         <div class="card-heading">
@@ -736,7 +744,17 @@ onBeforeUnmount(cleanupPage);
         </div>
       </n-card>
     </div>
+    </section>
 
+
+    <section class="live-secondary-config" aria-labelledby="live-secondary-config-title">
+      <div class="live-section-heading">
+        <div>
+          <p class="panel-kicker">Secondary configuration</p>
+          <h3 id="live-secondary-config-title">启动前配置</h3>
+          <p>显示、翻译与识别设置按需调整，并在下一次开始抓取字幕时应用。</p>
+        </div>
+      </div>
     <n-card class="live-card live-settings-card" :bordered="false">
       <div class="card-heading">
         <div>
@@ -1004,8 +1022,18 @@ onBeforeUnmount(cleanupPage);
         }}
       </n-alert>
     </n-card>
+    </section>
 
 
+
+    <section class="live-observability" aria-labelledby="live-observability-title">
+      <div class="live-section-heading">
+        <div>
+          <p class="panel-kicker">Runtime details</p>
+          <h3 id="live-observability-title">运行数据与诊断</h3>
+          <p>指标和调试记录用于会话运行中的状态观察与问题排查，位于主要流程之后。</p>
+        </div>
+      </div>
     <n-card class="metrics-card" :bordered="false">
       <div class="metrics-heading">
         <div>
@@ -1076,6 +1104,8 @@ onBeforeUnmount(cleanupPage);
         </li>
       </ol>
     </n-card>
+    </section>
+
 
     <footer class="live-footer">
       <span>单窗口 · 单 ROI</span>
@@ -1140,6 +1170,42 @@ onBeforeUnmount(cleanupPage);
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
+.live-primary-section,
+.live-secondary-config,
+.live-observability {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.live-secondary-config,
+.live-observability {
+  padding-top: 4px;
+  border-top: 1px solid var(--divider);
+}
+
+.live-section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 4px;
+}
+
+.live-section-heading h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 18px;
+}
+
+.live-section-heading p:not(.panel-kicker) {
+  max-width: 760px;
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 
 .live-workspace-grid {
   display: grid;

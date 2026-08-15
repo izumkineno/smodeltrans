@@ -318,15 +318,16 @@ onBeforeUnmount(() => {
 
 <template>
   <section ref="pageRoot" class="text-translation-page" aria-label="文本翻译工作区">
-    <div class="text-page-grid">
-      <n-card class="text-page-card text-input-card" :bordered="false">
-        <div class="text-card-heading">
-          <div class="text-card-title">
-            <span class="text-section-number">01</span>
+    <p class="one-shot-context">适合已有文字的直接翻译，不需要先识别图片。</p>
+    <div class="workflow-grid text-page-grid">
+      <n-card class="panel text-page-card text-input-card" :bordered="false">
+        <div class="panel-heading text-card-heading">
+          <div class="panel-title text-card-title">
+            <span class="section-number text-section-number">01</span>
             <div>
-              <p class="text-panel-kicker">输入 / 文本</p>
+              <p class="panel-kicker text-panel-kicker">输入 / 文本</p>
               <h2>输入待翻译内容</h2>
-              <p class="text-panel-copy">直接调用 Hy-MT2 模型翻译文本，不经过 OCR。</p>
+              <p class="panel-copy text-panel-copy">直接调用 Hy-MT2 模型翻译文本，不经过 OCR。</p>
             </div>
           </div>
           <n-tag round size="small" type="info">Hy-MT2</n-tag>
@@ -385,14 +386,14 @@ onBeforeUnmount(() => {
         </div>
       </n-card>
 
-      <n-card class="text-page-card text-output-card" :bordered="false">
-        <div class="text-card-heading">
-          <div class="text-card-title">
-            <span class="text-section-number">02</span>
+      <n-card class="panel text-page-card text-output-card" :bordered="false">
+        <div class="panel-heading text-card-heading">
+          <div class="panel-title text-card-title">
+            <span class="section-number text-section-number">02</span>
             <div>
-              <p class="text-panel-kicker">输出 / 译文</p>
+              <p class="panel-kicker text-panel-kicker">输出 / 译文</p>
               <h2>翻译结果</h2>
-              <p class="text-panel-copy">复制译文，或保存为文本文件。</p>
+              <p class="panel-copy text-panel-copy">复制译文，或保存为文本文件。</p>
             </div>
           </div>
           <n-tag :type="workflowTagType" round size="small">{{ workflowStatus }}</n-tag>
@@ -400,7 +401,7 @@ onBeforeUnmount(() => {
 
         <div v-if="workflowState === 'processing'" class="text-processing-state" aria-busy="true">
           <div class="text-processing-icon" aria-hidden="true"><n-spin size="medium" /></div>
-          <p class="text-panel-kicker">模型生成中</p>
+          <p class="panel-kicker text-panel-kicker">模型生成中</p>
           <p class="text-status-copy">{{ statusMessage }}</p>
           <n-progress
             type="line"
@@ -466,6 +467,13 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.one-shot-context {
+  margin: 0 0 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .text-translation-page {
   width: 100%;
   margin-top: 24px;

@@ -279,33 +279,105 @@ function renderSettingsIcon() {
   );
 }
 
-const menuOptions: MenuOption[] = [
+function renderLiveTranslationIcon() {
+  return h(
+    NIcon,
+    { size: 16 },
+    {
+      default: () =>
+        h("svg", { viewBox: "0 0 20 20", fill: "none", "aria-hidden": "true" }, [
+          h("rect", {
+            x: "3",
+            y: "4",
+            width: "14",
+            height: "10",
+            rx: "1.5",
+            stroke: "currentColor",
+            "stroke-width": "1.2",
+          }),
+          h("path", {
+            d: "M6 17h8M8.5 14v3M11.5 14v3M5.5 9h2l1.3-2.2L11 11l1.4-1.8 2.1 1.3",
+            stroke: "currentColor",
+            "stroke-width": "1.2",
+            "stroke-linecap": "round",
+            "stroke-linejoin": "round",
+          }),
+        ]),
+    },
+  );
+}
+
+function renderModelMonitorIcon() {
+  return h(
+    NIcon,
+    { size: 16 },
+    {
+      default: () =>
+        h("svg", { viewBox: "0 0 20 20", fill: "none", "aria-hidden": "true" }, [
+          h("path", {
+            d: "M4 15.5V10M8 15.5V6.5M12 15.5V8.5M16 15.5V4.5",
+            stroke: "currentColor",
+            "stroke-width": "1.4",
+            "stroke-linecap": "round",
+          }),
+          h("path", {
+            d: "M3 17h14",
+            stroke: "currentColor",
+            "stroke-width": "1.2",
+            "stroke-linecap": "round",
+          }),
+        ]),
+    },
+  );
+}
+
+function renderNavOptionLabel(title: string, description: string) {
+  return () =>
+    h("span", { class: "nav-option-label" }, [
+      h("span", { class: "nav-option-title" }, title),
+      h("span", { class: "nav-option-description" }, description),
+    ]);
+}
+
+const primaryMenuOptions: MenuOption[] = [
   {
-    label: "翻译",
+    label: "实时翻译",
+    key: "live-translation",
+    icon: renderLiveTranslationIcon,
+  },
+];
+
+const oneShotMenuOptions: MenuOption[] = [
+  {
+    label: renderNavOptionLabel("文本翻译", "粘贴文本，快速完成一次翻译"),
     key: "translate",
     icon: renderTranslationIcon,
   },
   {
-    label: "OCR",
+    label: renderNavOptionLabel("OCR", "上传图片，提取其中的文字"),
     key: "ocr",
     icon: renderOcrIcon,
   },
   {
-    label: "OCR翻译",
+    label: renderNavOptionLabel("OCR翻译", "上传图片，识别并翻译文字"),
     key: "ocr-translate",
     icon: renderOcrTranslationIcon,
   },
-  {
-    label: "实时翻译",
-    key: "live-translation",
-    icon: renderOcrTranslationIcon,
-  },
+];
+
+const operationsMenuOptions: MenuOption[] = [
   {
     label: "设置",
     key: "settings",
     icon: renderSettingsIcon,
   },
+  {
+    label: "模型监控",
+    key: "model-monitor",
+    icon: renderModelMonitorIcon,
+  },
 ];
+
 
 const route = useRoute();
 const router = useRouter();
@@ -647,20 +719,40 @@ onBeforeUnmount(() => {
 
         <n-layout has-sider class="workspace-shell">
           <n-layout-sider class="sidebar" bordered :width="208" :native-scrollbar="false">
-            <div class="sidebar-header">
-              <p class="sidebar-kicker">工作区</p>
-              <p class="sidebar-title">SmodelTrans</p>
-              <p class="sidebar-subtitle">本地翻译工作台</p>
-            </div>
 
             <nav class="sidebar-nav" aria-label="主导航">
-              <p class="nav-heading">工作台</p>
-              <n-menu
-                :value="activeMenu"
-                :icon-size="16"
-                :options="menuOptions"
-                @update:value="handleMenuUpdate"
-              />
+              <section class="nav-section nav-section-primary" aria-labelledby="nav-primary-heading">
+                <p id="nav-primary-heading" class="nav-heading">主要功能</p>
+                <p class="nav-context">先选择窗口并开始实时翻译。</p>
+                <n-menu
+                  :value="activeMenu"
+                  :icon-size="16"
+                  :options="primaryMenuOptions"
+                  @update:value="handleMenuUpdate"
+                />
+              </section>
+
+              <section class="nav-section" aria-labelledby="nav-one-shot-heading">
+                <p id="nav-one-shot-heading" class="nav-heading">一次性工具</p>
+                <p class="nav-context">按内容选择文本、OCR 或 OCR 翻译。</p>
+                <n-menu
+                  :value="activeMenu"
+                  :icon-size="16"
+                  :options="oneShotMenuOptions"
+                  @update:value="handleMenuUpdate"
+                />
+              </section>
+
+              <section class="nav-section" aria-labelledby="nav-operations-heading">
+                <p id="nav-operations-heading" class="nav-heading">操作</p>
+                <p class="nav-context">准备模型和目标语言，或查看运行状态。</p>
+                <n-menu
+                  :value="activeMenu"
+                  :icon-size="16"
+                  :options="operationsMenuOptions"
+                  @update:value="handleMenuUpdate"
+                />
+              </section>
             </nav>
 
             <div class="sidebar-bottom">
@@ -1007,7 +1099,20 @@ a:focus-visible {
 }
 
 .sidebar-nav {
-  padding: 0 10px;
+  display: grid;
+  gap: 18px;
+  padding: 0 10px 12px;
+}
+
+.nav-section {
+  min-width: 0;
+}
+
+.nav-section-primary {
+  padding: 10px 8px 8px;
+  border: 1px solid #d9ecff;
+  border-radius: 6px;
+  background: #f8fbff;
 }
 
 .sidebar-nav .n-menu {
@@ -1019,6 +1124,43 @@ a:focus-visible {
   padding: 0 9px 8px;
 }
 
+.nav-section-primary .nav-heading {
+  color: var(--green);
+}
+
+.nav-context {
+  margin: -2px 9px 8px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.nav-option-label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+  line-height: 1.2;
+}
+
+.nav-option-title,
+.nav-option-description {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-option-title {
+  color: inherit;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.nav-option-description {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.25;
+}
 
 .sidebar-bottom {
   margin-top: auto;

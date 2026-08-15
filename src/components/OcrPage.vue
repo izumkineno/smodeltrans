@@ -501,16 +501,17 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="ocr-page" aria-label="OCR 识别工作区">
+    <p class="one-shot-context">适合只从图片提取文字，不进行翻译。</p>
     <p class="sr-only" aria-live="polite">{{ statusMessage }}</p>
-    <div class="ocr-page-grid">
-      <n-card class="ocr-page-card ocr-input-card" :bordered="false">
-        <div class="ocr-card-heading">
-          <div class="ocr-card-title">
-            <span class="ocr-section-number">01</span>
+    <div class="workflow-grid ocr-page-grid">
+      <n-card class="panel ocr-page-card ocr-input-card" :bordered="false">
+        <div class="panel-heading ocr-card-heading">
+          <div class="panel-title ocr-card-title">
+            <span class="section-number ocr-section-number">01</span>
             <div>
-              <p class="ocr-panel-kicker">输入 / 图片</p>
+              <p class="panel-kicker ocr-panel-kicker">输入 / 图片</p>
               <h2>选择图片</h2>
-              <p class="ocr-panel-copy">识别图片中的文字，不执行模型翻译。</p>
+              <p class="panel-copy ocr-panel-copy">识别图片中的文字，不执行模型翻译。</p>
             </div>
           </div>
           <n-tag class="ocr-state-tag" :type="workflowTagType" round size="small">{{ workflowStatus }}</n-tag>
@@ -518,8 +519,8 @@ onBeforeUnmount(() => {
 
         <div
           v-if="!selectedFile"
-          class="ocr-drop-zone"
-          :class="{ 'ocr-drop-zone-active': isDragActive }"
+          class="drop-zone ocr-drop-zone"
+          :class="{ 'ocr-drop-zone-active': isDragActive, 'drop-zone-active': isDragActive }"
           role="button"
           tabindex="0"
           aria-label="选择 OCR 图片文件"
@@ -533,29 +534,29 @@ onBeforeUnmount(() => {
           <input
             id="ocr-image-file"
             ref="fileInput"
-            class="ocr-file-input"
+            class="file-input ocr-file-input"
             type="file"
             :accept="SUPPORTED_IMAGE_EXTENSIONS.map((extension) => `.${extension}`).join(',')"
             aria-label="选择 OCR 图片文件"
             @change="handleFileInput"
           />
-          <div class="ocr-drop-label">
-            <span class="ocr-drop-icon" aria-hidden="true">
+          <div class="drop-zone-label ocr-drop-label">
+            <span class="drop-icon ocr-drop-icon" aria-hidden="true">
               <svg viewBox="0 0 32 32" fill="none">
                 <rect x="4.5" y="5.5" width="23" height="21" rx="3" stroke="currentColor" stroke-width="1.5" />
                 <circle cx="11" cy="12" r="2" stroke="currentColor" stroke-width="1.5" />
                 <path d="m7 23 6.2-6 4.3 4 3-3 4.5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
               </svg>
             </span>
-            <span class="ocr-drop-kicker">拖放图片以识别</span>
-            <span class="ocr-drop-copy">或从设备选择文件，或按 Ctrl+V 粘贴图片</span>
-            <n-button text type="primary" size="small" class="ocr-drop-action" @click.stop="openFilePicker">
+            <span class="drop-zone-kicker ocr-drop-kicker">拖放图片以识别</span>
+            <span class="drop-zone-copy ocr-drop-copy">或从设备选择文件，或按 Ctrl+V 粘贴图片</span>
+            <n-button text type="primary" size="small" class="drop-zone-action ocr-drop-action" @click.stop="openFilePicker">
               浏览文件 <span aria-hidden="true">↗</span>
             </n-button>
           </div>
         </div>
 
-        <div v-else class="ocr-preview-layout">
+        <div v-else class="preview-layout ocr-preview-layout">
           <ImagePreviewFrame
             title="输入预览"
             state-label="已加载"
@@ -566,7 +567,7 @@ onBeforeUnmount(() => {
             :render-toolbar="renderImageToolbar"
             @error="handlePreviewError"
           />
-          <div class="ocr-preview-details">
+          <div class="preview-details ocr-preview-details">
             <div class="ocr-file-identity">
               <span class="ocr-file-type-mark" aria-hidden="true">IMG</span>
               <div>
@@ -575,7 +576,7 @@ onBeforeUnmount(() => {
                 <p class="ocr-file-meta">{{ fileSizeLabel }} <span aria-hidden="true">·</span> {{ selectedFile.type || '图片文件' }}</p>
               </div>
             </div>
-            <div class="ocr-button-row">
+            <div class="button-row ocr-button-row">
               <n-button secondary @click="resetWorkflow">选择其他</n-button>
               <n-button
                 v-if="workflowState !== 'processing'"
@@ -587,39 +588,39 @@ onBeforeUnmount(() => {
               </n-button>
               <n-button v-else tertiary type="warning" @click="cancelOcr">取消 OCR</n-button>
             </div>
-            <n-alert v-if="!isDesktopRuntime" class="ocr-inline-alert" type="info" :show-icon="false">
+            <n-alert v-if="!isDesktopRuntime" class="inline-alert ocr-inline-alert" type="info" :show-icon="false">
               浏览器预览仅展示界面；OCR 需要在 Tauri 桌面端运行。
             </n-alert>
-            <n-alert v-if="workflowState === 'error'" class="ocr-inline-alert" type="error" title="图片无法识别" :show-icon="true">
+            <n-alert v-if="workflowState === 'error'" class="inline-alert ocr-inline-alert" type="error" title="图片无法识别" :show-icon="true">
               {{ errorMessage }}
             </n-alert>
           </div>
         </div>
 
-        <n-alert v-if="workflowState === 'error' && !selectedFile" class="ocr-inline-alert" type="error" title="图片无法使用" :show-icon="true">
+        <n-alert v-if="workflowState === 'error' && !selectedFile" class="inline-alert ocr-inline-alert" type="error" title="图片无法使用" :show-icon="true">
           {{ errorMessage }}
         </n-alert>
-        <p class="ocr-input-helper">
+        <p class="input-helper ocr-input-helper">
           支持：{{ SUPPORTED_IMAGE_EXTENSIONS.map((extension) => extension.toUpperCase()).join(' · ') }}
           <span aria-hidden="true"> / </span>
           最大 {{ MAX_IMAGE_BYTES / (1024 * 1024) }} MB · {{ MAX_IMAGE_PIXELS / 1000000 }} MP
         </p>
       </n-card>
 
-      <n-card class="ocr-page-card ocr-output-card" :bordered="false">
-        <div class="ocr-card-heading">
-          <div class="ocr-card-title">
-            <span class="ocr-section-number">02</span>
+      <n-card class="panel ocr-page-card ocr-output-card" :bordered="false">
+        <div class="panel-heading ocr-card-heading">
+          <div class="panel-title ocr-card-title">
+            <span class="section-number ocr-section-number">02</span>
             <div>
-              <p class="ocr-panel-kicker">输出 / 识别文本</p>
+              <p class="panel-kicker ocr-panel-kicker">输出 / 识别文本</p>
               <h2>OCR 结果</h2>
-              <p class="ocr-panel-copy">查看识别文本和结构化 Markdown。</p>
+              <p class="panel-copy ocr-panel-copy">查看识别文本和结构化 Markdown。</p>
             </div>
           </div>
           <n-tag v-if="providerLabel" type="success" round size="small">{{ providerLabel }}</n-tag>
         </div>
 
-        <div v-if="workflowState === 'processing'" class="ocr-processing-state" aria-busy="true">
+        <div v-if="workflowState === 'processing'" class="processing-state ocr-processing-state" aria-busy="true">
           <div class="ocr-processing-visual" aria-hidden="true"><n-spin size="medium" /></div>
           <p class="ocr-detail-label">正在识别图片</p>
           <p class="ocr-status-copy">{{ statusMessage }}</p>
@@ -634,7 +635,7 @@ onBeforeUnmount(() => {
           <div class="ocr-progress-meta"><span>{{ statusMessage }}</span><strong>{{ processingProgress }}%</strong></div>
         </div>
 
-        <div v-else-if="workflowState === 'result' && resultText !== null" class="ocr-result-state">
+        <div v-else-if="workflowState === 'result' && resultText !== null" class="result-state ocr-result-state">
           <div
             v-if="annotatedResultUrl && resultImageWidth > 0 && resultImageHeight > 0"
             class="ocr-selectable-result"
@@ -658,7 +659,7 @@ onBeforeUnmount(() => {
             </ImagePreviewFrame>
             <p class="ocr-selection-hint" aria-live="polite">{{ imageSelectionHint }}</p>
           </div>
-          <div class="ocr-result-toolbar">
+          <div class="result-toolbar ocr-result-toolbar">
             <span>识别输出</span>
             <div class="ocr-result-toolbar-meta">
               <span>{{ providerLabel || 'PP-OCR' }}</span>
@@ -696,21 +697,21 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <div v-else-if="workflowState === 'cancelled'" class="ocr-output-message">
-          <n-alert class="ocr-inline-alert" type="warning" title="OCR 已取消" :show-icon="true">
+        <div v-else-if="workflowState === 'cancelled'" class="output-message ocr-output-message">
+          <n-alert class="inline-alert ocr-inline-alert" type="warning" title="OCR 已取消" :show-icon="true">
             图片预览仍然保留，可以再次开始识别。
           </n-alert>
           <n-button type="primary" :disabled="!canStartOcr" @click="startOcr">再次识别</n-button>
         </div>
 
-        <div v-else-if="workflowState === 'error'" class="ocr-output-message">
-          <n-alert class="ocr-inline-alert" type="error" title="OCR 未完成" :show-icon="true">
+        <div v-else-if="workflowState === 'error'" class="output-message ocr-output-message">
+          <n-alert class="inline-alert ocr-inline-alert" type="error" title="OCR 未完成" :show-icon="true">
             {{ errorMessage }}
           </n-alert>
           <n-button type="primary" :disabled="!canStartOcr" @click="startOcr">再次识别</n-button>
         </div>
 
-        <div v-else class="ocr-empty-output">
+        <div v-else class="empty-output ocr-empty-output">
           <n-empty size="small" description="OCR 结果将在此处显示。" />
         </div>
       </n-card>
@@ -727,6 +728,13 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.one-shot-context {
+  margin: 0 0 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .ocr-page {
   width: 100%;
   margin-top: 24px;

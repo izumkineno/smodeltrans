@@ -103,9 +103,9 @@ function applyBackendStatus(status: BackendStatus) {
   applySharedBackendStatus(status);
   modelDetectorPath.value = status.detectorModelDir;
   modelRecognizerPath.value = status.recognizerModelDir;
+  modelHyPath.value = status.hyModel;
   modelFontPath.value = status.fontPath;
   device.value = status.device === "cpu" ? "cpu" : "cuda";
-  regionParallelism.value = status.regionParallelism;
   translationBatchSize.value = status.translationBatchSize;
   idleUnloadMinutes.value = status.idleUnloadMinutes;
   generationMaxNewTokens.value = status.generation.maxNewTokens;
@@ -698,12 +698,12 @@ onMounted(() => {
       <n-card class="settings-card settings-card-wide" :bordered="false">
         <div class="settings-card-heading">
           <div>
-            <p class="panel-kicker">模型资源</p>
+            <p class="panel-kicker">01 / 模型准备</p>
             <h2>本地模型</h2>
           </div>
         </div>
         <p class="settings-card-copy">
-          下拉框选择翻译、OCR 模型与标注字体；点击"配置路径"可设置各类型对应的本地路径（持久化保存）。选择后点击"保存设置"生效。
+          选择 Hy-MT2 与 PP-OCR 模型，为实时翻译做好准备；标注字体可选。配置路径后，点击"保存设置"生效。
         </p>
         <dl class="settings-path-list">
           <div>
@@ -817,6 +817,48 @@ onMounted(() => {
         </template>
       </n-modal>
 
+      <n-card class="settings-card" :bordered="false">
+        <div class="settings-card-heading">
+          <div>
+            <p class="panel-kicker">02 / 翻译准备</p>
+            <h2>目标语言与提示词</h2>
+          </div>
+        </div>
+        <p class="settings-card-copy">先设置目标语言；system 和 user 预设提示词会作为下一次翻译请求的默认模型上下文。</p>
+        <div class="settings-field-grid">
+          <label class="settings-field">
+            <span>目标语言</span>
+            <n-input
+              v-model:value="targetLanguage"
+              maxlength="64"
+              placeholder="例如：Chinese"
+              aria-label="目标语言"
+            />
+          </label>
+          <label class="settings-field settings-field-wide settings-textarea">
+            <span>System 预设提示词</span>
+            <n-input
+              v-model:value="systemPrompt"
+              type="textarea"
+              maxlength="4096"
+              placeholder="可选：例如 Return concise JSON."
+              :autosize="{ minRows: 3, maxRows: 6 }"
+              aria-label="Hy system prompt"
+            />
+          </label>
+          <label class="settings-field settings-field-wide settings-textarea">
+            <span>User 预设提示词</span>
+            <n-input
+              v-model:value="userPrompt"
+              type="textarea"
+              maxlength="4096"
+              placeholder="可选：例如 Preserve product names and translate only visible text."
+              :autosize="{ minRows: 3, maxRows: 6 }"
+              aria-label="Hy user preset prompt"
+            />
+          </label>
+        </div>
+      </n-card>
       <n-card class="settings-card settings-card-wide" :bordered="false">
         <div class="settings-card-heading">
           <div>
@@ -897,49 +939,15 @@ onMounted(() => {
         </div>
       </n-card>
 
-      <n-card class="settings-card" :bordered="false">
-        <div class="settings-card-heading">
-          <div>
-            <p class="panel-kicker">翻译参数</p>
-            <h2>翻译默认值</h2>
-          </div>
-        </div>
-        <p class="settings-card-copy">目标语言、system 预设提示词和 user 预设提示词会作为下一次翻译请求的默认模型上下文。</p>
-        <div class="settings-field-grid">
-          <label class="settings-field">
-            <span>目标语言</span>
-            <n-input
-              v-model:value="targetLanguage"
-              maxlength="64"
-              placeholder="例如：Chinese"
-              aria-label="目标语言"
-            />
-          </label>
-          <label class="settings-field settings-field-wide settings-textarea">
-            <span>System 预设提示词</span>
-            <n-input
-              v-model:value="systemPrompt"
-              type="textarea"
-              maxlength="4096"
-              placeholder="可选：例如 Return concise JSON."
-              :autosize="{ minRows: 3, maxRows: 6 }"
-              aria-label="Hy system prompt"
-            />
-          </label>
-          <label class="settings-field settings-field-wide settings-textarea">
-            <span>User 预设提示词</span>
-            <n-input
-              v-model:value="userPrompt"
-              type="textarea"
-              maxlength="4096"
-              placeholder="可选：例如 Preserve product names and translate only visible text."
-              :autosize="{ minRows: 3, maxRows: 6 }"
-              aria-label="Hy user preset prompt"
-            />
-          </label>
-        </div>
-      </n-card>
 
+      <details class="settings-advanced settings-card-wide">
+        <summary class="settings-advanced-summary">
+          <span>
+            <span class="panel-kicker">高级设置</span>
+            <strong>Hy 生成与记忆参数</strong>
+          </span>
+          <span class="settings-advanced-summary-copy">仅在需要微调时展开，默认设置已适合首次使用。</span>
+        </summary>
       <n-card class="settings-card settings-card-wide" :bordered="false">
         <div class="settings-card-heading">
           <div>
@@ -1076,6 +1084,7 @@ onMounted(() => {
           </label>
         </div>
       </n-card>
+      </details>
 
       <div class="settings-card-actions settings-page-actions settings-card-wide">
         <n-alert v-if="settingsMessage" class="settings-actions-feedback" :type="settingsMessageType" :show-icon="false">
@@ -1087,3 +1096,57 @@ onMounted(() => {
     </div>
   </section>
 </template>
+<style scoped>
+.settings-advanced {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.settings-advanced-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.settings-advanced-summary::marker {
+  color: var(--primary);
+}
+
+.settings-advanced-summary:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.settings-advanced-summary > span:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-advanced-summary strong {
+  font-size: 15px;
+}
+
+.settings-advanced-summary-copy {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.settings-advanced[open] > .settings-advanced-summary {
+  border-color: rgba(64, 158, 255, 0.34);
+}
+
+@media (max-width: 720px) {
+  .settings-advanced-summary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+</style>

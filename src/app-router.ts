@@ -5,10 +5,10 @@ import {
 import type { RouteRecordRaw } from "vue-router";
 
 export const WORKSPACE_ROUTE_NAMES = [
+  "live-translation",
   "translate",
   "ocr",
   "ocr-translate",
-  "live-translation",
   "settings",
   "model-monitor",
 ] as const;
@@ -25,6 +25,11 @@ const routes: RouteRecordRaw[] = [
     redirect: { name: "ocr-translate" },
   },
   {
+    path: "/live-translation",
+    name: "live-translation",
+    component: () => import("./components/LiveTranslationPage.vue"),
+  },
+  {
     path: "/translate",
     name: "translate",
     component: () => import("./components/TextTranslationPage.vue"),
@@ -38,11 +43,6 @@ const routes: RouteRecordRaw[] = [
     path: "/ocr-translate",
     name: "ocr-translate",
     component: () => import("./components/OcrTranslationPage.vue"),
-  },
-  {
-    path: "/live-translation",
-    name: "live-translation",
-    component: () => import("./components/LiveTranslationPage.vue"),
   },
   {
     path: "/settings",
