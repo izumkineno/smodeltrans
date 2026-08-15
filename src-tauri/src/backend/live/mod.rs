@@ -5,10 +5,11 @@ mod scheduler;
 use self::{
     contracts::{
         CaptureWindowInfo, LiveConfig, LiveDebugOutcome, LiveDebugRecord, LiveDebugStage,
-        LiveMetrics, LiveOverlayAttachment, LiveOverlayMode, LiveOverlaySettings,
-        LiveRecognitionMode, LiveRecognitionSettings, LiveRecognitionTrigger, LiveRoi,
-        LiveSessionState, LiveSessionStatus, LiveSubtitle, LiveSubtitleRegion,
-        LiveSubtitleRegionBounds, LiveTranslationSettings, NormalizedRoi,
+        LiveMetrics, LiveOverlayAttachment, LiveOverlayContentSize, LiveOverlayMode,
+        LiveOverlaySettings, LiveOverlaySizing, LiveRecognitionMode, LiveRecognitionSettings,
+        LiveRecognitionTrigger, LiveRoi, LiveSessionState, LiveSessionStatus, LiveSubtitle,
+        LiveSubtitleRegion, LiveSubtitleRegionBounds, LiveTranslationSettings,
+        NormalizedRoi, MIN_LIVE_OVERLAY_MANUAL_HEIGHT, MIN_LIVE_OVERLAY_MANUAL_WIDTH,
     },
     scheduler::{
         LatestFrameSlot, OwnedFrame, StabilityScheduler, finalize_live_regions,
@@ -42,7 +43,6 @@ const SUBTITLE_EVENT: &str = "live-subtitle";
 const DEBUG_RECORD_EVENT: &str = "live-debug-record";
 const SELECTOR_LABEL: &str = "live-selector";
 const OVERLAY_LABEL: &str = "live-overlay";
-const OVERLAY_EDGE_THICKNESS: u32 = 168;
 const DEBUG_TEXT_MAX_CHARS: usize = 2_000;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -79,6 +79,7 @@ struct ManagerInner {
     session_id: Option<String>,
     target_language: Option<String>,
     overlay_settings: Option<LiveOverlaySettings>,
+    overlay_content_size: LiveOverlayContentSize,
     recognition_settings: Option<LiveRecognitionSettings>,
     translation_settings: Option<LiveTranslationSettings>,
     selection_previous_state: Option<LiveSessionState>,
@@ -207,6 +208,7 @@ impl LiveSessionManager {
             inner.recognition_settings = Some(recognition_settings);
             inner.translation_settings = Some(translation_settings);
             inner.selection_previous_state = None;
+            inner.overlay_content_size = LiveOverlayContentSize::default();
         }
         trace_live(format_args!(
             "selector status published session={session_id}; dispatching selector window"
@@ -227,6 +229,58 @@ impl LiveSessionManager {
             return Err(error);
         }
         Ok(status)
+    }
+
+    fn update_overlay_layout(
+        &self,
+        app: &tauri::AppHandle,
+        session_id: &str,
+        sizing: LiveOverlaySizing,
+        content_size: LiveOverlayContentSize,
+    ) -> Result<(), BackendFailure> {
+        let sizing = sizing.validate().map_err(BackendFailure::arguments)?;
+        let content_size = content_size
+            .validate()
+            .map_err(BackendFailure::arguments)?;
+        let current = self.current_status()?;
+        require_session(&current, session_id)?;
+        let target_id = current.target.as_ref().map(|target| target.id.clone());
+        let (settings, content_size, has_runtime) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| BackendFailure::internal("实时会话锁已损坏"))?;
+            if inner.session_id.as_deref() != Some(session_id) {
+                return Err(BackendFailure::arguments("实时会话标识已过期"));
+            }
+            let settings = {
+                let settings = inner
+                    .overlay_settings
+                    .as_mut()
+                    .ok_or_else(|| BackendFailure::internal("实时会话缺少浮层设置"))?;
+                settings.apply_sizing(sizing);
+                *settings
+            };
+            inner.overlay_content_size = content_size;
+            if let Some(runtime) = inner.runtime.as_mut() {
+                let mut config = runtime
+                    .config
+                    .lock()
+                    .map_err(|_| BackendFailure::internal("实时配置锁已损坏"))?;
+                config.overlay_settings = settings;
+                config.overlay_content_size = content_size;
+                (settings, content_size, true)
+            } else {
+                (settings, content_size, false)
+            }
+        };
+        if has_runtime {
+            let target_id =
+                target_id.ok_or_else(|| BackendFailure::internal("实时会话缺少目标窗口"))?;
+            let geometry = platform::target_geometry(&target_id)?;
+            position_overlay(app, geometry, settings, content_size);
+        }
+        Ok(())
     }
 
     fn confirm_selection(
@@ -261,7 +315,7 @@ impl LiveSessionManager {
             .runtime
             .is_some();
         if has_runtime {
-            let (state, overlay_settings) = {
+            let (state, overlay_settings, overlay_content_size) = {
                 let mut inner = self
                     .inner
                     .lock()
@@ -287,10 +341,10 @@ impl LiveSessionManager {
                     .store(state == LiveSessionState::Paused, Ordering::SeqCst);
                 runtime.latest.clear();
                 runtime.latest.wake();
-                (state, config.overlay_settings)
+                (state, config.overlay_settings, config.overlay_content_size)
             };
             close_window(app, SELECTOR_LABEL);
-            position_overlay(app, geometry, overlay_settings);
+            position_overlay(app, geometry, overlay_settings, overlay_content_size);
             return update_status(&self.status, app, |status| {
                 status.state = state;
                 status.roi = Some(display_roi);
@@ -313,7 +367,13 @@ impl LiveSessionManager {
         display_roi: LiveRoi,
         geometry: platform::TargetGeometry,
     ) -> Result<LiveSessionStatus, BackendFailure> {
-        let (target_language, overlay_settings, recognition_settings, translation_settings) = {
+        let (
+            target_language,
+            overlay_settings,
+            overlay_content_size,
+            recognition_settings,
+            translation_settings,
+        ) = {
             let inner = self
                 .inner
                 .lock()
@@ -326,6 +386,7 @@ impl LiveSessionManager {
                 inner
                     .overlay_settings
                     .ok_or_else(|| BackendFailure::internal("实时会话缺少浮层设置"))?,
+                inner.overlay_content_size,
                 inner
                     .recognition_settings
                     .clone()
@@ -336,7 +397,13 @@ impl LiveSessionManager {
                     .ok_or_else(|| BackendFailure::internal("实时会话缺少翻译提示设置"))?,
             )
         };
-        create_overlay_window(app, session_id, geometry, overlay_settings)?;
+        create_overlay_window(
+            app,
+            session_id,
+            geometry,
+            overlay_settings,
+            overlay_content_size,
+        )?;
         let config = Arc::new(Mutex::new(LiveConfig {
             roi,
             roi_version: 1,
@@ -344,6 +411,7 @@ impl LiveSessionManager {
             client_height: display_roi.client_height,
             target_language,
             overlay_settings,
+            overlay_content_size,
             recognition_settings,
             translation_settings,
         }));
@@ -923,7 +991,12 @@ impl SessionLoop {
             if last_geometry_sync.elapsed() >= Duration::from_millis(500) {
                 match platform::target_geometry(&self.target_id) {
                     Ok(geometry) => {
-                        position_overlay(&self.app, geometry, config.overlay_settings);
+                        position_overlay(
+                            &self.app,
+                            geometry,
+                            config.overlay_settings,
+                            config.overlay_content_size,
+                        );
                         if geometry.width != config.client_width
                             || geometry.height != config.client_height
                         {
@@ -1299,7 +1372,8 @@ impl SessionLoop {
             self.latest.clear();
             self.latest.wake();
         }
-        position_overlay(&self.app, geometry, self.config_overlay_settings());
+        let (overlay_settings, overlay_content_size) = self.config_overlay_layout();
+        position_overlay(&self.app, geometry, overlay_settings, overlay_content_size);
         set_overlay_visible(&self.app, true);
         let _ = update_status(&self.status, &self.app, |status| {
             if auto_resume {
@@ -1318,10 +1392,10 @@ impl SessionLoop {
         Ok(())
     }
 
-    fn config_overlay_settings(&self) -> LiveOverlaySettings {
+    fn config_overlay_layout(&self) -> (LiveOverlaySettings, LiveOverlayContentSize) {
         self.config
             .lock()
-            .map(|config| config.overlay_settings)
+            .map(|config| (config.overlay_settings, config.overlay_content_size))
             .unwrap_or_default()
     }
 
@@ -1731,72 +1805,95 @@ fn epoch_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn automatic_overlay_dimension(measured: u32, minimum: u32, maximum: u32) -> u32 {
+    let maximum = maximum.max(1);
+    measured.clamp(minimum.min(maximum), maximum)
+}
+
+fn centered_coordinate(origin: i32, container_length: u32, overlay_length: u32) -> i32 {
+    let displacement = (i64::from(container_length) - i64::from(overlay_length)) / 2;
+    origin.saturating_add(displacement as i32)
+}
+
 fn overlay_bounds(
     geometry: platform::TargetGeometry,
     settings: LiveOverlaySettings,
+    content_size: LiveOverlayContentSize,
 ) -> (i32, i32, u32, u32) {
     if settings.mode == LiveOverlayMode::RegionReplace {
         return (geometry.x, geometry.y, geometry.width, geometry.height);
     }
+    let width = if settings.auto_width {
+        automatic_overlay_dimension(
+            content_size.width,
+            MIN_LIVE_OVERLAY_MANUAL_WIDTH,
+            geometry.width,
+        )
+    } else {
+        settings.manual_width
+    };
+    let height = if settings.auto_height {
+        automatic_overlay_dimension(
+            content_size.height,
+            MIN_LIVE_OVERLAY_MANUAL_HEIGHT,
+            geometry.height,
+        )
+    } else {
+        settings.manual_height
+    };
     let offset = i32::try_from(settings.offset).unwrap_or(i32::MAX);
     match settings.attachment {
-        LiveOverlayAttachment::Top => {
-            let height = OVERLAY_EDGE_THICKNESS.min(geometry.height);
-            (
-                geometry.x,
-                geometry
-                    .y
-                    .saturating_sub(i32::try_from(height).unwrap_or(i32::MAX))
-                    .saturating_sub(offset),
-                geometry.width,
-                height,
-            )
-        }
-        LiveOverlayAttachment::Bottom => {
-            let height = OVERLAY_EDGE_THICKNESS.min(geometry.height);
-            (
-                geometry.x,
-                geometry
-                    .y
-                    .saturating_add(i32::try_from(geometry.height).unwrap_or(i32::MAX))
-                    .saturating_add(offset),
-                geometry.width,
-                height,
-            )
-        }
-        LiveOverlayAttachment::Left => {
-            let width = OVERLAY_EDGE_THICKNESS.min(geometry.width);
-            (
-                geometry
-                    .x
-                    .saturating_sub(i32::try_from(width).unwrap_or(i32::MAX))
-                    .saturating_sub(offset),
-                geometry.y,
-                width,
-                geometry.height,
-            )
-        }
-        LiveOverlayAttachment::Right => {
-            let width = OVERLAY_EDGE_THICKNESS.min(geometry.width);
-            (
-                geometry
-                    .x
-                    .saturating_add(i32::try_from(geometry.width).unwrap_or(i32::MAX))
-                    .saturating_add(offset),
-                geometry.y,
-                width,
-                geometry.height,
-            )
-        }
+        LiveOverlayAttachment::Top => (
+            centered_coordinate(geometry.x, geometry.width, width),
+            geometry
+                .y
+                .saturating_sub(i32::try_from(height).unwrap_or(i32::MAX))
+                .saturating_sub(offset),
+            width,
+            height,
+        ),
+        LiveOverlayAttachment::Bottom => (
+            centered_coordinate(geometry.x, geometry.width, width),
+            geometry
+                .y
+                .saturating_add(i32::try_from(geometry.height).unwrap_or(i32::MAX))
+                .saturating_add(offset),
+            width,
+            height,
+        ),
+        LiveOverlayAttachment::Left => (
+            geometry
+                .x
+                .saturating_sub(i32::try_from(width).unwrap_or(i32::MAX))
+                .saturating_sub(offset),
+            centered_coordinate(geometry.y, geometry.height, height),
+            width,
+            height,
+        ),
+        LiveOverlayAttachment::Right => (
+            geometry
+                .x
+                .saturating_add(i32::try_from(geometry.width).unwrap_or(i32::MAX))
+                .saturating_add(offset),
+            centered_coordinate(geometry.y, geometry.height, height),
+            width,
+            height,
+        ),
     }
 }
 
-fn overlay_url_path(session_id: &str, settings: LiveOverlaySettings) -> String {
+fn overlay_url_path(
+    session_id: &str,
+    geometry: platform::TargetGeometry,
+    settings: LiveOverlaySettings,
+) -> String {
     let source_visibility = if settings.show_source { "1" } else { "0" };
     let region_box_visibility = if settings.show_region_boxes { "1" } else { "0" };
     format!(
-        "index.html?liveSessionId={session_id}&liveOverlayMode={}&showSource={source_visibility}&showRegionBoxes={region_box_visibility}",
+        "index.html?liveSessionId={session_id}&liveOverlayMode={}&showSource={source_visibility}&showRegionBoxes={region_box_visibility}&overlayMaxWidth={}&overlayMaxHeight={}",
         settings.mode_query_value(),
+        geometry.width,
+        geometry.height,
     )
 }
 
@@ -1805,21 +1902,21 @@ fn create_overlay_window(
     session_id: &str,
     geometry: platform::TargetGeometry,
     settings: LiveOverlaySettings,
+    content_size: LiveOverlayContentSize,
 ) -> Result<(), BackendFailure> {
     let app = app.clone();
     let window_app = app.clone();
     let session_id = session_id.to_owned();
     run_window_operation_on_main_thread(app, move || {
         close_window_now(&window_app, OVERLAY_LABEL);
-        let (x, y, width, height) = overlay_bounds(geometry, settings);
-        let url = WebviewUrl::App(overlay_url_path(&session_id, settings).into());
+        let (x, y, width, height) = overlay_bounds(geometry, settings, content_size);
+        let url = WebviewUrl::App(overlay_url_path(&session_id, geometry, settings).into());
         let window = WebviewWindowBuilder::new(&window_app, OVERLAY_LABEL, url)
             .title("smodeltrans 实时字幕")
             .decorations(false)
             .transparent(true)
             .shadow(false)
             .always_on_top(true)
-            .focusable(false)
             .skip_taskbar(true)
             .resizable(false)
             // Bounds are applied as physical pixels below. Logical builder
@@ -1837,9 +1934,15 @@ fn create_overlay_window(
             .map_err(|error| {
                 BackendFailure::internal(format!("设置实时字幕窗口尺寸失败: {error}"))
             })?;
-        window
-            .set_ignore_cursor_events(true)
-            .map_err(|error| BackendFailure::internal(format!("启用字幕鼠标穿透失败: {error}")))?;
+        if settings.mode == LiveOverlayMode::RegionReplace {
+            window
+                .set_ignore_cursor_events(true)
+                .map_err(|error| {
+                    BackendFailure::internal(format!(
+                        "设置坐标替换浮层鼠标穿透失败: {error}"
+                    ))
+                })?;
+        }
         window
             .show()
             .map_err(|error| BackendFailure::internal(format!("显示实时字幕窗口失败: {error}")))?;
@@ -1914,6 +2017,7 @@ fn position_overlay(
     app: &tauri::AppHandle,
     geometry: platform::TargetGeometry,
     settings: LiveOverlaySettings,
+    content_size: LiveOverlayContentSize,
 ) {
     let app = app.clone();
     let window_app = app.clone();
@@ -1921,7 +2025,7 @@ fn position_overlay(
         let Some(window) = window_app.get_webview_window(OVERLAY_LABEL) else {
             return Ok(());
         };
-        let (x, y, width, height) = overlay_bounds(geometry, settings);
+        let (x, y, width, height) = overlay_bounds(geometry, settings, content_size);
         let _ = window.set_position(PhysicalPosition::new(x, y));
         let _ = window.set_size(PhysicalSize::new(width, height));
         Ok(())
@@ -2010,6 +2114,21 @@ pub(crate) async fn begin_live_selection(
             recognition_settings,
             translation_settings,
         )
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn update_live_overlay_layout(
+    app: tauri::AppHandle,
+    session_id: String,
+    sizing: LiveOverlaySizing,
+    content_size: LiveOverlayContentSize,
+    manager: State<'_, LiveSessionManager>,
+) -> Result<(), BackendError> {
+    let manager = manager.inner().clone();
+    run_live_operation(move || {
+        manager.update_overlay_layout(&app, &session_id, sizing, content_size)
     })
     .await
 }

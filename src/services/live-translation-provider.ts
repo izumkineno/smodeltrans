@@ -70,6 +70,20 @@ export interface LiveOverlaySettings {
   offset: number;
   showSource: boolean;
   showRegionBoxes: boolean;
+  autoWidth: boolean;
+  autoHeight: boolean;
+  manualWidth: number;
+  manualHeight: number;
+}
+
+export type LiveOverlaySizing = Pick<
+  LiveOverlaySettings,
+  "autoWidth" | "autoHeight" | "manualWidth" | "manualHeight"
+>;
+
+export interface LiveOverlayContentSize {
+  width: number;
+  height: number;
 }
 
 export type LiveRecognitionMode = "automatic" | "key_trigger";
@@ -249,6 +263,15 @@ export function interruptLiveTranslation(
 
 export function getLiveSessionStatus(invokeFn: InvokeFn = invoke): Promise<LiveSessionStatus> {
   return invokeFn<LiveSessionStatus>("get_live_session_status");
+}
+
+export function updateLiveOverlayLayout(
+  sessionId: string,
+  sizing: LiveOverlaySizing,
+  contentSize: LiveOverlayContentSize,
+  invokeFn: InvokeFn = invoke,
+): Promise<void> {
+  return invokeFn<void>("update_live_overlay_layout", { sessionId, sizing, contentSize });
 }
 
 export function listenLiveStatus(

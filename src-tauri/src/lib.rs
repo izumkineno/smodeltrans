@@ -40,6 +40,7 @@ pub fn run() {
             backend::commands::ocr_image,
             backend::live::list_capture_windows,
             backend::live::begin_live_selection,
+            backend::live::update_live_overlay_layout,
             backend::live::confirm_live_selection,
             backend::live::begin_live_roi_update,
             backend::live::cancel_live_selection,

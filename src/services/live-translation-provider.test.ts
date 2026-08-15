@@ -22,6 +22,7 @@ import {
   setLiveRegionBoxesVisible,
   shouldApplyLiveSubtitle,
   stopLiveSession,
+  updateLiveOverlayLayout,
 } from "./live-translation-provider";
 import type {
   CaptureWindowInfo,
@@ -59,6 +60,10 @@ const overlaySettings: LiveOverlaySettings = {
   offset: 24,
   showSource: false,
   showRegionBoxes: true,
+  autoWidth: true,
+  autoHeight: false,
+  manualWidth: 880,
+  manualHeight: 144,
 };
 
 const recognitionSettings: LiveRecognitionSettings = {
@@ -75,6 +80,18 @@ const translationSettings: LiveTranslationSettings = {
   memoryEnabled: true,
   memoryMaxTokens: 4_096,
   memoryMaxTurns: 16,
+};
+
+const overlaySizing = {
+  autoWidth: false,
+  autoHeight: true,
+  manualWidth: 720,
+  manualHeight: 180,
+};
+
+const overlayContentSize = {
+  width: 512,
+  height: 96,
 };
 
 const status: LiveSessionStatus = {
@@ -129,6 +146,7 @@ describe("live translation command adapter", () => {
     await stopLiveSession("live-1", invokeFn);
     await stopLiveSession(undefined, invokeFn);
     await getLiveSessionStatus(invokeFn);
+    await updateLiveOverlayLayout("live-1", overlaySizing, overlayContentSize, invokeFn);
 
     expect(calls).toEqual([
       { command: "list_capture_windows", args: undefined },
@@ -172,6 +190,14 @@ describe("live translation command adapter", () => {
       },
       { command: "stop_live_session", args: {} },
       { command: "get_live_session_status", args: undefined },
+      {
+        command: "update_live_overlay_layout",
+        args: {
+          sessionId: "live-1",
+          sizing: overlaySizing,
+          contentSize: overlayContentSize,
+        },
+      },
     ]);
   });
 

@@ -28,19 +28,32 @@ export const LIVE_STABILITY_WAIT_MAX_MS = 5_000;
 export const DEFAULT_KEY_TRIGGER_TIMEOUT_MS = 1_000;
 export const KEY_TRIGGER_TIMEOUT_MIN_MS = 100;
 export const KEY_TRIGGER_TIMEOUT_MAX_MS = 5_000;
+export const DEFAULT_LIVE_SUBTITLE_MANUAL_WIDTH = 960;
+export const LIVE_SUBTITLE_MANUAL_WIDTH_MIN = 160;
+export const LIVE_SUBTITLE_MANUAL_WIDTH_MAX = 8_192;
+export const DEFAULT_LIVE_SUBTITLE_MANUAL_HEIGHT = 168;
+export const LIVE_SUBTITLE_MANUAL_HEIGHT_MIN = 72;
+export const LIVE_SUBTITLE_MANUAL_HEIGHT_MAX = 4_096;
+
+function createDefaultLiveOverlaySettings(): LiveOverlaySettings {
+  return {
+    mode: "subtitle",
+    attachment: "bottom",
+    offset: 0,
+    showSource: true,
+    showRegionBoxes: false,
+    autoWidth: true,
+    autoHeight: true,
+    manualWidth: DEFAULT_LIVE_SUBTITLE_MANUAL_WIDTH,
+    manualHeight: DEFAULT_LIVE_SUBTITLE_MANUAL_HEIGHT,
+  };
+}
 
 export const targetLanguage = ref("Chinese");
 export const backendStatus = ref<BackendStatus | null>(null);
 export const modelRuntimeStatus = ref<ModelRuntimeStatus | null>(null);
 
-export const liveOverlaySettings = ref<LiveOverlaySettings>({
-  mode: "subtitle",
-  attachment: "bottom",
-  offset: 0,
-  showSource: true,
-  showRegionBoxes: false,
-});
-
+export const liveOverlaySettings = ref(createDefaultLiveOverlaySettings());
 export const liveRecognitionSettings = ref<LiveRecognitionSettings>({
   mode: "automatic",
   triggerKey: "F8",
@@ -108,23 +121,58 @@ export async function fetchSharedModelRuntimeStatus(): Promise<ModelRuntimeStatu
 }
 
 let persistedLiveOverlaySettingsLoaded = false;
+let liveOverlaySettingsStorageSyncBound = false;
 
-export function loadPersistedLiveOverlaySettings(): string | null {
-  if (persistedLiveOverlaySettingsLoaded || typeof window === "undefined") {
+function normalizePersistedLiveOverlayDimension(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+): number | null {
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < minimum ||
+    value > maximum
+  ) {
     return null;
   }
-  persistedLiveOverlaySettingsLoaded = true;
-  try {
-    const rawSettings = window.localStorage.getItem(LIVE_OVERLAY_SETTINGS_STORAGE_KEY);
-    if (!rawSettings) {
-      return null;
+  return value;
+}
+
+function applyPersistedLiveOverlaySettings(
+  rawSettings: string | null,
+  resetToDefaults: boolean,
+): string | null {
+  if (!rawSettings) {
+    if (resetToDefaults) {
+      liveOverlaySettings.value = createDefaultLiveOverlaySettings();
     }
+    return null;
+  }
+  try {
     const parsed: unknown = JSON.parse(rawSettings);
     if (!parsed || typeof parsed !== "object") {
       return "实时浮层设置无效，将使用默认值。";
     }
     const value = parsed as Partial<LiveOverlaySettings>;
-    const { mode, attachment, offset, showSource, showRegionBoxes } = value;
+    const { mode, attachment, offset, showSource, showRegionBoxes, autoWidth, autoHeight } =
+      value;
+    const manualWidth =
+      value.manualWidth === undefined
+        ? DEFAULT_LIVE_SUBTITLE_MANUAL_WIDTH
+        : normalizePersistedLiveOverlayDimension(
+            value.manualWidth,
+            LIVE_SUBTITLE_MANUAL_WIDTH_MIN,
+            LIVE_SUBTITLE_MANUAL_WIDTH_MAX,
+          );
+    const manualHeight =
+      value.manualHeight === undefined
+        ? DEFAULT_LIVE_SUBTITLE_MANUAL_HEIGHT
+        : normalizePersistedLiveOverlayDimension(
+            value.manualHeight,
+            LIVE_SUBTITLE_MANUAL_HEIGHT_MIN,
+            LIVE_SUBTITLE_MANUAL_HEIGHT_MAX,
+          );
     if (
       (mode !== "subtitle" && mode !== "region_replace") ||
       (attachment !== "top" &&
@@ -136,7 +184,11 @@ export function loadPersistedLiveOverlaySettings(): string | null {
       offset < 0 ||
       offset > 2048 ||
       typeof showSource !== "boolean" ||
-      (showRegionBoxes !== undefined && typeof showRegionBoxes !== "boolean")
+      (showRegionBoxes !== undefined && typeof showRegionBoxes !== "boolean") ||
+      (autoWidth !== undefined && typeof autoWidth !== "boolean") ||
+      (autoHeight !== undefined && typeof autoHeight !== "boolean") ||
+      manualWidth === null ||
+      manualHeight === null
     ) {
       return "实时浮层设置无效，将使用默认值。";
     }
@@ -146,6 +198,10 @@ export function loadPersistedLiveOverlaySettings(): string | null {
       offset,
       showSource,
       showRegionBoxes: showRegionBoxes ?? false,
+      autoWidth: autoWidth ?? true,
+      autoHeight: autoHeight ?? true,
+      manualWidth,
+      manualHeight,
     };
     return null;
   } catch {
@@ -153,17 +209,72 @@ export function loadPersistedLiveOverlaySettings(): string | null {
   }
 }
 
+function bindLiveOverlaySettingsStorageSync(): void {
+  if (liveOverlaySettingsStorageSyncBound || typeof window === "undefined") {
+    return;
+  }
+  liveOverlaySettingsStorageSyncBound = true;
+  window.addEventListener("storage", (event) => {
+    if (event.key !== LIVE_OVERLAY_SETTINGS_STORAGE_KEY) {
+      return;
+    }
+    const error = applyPersistedLiveOverlaySettings(event.newValue, true);
+    if (error) {
+      liveOverlaySettings.value = createDefaultLiveOverlaySettings();
+    }
+  });
+}
+
+export function loadPersistedLiveOverlaySettings(): string | null {
+  bindLiveOverlaySettingsStorageSync();
+  if (persistedLiveOverlaySettingsLoaded || typeof window === "undefined") {
+    return null;
+  }
+  persistedLiveOverlaySettingsLoaded = true;
+  try {
+    return applyPersistedLiveOverlaySettings(
+      window.localStorage.getItem(LIVE_OVERLAY_SETTINGS_STORAGE_KEY),
+      false,
+    );
+  } catch {
+    return "无法读取实时浮层设置，将使用默认值。";
+  }
+}
+
 export function savePersistedLiveOverlaySettings(): string | null {
   const settings = liveOverlaySettings.value;
-  if (
-    !Number.isInteger(settings.offset) ||
-    settings.offset < 0 ||
-    settings.offset > 2048
-  ) {
+  const offset = settings.offset;
+  const manualWidth = settings.manualWidth;
+  const manualHeight = settings.manualHeight;
+  if (!Number.isInteger(offset) || offset < 0 || offset > 2_048) {
     return "实时翻译框外侧偏移必须为 0 到 2048 的整数。";
   }
+  if (
+    !Number.isInteger(manualWidth) ||
+    manualWidth < LIVE_SUBTITLE_MANUAL_WIDTH_MIN ||
+    manualWidth > LIVE_SUBTITLE_MANUAL_WIDTH_MAX
+  ) {
+    return `字幕窗口手动宽度必须为 ${LIVE_SUBTITLE_MANUAL_WIDTH_MIN} 到 ${LIVE_SUBTITLE_MANUAL_WIDTH_MAX} 的整数。`;
+  }
+  if (
+    !Number.isInteger(manualHeight) ||
+    manualHeight < LIVE_SUBTITLE_MANUAL_HEIGHT_MIN ||
+    manualHeight > LIVE_SUBTITLE_MANUAL_HEIGHT_MAX
+  ) {
+    return `字幕窗口手动高度必须为 ${LIVE_SUBTITLE_MANUAL_HEIGHT_MIN} 到 ${LIVE_SUBTITLE_MANUAL_HEIGHT_MAX} 的整数。`;
+  }
+  const normalizedSettings = {
+    ...settings,
+    offset,
+    manualWidth,
+    manualHeight,
+  };
+  liveOverlaySettings.value = normalizedSettings;
   try {
-    window.localStorage.setItem(LIVE_OVERLAY_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    window.localStorage.setItem(
+      LIVE_OVERLAY_SETTINGS_STORAGE_KEY,
+      JSON.stringify(normalizedSettings),
+    );
     return null;
   } catch {
     return "无法写入实时浮层设置，请检查应用存储权限。";

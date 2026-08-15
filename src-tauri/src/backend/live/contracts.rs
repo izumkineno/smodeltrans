@@ -66,6 +66,81 @@ pub(crate) enum LiveOverlayAttachment {
     Right,
 }
 
+pub(super) const MIN_LIVE_OVERLAY_MANUAL_WIDTH: u32 = 160;
+const MAX_LIVE_OVERLAY_MANUAL_WIDTH: u32 = 8_192;
+pub(super) const MIN_LIVE_OVERLAY_MANUAL_HEIGHT: u32 = 72;
+const MAX_LIVE_OVERLAY_MANUAL_HEIGHT: u32 = 4_096;
+const MAX_LIVE_OVERLAY_CONTENT_DIMENSION: u32 = 32_768;
+
+fn default_live_overlay_auto_width() -> bool {
+    true
+}
+
+fn default_live_overlay_auto_height() -> bool {
+    true
+}
+
+fn default_live_overlay_manual_width() -> u32 {
+    960
+}
+
+fn default_live_overlay_manual_height() -> u32 {
+    168
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LiveOverlaySizing {
+    pub(crate) auto_width: bool,
+    pub(crate) auto_height: bool,
+    pub(crate) manual_width: u32,
+    pub(crate) manual_height: u32,
+}
+
+impl LiveOverlaySizing {
+    pub(super) fn validate(self) -> Result<Self, &'static str> {
+        if !(MIN_LIVE_OVERLAY_MANUAL_WIDTH..=MAX_LIVE_OVERLAY_MANUAL_WIDTH)
+            .contains(&self.manual_width)
+        {
+            return Err("字幕窗口手动宽度必须为 160 到 8192 的整数");
+        }
+        if !(MIN_LIVE_OVERLAY_MANUAL_HEIGHT..=MAX_LIVE_OVERLAY_MANUAL_HEIGHT)
+            .contains(&self.manual_height)
+        {
+            return Err("字幕窗口手动高度必须为 72 到 4096 的整数");
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LiveOverlayContentSize {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+impl Default for LiveOverlayContentSize {
+    fn default() -> Self {
+        Self {
+            width: default_live_overlay_manual_width(),
+            height: default_live_overlay_manual_height(),
+        }
+    }
+}
+
+impl LiveOverlayContentSize {
+    pub(super) fn validate(self) -> Result<Self, &'static str> {
+        if self.width == 0 || self.width > MAX_LIVE_OVERLAY_CONTENT_DIMENSION {
+            return Err("字幕窗口测量宽度无效");
+        }
+        if self.height == 0 || self.height > MAX_LIVE_OVERLAY_CONTENT_DIMENSION {
+            return Err("字幕窗口测量高度无效");
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LiveOverlaySettings {
@@ -75,16 +150,28 @@ pub(crate) struct LiveOverlaySettings {
     pub(crate) show_source: bool,
     #[serde(default)]
     pub(crate) show_region_boxes: bool,
+    #[serde(default = "default_live_overlay_auto_width")]
+    pub(crate) auto_width: bool,
+    #[serde(default = "default_live_overlay_auto_height")]
+    pub(crate) auto_height: bool,
+    #[serde(default = "default_live_overlay_manual_width")]
+    pub(crate) manual_width: u32,
+    #[serde(default = "default_live_overlay_manual_height")]
+    pub(crate) manual_height: u32,
 }
 
 impl Default for LiveOverlaySettings {
     fn default() -> Self {
         Self {
-            mode: LiveOverlayMode::Subtitle,
-            attachment: LiveOverlayAttachment::Bottom,
+            mode: LiveOverlayMode::default(),
+            attachment: LiveOverlayAttachment::default(),
             offset: 0,
             show_source: true,
             show_region_boxes: false,
+            auto_width: default_live_overlay_auto_width(),
+            auto_height: default_live_overlay_auto_height(),
+            manual_width: default_live_overlay_manual_width(),
+            manual_height: default_live_overlay_manual_height(),
         }
     }
 }
@@ -94,7 +181,24 @@ impl LiveOverlaySettings {
         if self.offset > 2_048 {
             return Err("实时翻译框外侧偏移必须在 0 到 2048 像素之间");
         }
+        self.sizing().validate()?;
         Ok(self)
+    }
+
+    pub(super) fn sizing(self) -> LiveOverlaySizing {
+        LiveOverlaySizing {
+            auto_width: self.auto_width,
+            auto_height: self.auto_height,
+            manual_width: self.manual_width,
+            manual_height: self.manual_height,
+        }
+    }
+
+    pub(super) fn apply_sizing(&mut self, sizing: LiveOverlaySizing) {
+        self.auto_width = sizing.auto_width;
+        self.auto_height = sizing.auto_height;
+        self.manual_width = sizing.manual_width;
+        self.manual_height = sizing.manual_height;
     }
 
     pub(super) fn mode_query_value(self) -> &'static str {
@@ -542,6 +646,7 @@ pub(super) struct LiveConfig {
     pub(super) client_height: u32,
     pub(super) target_language: String,
     pub(super) overlay_settings: LiveOverlaySettings,
+    pub(super) overlay_content_size: LiveOverlayContentSize,
     pub(super) recognition_settings: LiveRecognitionSettings,
     pub(super) translation_settings: LiveTranslationSettings,
 }
