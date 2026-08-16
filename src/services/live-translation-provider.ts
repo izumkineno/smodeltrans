@@ -132,28 +132,6 @@ export interface LiveSubtitleRegion {
   translatedText: string;
 }
 
-export interface LiveSubtitleRegionFlowItem {
-  id: string;
-  index: number;
-  region: LiveSubtitleRegion;
-  leftOffset: number;
-  width: number;
-  gapAbove: number;
-}
-
-export interface LiveSubtitleRegionFlowGroup {
-  id: string;
-  left: number;
-  top: number;
-  bottom: number;
-  width: number;
-  items: LiveSubtitleRegionFlowItem[];
-}
-
-export interface LiveSubtitleRegionVerticalAnchor {
-  edge: "top" | "bottom";
-  offset: number;
-}
 
 export interface LiveSubtitle {
   sessionId: string;
@@ -271,6 +249,10 @@ export function getLiveSessionStatus(invokeFn: InvokeFn = invoke): Promise<LiveS
   return invokeFn<LiveSessionStatus>("get_live_session_status");
 }
 
+export function getLiveSubtitle(invokeFn: InvokeFn = invoke): Promise<LiveSubtitle | null> {
+  return invokeFn<LiveSubtitle | null>("get_live_subtitle");
+}
+
 export function updateLiveOverlayLayout(
   sessionId: string,
   sizing: LiveOverlaySizing,
@@ -356,119 +338,40 @@ export function shouldApplyLiveSubtitle(
     subtitle.revision >= lastAppliedRevision
   );
 }
-export function groupLiveSubtitleRegions(
-  regions: LiveSubtitleRegion[],
-): LiveSubtitleRegionFlowGroup[] {
-  const prepared = regions
-    .map((region, index) => ({
-      region,
-      index,
-      left: region.bounds.left,
-      top: region.bounds.top,
-      right: region.bounds.left + region.bounds.width,
-      bottom: region.bounds.top + region.bounds.height,
-    }))
-    .filter(
-      ({ left, top, right, bottom }) =>
-        [left, top, right, bottom].every(Number.isFinite) &&
-        right > left &&
-        bottom > top,
-    )
-    .sort(
-      (left, right) =>
-        left.left - right.left || left.top - right.top || left.index - right.index,
-    );
-  const columns: Array<{
-    right: number;
-    items: typeof prepared;
-  }> = [];
-  for (const item of prepared) {
-    const column = columns[columns.length - 1];
-    if (!column || item.left >= column.right) {
-      columns.push({ right: item.right, items: [item] });
-      continue;
-    }
-    column.items.push(item);
-    column.right = Math.max(column.right, item.right);
-  }
-
-  const blocks: Array<typeof prepared> = [];
-  for (const column of columns) {
-    const ordered = column.items.sort(
-      (left, right) =>
-        left.top - right.top || left.left - right.left || left.index - right.index,
-    );
-    let block: typeof prepared = [];
-    let blockBottom = Number.NEGATIVE_INFINITY;
-    let blockLineHeight = 0;
-    for (const item of ordered) {
-      const itemHeight = item.bottom - item.top;
-      const gap = item.top - blockBottom;
-      const splitThreshold = Math.max(24, Math.max(blockLineHeight, itemHeight) * 1.5);
-      if (block.length > 0 && gap > splitThreshold) {
-        blocks.push(block);
-        block = [];
-        blockBottom = Number.NEGATIVE_INFINITY;
-        blockLineHeight = 0;
-      }
-      block.push(item);
-      blockBottom = Math.max(blockBottom, item.bottom);
-      blockLineHeight = Math.max(blockLineHeight, itemHeight);
-    }
-    if (block.length > 0) {
-      blocks.push(block);
-    }
-  }
-
-  return blocks.map((block, groupIndex) => {
-    const left = Math.min(...block.map((item) => item.left));
-    const right = Math.max(...block.map((item) => item.right));
-    const top = Math.min(...block.map((item) => item.top));
-    const bottom = Math.max(...block.map((item) => item.bottom));
-    let previousBottom: number | undefined;
-    const items = block.map((item) => {
-      const gapAbove =
-        previousBottom === undefined ? 0 : Math.max(4, item.top - previousBottom);
-      previousBottom =
-        previousBottom === undefined
-          ? item.bottom
-          : Math.max(previousBottom, item.bottom);
-      return {
-        id: `${item.index}-${item.left}-${item.top}-${item.region.sourceText}`,
-        index: item.index,
-        region: item.region,
-        leftOffset: item.left - left,
-        width: item.right - item.left,
-        gapAbove,
-      };
-    });
-    return {
-      id: `group-${groupIndex}-${left}-${top}`,
-      left,
-      top,
-      bottom,
-      width: right - left,
-      items,
-    };
-  });
+export function hasRenderableLiveSubtitleContent(subtitle: LiveSubtitle): boolean {
+  return (
+    subtitle.isStreaming ||
+    subtitle.regions.length > 0 ||
+    subtitle.translatedText.trim().length > 0 ||
+    subtitle.sourceText.trim().length > 0
+  );
 }
-
-export function resolveLiveSubtitleRegionVerticalAnchor(
-  group: LiveSubtitleRegionFlowGroup,
-  clientHeight: number,
-): LiveSubtitleRegionVerticalAnchor | undefined {
+export function mapLiveSubtitleRegionToOverlay(
+  region: LiveSubtitleRegion,
+  roi: LiveRoi,
+  overlayWidth: number,
+  overlayHeight: number,
+): { x: number; y: number; width: number; height: number } | undefined {
   if (
-    !Number.isFinite(clientHeight) ||
-    clientHeight <= 0 ||
-    !Number.isFinite(group.top) ||
-    !Number.isFinite(group.bottom) ||
-    group.bottom <= group.top
+    roi.clientWidth <= 0 ||
+    roi.clientHeight <= 0 ||
+    !Number.isFinite(overlayWidth) ||
+    !Number.isFinite(overlayHeight) ||
+    overlayWidth <= 0 ||
+    overlayHeight <= 0 ||
+    !Number.isFinite(region.bounds.left) ||
+    !Number.isFinite(region.bounds.top) ||
+    !Number.isFinite(region.bounds.width) ||
+    !Number.isFinite(region.bounds.height) ||
+    region.bounds.width <= 0 ||
+    region.bounds.height <= 0
   ) {
     return undefined;
   }
-  const top = Math.max(0, Math.min(clientHeight, group.top));
-  const bottom = Math.max(top, Math.min(clientHeight, group.bottom));
-  return top + bottom <= clientHeight
-    ? { edge: "top", offset: top }
-    : { edge: "bottom", offset: clientHeight - bottom };
+  return {
+    x: (region.bounds.left / roi.clientWidth) * overlayWidth,
+    y: (region.bounds.top / roi.clientHeight) * overlayHeight,
+    width: (region.bounds.width / roi.clientWidth) * overlayWidth,
+    height: (region.bounds.height / roi.clientHeight) * overlayHeight,
+  };
 }

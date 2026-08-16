@@ -49,6 +49,7 @@ pub fn run() {
             backend::live::begin_live_roi_update,
             backend::live::cancel_live_selection,
             backend::live::get_live_session_status,
+            backend::live::get_live_subtitle,
             backend::live::pause_live_session,
             backend::live::resume_live_session,
             backend::live::interrupt_live_translation,

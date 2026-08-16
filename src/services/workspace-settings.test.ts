@@ -2,10 +2,13 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
   DEFAULT_KEY_TRIGGER_TIMEOUT_MS,
   liveRecognitionSettings,
+  liveSubtitleStyleSettings,
   liveTranslationSettings,
   loadPersistedLiveRecognitionSettings,
+  loadPersistedLiveSubtitleStyleSettings,
   loadPersistedLiveTranslationSettings,
   savePersistedLiveRecognitionSettings,
+  savePersistedLiveSubtitleStyleSettings,
   savePersistedLiveTranslationSettings,
 } from "./workspace-settings";
 
@@ -89,5 +92,43 @@ describe("live recognition settings persistence", () => {
     expect(
       JSON.parse(stored.get("smodeltrans.liveRecognitionSettings") ?? "{}"),
     ).toMatchObject({ keyTriggerTimeoutMs: 1_500 });
+  });
+});
+
+describe("live subtitle style persistence", () => {
+  test("loads, validates, and saves subtitle appearance controls", () => {
+    stored.set(
+      "smodeltrans.liveSubtitleStyleSettings",
+      JSON.stringify({
+        fontColor: "#123456",
+        fontSize: 32,
+        backgroundColor: "#abcdef",
+        backgroundOpacity: 64,
+      }),
+    );
+
+    expect(loadPersistedLiveSubtitleStyleSettings()).toBeNull();
+    expect(liveSubtitleStyleSettings.value).toEqual({
+      fontColor: "#123456",
+      fontSize: 32,
+      backgroundColor: "#abcdef",
+      backgroundOpacity: 64,
+    });
+
+    liveSubtitleStyleSettings.value = {
+      fontColor: "#0f172a",
+      fontSize: 20,
+      backgroundColor: "#e2e8f0",
+      backgroundOpacity: 80,
+    };
+    expect(savePersistedLiveSubtitleStyleSettings()).toBeNull();
+    expect(
+      JSON.parse(stored.get("smodeltrans.liveSubtitleStyleSettings") ?? "{}"),
+    ).toEqual({
+      fontColor: "#0f172a",
+      fontSize: 20,
+      backgroundColor: "#e2e8f0",
+      backgroundOpacity: 80,
+    });
   });
 });

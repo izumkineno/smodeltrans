@@ -9,6 +9,7 @@ import {
   cancelLiveSelection,
   confirmLiveSelection,
   getLiveSessionStatus,
+  getLiveSubtitle,
   listCaptureWindows,
   listenLiveDebugRecord,
   listenLiveRegionBoxesVisible,
@@ -16,11 +17,11 @@ import {
   listenLiveSubtitle,
   interruptLiveTranslation,
   pauseLiveSession,
-  groupLiveSubtitleRegions,
-  resolveLiveSubtitleRegionVerticalAnchor,
   resumeLiveSession,
   setLiveRegionBoxesVisible,
   shouldApplyLiveSubtitle,
+  hasRenderableLiveSubtitleContent,
+  mapLiveSubtitleRegionToOverlay,
   stopLiveSession,
   beginLiveOverlayDrag,
   beginLiveOverlayResize,
@@ -131,6 +132,9 @@ describe("live translation command adapter", () => {
       if (command === "list_capture_windows") {
         return [target] as T;
       }
+      if (command === "get_live_subtitle") {
+        return null as T;
+      }
       return status as T;
     };
 
@@ -152,6 +156,7 @@ describe("live translation command adapter", () => {
     await stopLiveSession("live-1", invokeFn);
     await stopLiveSession(undefined, invokeFn);
     await getLiveSessionStatus(invokeFn);
+    await getLiveSubtitle(invokeFn);
     await updateLiveOverlayLayout("live-1", overlaySizing, overlayContentSize, invokeFn);
     await beginLiveOverlayDrag("live-1", invokeFn);
     await beginLiveOverlayResize("live-1", invokeFn);
@@ -200,6 +205,7 @@ describe("live translation command adapter", () => {
       },
       { command: "stop_live_session", args: {} },
       { command: "get_live_session_status", args: undefined },
+      { command: "get_live_subtitle", args: undefined },
       {
         command: "update_live_overlay_layout",
         args: {
@@ -331,91 +337,61 @@ describe("live subtitle revision filtering", () => {
     expect(shouldApplyLiveSubtitle(subtitle, "live-2", 1)).toBe(false);
     expect(shouldApplyLiveSubtitle(subtitle, undefined, -1)).toBe(false);
   });
+  test("keeps region payload when aggregate subtitle text is empty", () => {
+    expect(
+      hasRenderableLiveSubtitleContent({
+        ...subtitle,
+        sourceText: "",
+        translatedText: "",
+        regions: [
+          {
+            bounds: { left: 10, top: 20, width: 100, height: 24 },
+            sourceText: "原文",
+            translatedText: "译文",
+          },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      hasRenderableLiveSubtitleContent({
+        ...subtitle,
+        sourceText: "",
+        translatedText: "",
+        regions: [],
+        isStreaming: false,
+      }),
+    ).toBe(false);
+  });
 });
 
-describe("live subtitle region flow groups", () => {
-  function region(
-    left: number,
-    top: number,
-    width: number,
-    height: number,
-    sourceText: string,
-  ): LiveSubtitleRegion {
-    return {
-      bounds: { left, top, width, height },
-      sourceText,
-      translatedText: `译文-${sourceText}`,
-    };
-  }
+describe("live subtitle region coordinate mapping", () => {
+  const region: LiveSubtitleRegion = {
+    bounds: { left: 960, top: 270, width: 480, height: 54 },
+    sourceText: "原文",
+    translatedText: "译文",
+  };
 
-  test("puts horizontally overlapping regions in one vertical flow", () => {
-    const groups = groupLiveSubtitleRegions([
-      region(40, 0, 360, 24, "first"),
-      region(40, 0, 360, 24, "second"),
-      region(40, 0, 360, 24, "third"),
-      region(40, 0, 360, 24, "fourth"),
-    ]);
-
-    expect(groups).toHaveLength(1);
-    expect(groups[0].items.map((item) => item.index)).toEqual([0, 1, 2, 3]);
-    expect(groups[0].items.map((item) => item.gapAbove)).toEqual([0, 4, 4, 4]);
-  });
-
-  test("keeps non-overlapping horizontal columns independent", () => {
-    const groups = groupLiveSubtitleRegions([
-      region(20, 30, 180, 24, "left-1"),
-      region(30, 70, 160, 24, "left-2"),
-      region(240, 40, 140, 24, "right"),
-    ]);
-
-    expect(groups).toHaveLength(2);
-    expect(groups[0].items.map((item) => item.index)).toEqual([0, 1]);
-    expect(groups[1].items.map((item) => item.index)).toEqual([2]);
-  });
-
-  test("preserves source gaps inside one nearby text block", () => {
-    const groups = groupLiveSubtitleRegions([
-      region(20, 10, 180, 20, "first"),
-      region(20, 38, 180, 20, "second"),
-      region(20, 70, 180, 20, "third"),
-    ]);
-
-    expect(groups).toHaveLength(1);
-    expect(groups[0].items.map((item) => item.gapAbove)).toEqual([0, 8, 12]);
-  });
-
-  test("separates a distant bottom dialogue and anchors it to the bottom edge", () => {
-    const groups = groupLiveSubtitleRegions([
-      region(20, 10, 180, 20, "menu-1"),
-      region(20, 38, 180, 20, "menu-2"),
-      region(20, 500, 180, 60, "bottom-dialogue"),
-    ]);
-
-    expect(groups).toHaveLength(2);
-    expect(groups[0].items.map((item) => item.region.sourceText)).toEqual([
-      "menu-1",
-      "menu-2",
-    ]);
-    expect(groups[1].items[0].region.sourceText).toBe("bottom-dialogue");
-    expect(resolveLiveSubtitleRegionVerticalAnchor(groups[0], 600)).toEqual({
-      edge: "top",
-      offset: 10,
-    });
-    expect(resolveLiveSubtitleRegionVerticalAnchor(groups[1], 600)).toEqual({
-      edge: "bottom",
-      offset: 40,
+  test("maps source-image pixels into the measured overlay viewport", () => {
+    expect(mapLiveSubtitleRegionToOverlay(region, roi, 960, 540)).toEqual({
+      x: 480,
+      y: 135,
+      width: 240,
+      height: 27,
     });
   });
 
-  test("drops invalid or degenerate bounds", () => {
-    const groups = groupLiveSubtitleRegions([
-      region(20, 10, 0, 20, "zero-width"),
-      region(Number.NaN, 10, 20, 20, "nan"),
-      region(40, 50, 100, 24, "valid"),
-    ]);
-
-    expect(groups).toHaveLength(1);
-    expect(groups[0].items).toHaveLength(1);
-    expect(groups[0].items[0].region.sourceText).toBe("valid");
+  test("rejects invalid source or viewport dimensions", () => {
+    expect(
+      mapLiveSubtitleRegionToOverlay(region, { ...roi, clientWidth: 0 }, 960, 540),
+    ).toBeUndefined();
+    expect(mapLiveSubtitleRegionToOverlay(region, roi, 0, 540)).toBeUndefined();
+    expect(
+      mapLiveSubtitleRegionToOverlay(
+        { ...region, bounds: { ...region.bounds, width: 0 } },
+        roi,
+        960,
+        540,
+      ),
+    ).toBeUndefined();
   });
 });

@@ -72,6 +72,7 @@ fn key_trigger_timeout_reached(
 pub(crate) struct LiveSessionManager {
     backend: BackendState,
     status: Arc<Mutex<LiveSessionStatus>>,
+    latest_subtitle: Arc<Mutex<Option<Arc<LiveSubtitle>>>>,
     inner: Arc<Mutex<ManagerInner>>,
 }
 
@@ -104,6 +105,7 @@ impl LiveSessionManager {
         Self {
             backend,
             status: Arc::new(Mutex::new(LiveSessionStatus::default())),
+            latest_subtitle: Arc::new(Mutex::new(None)),
             inner: Arc::new(Mutex::new(ManagerInner::default())),
         }
     }
@@ -113,6 +115,18 @@ impl LiveSessionManager {
             .lock()
             .map(|status| status.clone())
             .map_err(|_| BackendFailure::internal("实时会话状态锁已损坏"))
+    }
+    fn current_subtitle(&self) -> Result<Option<LiveSubtitle>, BackendFailure> {
+        self.latest_subtitle
+            .lock()
+            .map(|subtitle| subtitle.as_deref().cloned())
+            .map_err(|_| BackendFailure::internal("实时字幕缓存锁已损坏"))
+    }
+
+    fn clear_latest_subtitle(&self) {
+        if let Ok(mut subtitle) = self.latest_subtitle.lock() {
+            *subtitle = None;
+        }
     }
 
     fn collect_finished(&self) -> Result<(), BackendFailure> {
@@ -221,6 +235,7 @@ impl LiveSessionManager {
             inner.selection_previous_state = None;
             inner.overlay_content_size = LiveOverlayContentSize::default();
         }
+        self.clear_latest_subtitle();
         replace_status(
             &self.status,
             app,
@@ -607,6 +622,7 @@ impl LiveSessionManager {
             app: app.clone(),
             backend: self.backend.clone(),
             status: Arc::clone(&self.status),
+            latest_subtitle: Arc::clone(&self.latest_subtitle),
             session_id: session_id.to_owned(),
             target_id: target.id.clone(),
             config: Arc::clone(&config),
@@ -890,6 +906,7 @@ impl LiveSessionManager {
         message: &str,
     ) {
         self.backend.live_active.store(false, Ordering::SeqCst);
+        self.clear_latest_subtitle();
         close_window(app, SELECTOR_LABEL);
         close_window(app, OVERLAY_LABEL);
         replace_status(
@@ -911,6 +928,7 @@ impl LiveSessionManager {
         self.backend.live_active.store(false, Ordering::SeqCst);
         close_window(app, SELECTOR_LABEL);
         close_window(app, OVERLAY_LABEL);
+        self.clear_latest_subtitle();
         if let Ok(mut inner) = self.inner.lock() {
             *inner = ManagerInner::default();
         }
@@ -930,6 +948,7 @@ struct SessionLoop {
     app: tauri::AppHandle,
     backend: BackendState,
     status: Arc<Mutex<LiveSessionStatus>>,
+    latest_subtitle: Arc<Mutex<Option<Arc<LiveSubtitle>>>>,
     session_id: String,
     target_id: String,
     config: Arc<Mutex<LiveConfig>>,
@@ -1681,19 +1700,20 @@ impl SessionLoop {
         } else {
             Vec::new()
         };
-        let _ = self.app.emit(
-            SUBTITLE_EVENT,
-            LiveSubtitle {
-                session_id: self.session_id.clone(),
-                revision,
-                source_text: source_text.to_owned(),
-                translated_text: translated_text.to_owned(),
-                roi: frame.roi,
-                regions: visible_regions,
-                is_streaming,
-                observed_at_epoch_ms: frame.observed_at_epoch_ms,
-            },
-        );
+        let subtitle = Arc::new(LiveSubtitle {
+            session_id: self.session_id.clone(),
+            revision,
+            source_text: source_text.to_owned(),
+            translated_text: translated_text.to_owned(),
+            roi: frame.roi,
+            regions: visible_regions,
+            is_streaming,
+            observed_at_epoch_ms: frame.observed_at_epoch_ms,
+        });
+        if let Ok(mut latest) = self.latest_subtitle.lock() {
+            *latest = Some(Arc::clone(&subtitle));
+        }
+        let _ = self.app.emit(SUBTITLE_EVENT, subtitle);
     }
 
     fn translate_subtitle_streaming(
@@ -2478,6 +2498,14 @@ pub(crate) fn get_live_session_status(
 ) -> Result<LiveSessionStatus, BackendError> {
     manager.collect_finished()?;
     manager.current_status().map_err(Into::into)
+}
+
+#[tauri::command]
+pub(crate) fn get_live_subtitle(
+    manager: State<'_, LiveSessionManager>,
+) -> Result<Option<LiveSubtitle>, BackendError> {
+    manager.collect_finished()?;
+    manager.current_subtitle().map_err(Into::into)
 }
 
 #[cfg(test)]

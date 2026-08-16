@@ -42,6 +42,7 @@ import type {
 } from "../services/live-translation-provider";
 import {
   liveOverlaySettings,
+  liveSubtitleStyleSettings,
   liveRecognitionSettings,
   liveTranslationSettings,
   KEY_TRIGGER_TIMEOUT_MAX_MS,
@@ -49,10 +50,16 @@ import {
   LIVE_STABILITY_WAIT_MAX_MS,
   LIVE_STABILITY_WAIT_MIN_MS,
   loadPersistedLiveOverlaySettings,
+  loadPersistedLiveSubtitleStyleSettings,
   loadPersistedLiveRecognitionSettings,
   loadPersistedLiveTranslationSettings,
   loadPersistedTargetLanguage,
   savePersistedLiveOverlaySettings,
+  savePersistedLiveSubtitleStyleSettings,
+  LIVE_SUBTITLE_FONT_SIZE_MIN,
+  LIVE_SUBTITLE_FONT_SIZE_MAX,
+  LIVE_SUBTITLE_BACKGROUND_OPACITY_MIN,
+  LIVE_SUBTITLE_BACKGROUND_OPACITY_MAX,
   savePersistedLiveRecognitionSettings,
   savePersistedLiveTranslationSettings,
   savePersistedTargetLanguage,
@@ -386,6 +393,10 @@ async function refreshWindows(notifyOnError = true): Promise<void> {
   }
 }
 
+function refreshWindowsOnTargetWindowInteraction(): void {
+  void refreshWindows(false);
+}
+
 async function startSession(): Promise<void> {
   const targetId = selectedTargetId.value;
   const language = targetLanguage.value.trim();
@@ -396,6 +407,7 @@ async function startSession(): Promise<void> {
   activeAction.value = "start";
   try {
     loadPersistedLiveOverlaySettings();
+    loadPersistedLiveSubtitleStyleSettings();
     loadPersistedLiveRecognitionSettings();
     loadPersistedLiveTranslationSettings();
     targetLanguage.value = language;
@@ -431,6 +443,11 @@ function saveLiveOverlayPreferences(): void {
   const persistError = savePersistedLiveOverlaySettings();
   if (persistError) {
     showWorkspaceToast(toast, "error", persistError);
+    return;
+  }
+  const stylePersistenceError = savePersistedLiveSubtitleStyleSettings();
+  if (stylePersistenceError) {
+    showWorkspaceToast(toast, "error", stylePersistenceError);
     return;
   }
   showWorkspaceToast(toast, "success", "实时显示设置已保存，下次开始抓取时生效。");
@@ -555,6 +572,7 @@ function cleanupPage(): void {
 onActivated(() => {
   loadPersistedTargetLanguage();
   loadPersistedLiveOverlaySettings();
+  loadPersistedLiveSubtitleStyleSettings();
   loadPersistedLiveRecognitionSettings();
   loadPersistedLiveTranslationSettings();
   void startStatusBinding();
@@ -619,7 +637,10 @@ onBeforeUnmount(cleanupPage);
               filterable
               placeholder="请选择要捕获的窗口"
               aria-label="实时翻译目标窗口"
+              @focus="refreshWindowsOnTargetWindowInteraction"
+              @click="refreshWindowsOnTargetWindowInteraction"
             />
+            <span class="live-settings-note">点击或聚焦目标窗口时自动刷新，也可使用右侧“刷新窗口”按钮。</span>
           </label>
           <n-empty
             v-if="isDesktopRuntime && windowsLoaded && captureWindows.length === 0"
@@ -816,6 +837,65 @@ onBeforeUnmount(cleanupPage);
           </n-button>
         </label>
       </div>
+
+      <section class="live-subtitle-style-settings" aria-labelledby="live-subtitle-style-title">
+        <div class="live-subtitle-style-heading">
+          <div>
+            <span class="panel-kicker">Subtitle appearance</span>
+            <h4 id="live-subtitle-style-title">字幕样式</h4>
+            <p>调整字幕文字与背景，保存后在下一次实时翻译会话中应用。</p>
+          </div>
+        </div>
+        <div class="live-subtitle-style-grid">
+          <label class="live-field">
+            <span>字体颜色</span>
+            <div class="live-color-control">
+              <input
+                v-model="liveSubtitleStyleSettings.fontColor"
+                class="live-color-input"
+                type="color"
+                aria-label="字幕字体颜色"
+              />
+              <code>{{ liveSubtitleStyleSettings.fontColor }}</code>
+            </div>
+          </label>
+          <label class="live-field live-number-field">
+            <span>字体大小（像素）</span>
+            <n-input-number
+              v-model:value="liveSubtitleStyleSettings.fontSize"
+              :min="LIVE_SUBTITLE_FONT_SIZE_MIN"
+              :max="LIVE_SUBTITLE_FONT_SIZE_MAX"
+              :step="1"
+              :precision="0"
+              aria-label="字幕字体大小"
+            />
+          </label>
+          <label class="live-field">
+            <span>背景颜色</span>
+            <div class="live-color-control">
+              <input
+                v-model="liveSubtitleStyleSettings.backgroundColor"
+                class="live-color-input"
+                type="color"
+                aria-label="字幕背景颜色"
+              />
+              <code>{{ liveSubtitleStyleSettings.backgroundColor }}</code>
+            </div>
+          </label>
+          <label class="live-field live-number-field">
+            <span>背景透明度（%）</span>
+            <n-input-number
+              v-model:value="liveSubtitleStyleSettings.backgroundOpacity"
+              :min="LIVE_SUBTITLE_BACKGROUND_OPACITY_MIN"
+              :max="LIVE_SUBTITLE_BACKGROUND_OPACITY_MAX"
+              :step="1"
+              :precision="0"
+              aria-label="字幕背景透明度"
+            />
+          </label>
+        </div>
+      </section>
+
 
       <n-alert v-if="liveOverlaySettings.mode === 'region_replace'" type="info" :show-icon="true">
         坐标替换模式固定覆盖目标客户区；贴附边与外侧偏移仅用于字幕框模式。
