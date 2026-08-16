@@ -22,7 +22,7 @@ export function isWorkspaceRouteName(value: unknown): value is WorkspaceRouteNam
 const routes: RouteRecordRaw[] = [
   {
     path: "/",
-    redirect: { name: "ocr-translate" },
+    redirect: { name: "live-translation" },
   },
   {
     path: "/live-translation",
@@ -56,7 +56,7 @@ const routes: RouteRecordRaw[] = [
   },
   {
     path: "/:pathMatch(.*)*",
-    redirect: { name: "ocr-translate" },
+    redirect: { name: "live-translation" },
   },
 ];
 

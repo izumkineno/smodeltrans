@@ -561,15 +561,15 @@ Hy 会话的记忆由 `HyConversationMemory` 管理：
 
 | 参数 | 默认值 |
 | --- | ---: |
-| `max_new_tokens` | `128` |
-| `sampling` | `false` |
-| `temperature` | `1.0` |
-| `top_k` | `0` |
-| `top_p` | `1.0` |
-| `repetition_penalty` | `1.0` |
+| `max_new_tokens` | `4096` |
+| `sampling` | `true` |
+| `temperature` | `0.7` |
+| `top_k` | `20` |
+| `top_p` | `0.6` |
+| `repetition_penalty` | `1.05` |
 | `frequency_penalty` | `0.0` |
 
-实际运行时以工作区后端设置为准；本文不把生成参数误认为 OCR 参数。
+实际运行时以工作区后端设置为准；OCR 与实时翻译可能根据源文本长度进一步调整 `max_new_tokens`，本文不把生成参数误认为 OCR 参数。
 
 ## 12. 结果事件与覆盖层
 

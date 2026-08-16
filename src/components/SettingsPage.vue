@@ -33,6 +33,8 @@ import {
   savePersistedTargetLanguage,
   targetLanguage,
 } from "../services/workspace-settings";
+import { setThemeMode, themeMode } from "../services/theme-settings";
+import type { ThemeMode } from "../services/theme-settings";
 import { showWorkspaceToast, type WorkspaceToastType } from "../services/workspace-toast";
 
 type TagType = "default" | "success" | "warning" | "error" | "info";
@@ -47,13 +49,13 @@ const device = ref<DeviceKind>("cuda");
 const regionParallelism = ref(16);
 const translationBatchSize = ref(4);
 const idleUnloadMinutes = ref(30);
-const generationMaxNewTokens = ref(128);
-const generationSampling = ref(false);
-const generationTemperature = ref(1);
-const generationTopK = ref(0);
-const generationTopP = ref(1);
+const generationMaxNewTokens = ref(4096);
+const generationSampling = ref(true);
+const generationTemperature = ref(0.7);
+const generationTopK = ref(20);
+const generationTopP = ref(0.6);
 const generationSeed = ref("");
-const generationRepetitionPenalty = ref(1);
+const generationRepetitionPenalty = ref(1.05);
 const generationFrequencyPenalty = ref(0);
 const generationStopTokensText = ref("");
 const generationStopStringsText = ref("");
@@ -71,6 +73,16 @@ const deviceOptions: Array<{ label: string; value: DeviceKind }> = [
   { label: "CUDA", value: "cuda" },
   { label: "CPU（仅用于状态检查；Hy 翻译需要 CUDA）", value: "cpu" },
 ];
+const themeModeOptions: Array<{ label: string; value: ThemeMode }> = [
+  { label: "自动（跟随系统）", value: "system" },
+  { label: "浅色（手动）", value: "light" },
+  { label: "深色（手动）", value: "dark" },
+];
+const themeModeLabels: Record<ThemeMode, string> = {
+  system: "自动（跟随系统）",
+  light: "浅色（手动）",
+  dark: "深色（手动）",
+};
 const toast = useMessage();
 
 function setSettingsFeedback(
@@ -83,6 +95,18 @@ function setSettingsFeedback(
   if (notify) {
     showWorkspaceToast(toast, type, message);
   }
+}
+
+function handleThemeModeChange(nextMode: ThemeMode | null): void {
+  if (!nextMode) {
+    return;
+  }
+  const persistError = setThemeMode(nextMode);
+  if (persistError) {
+    setSettingsFeedback("error", persistError);
+    return;
+  }
+  setSettingsFeedback("success", `界面主题已切换为${themeModeLabels[nextMode]}。`, false);
 }
 
 const settingsTagType = computed<TagType>(() => {
@@ -759,6 +783,28 @@ onMounted(() => {
         </dl>
       </n-card>
 
+      <n-card class="settings-card" :bordered="false">
+        <div class="settings-card-heading">
+          <div>
+            <p class="panel-kicker">界面外观</p>
+            <h2>颜色主题</h2>
+          </div>
+        </div>
+        <p class="settings-card-copy">
+          选择手动主题，或使用自动模式跟随 Windows 系统的浅色与深色设置；切换会立即生效并自动保存。
+        </p>
+        <label class="settings-field settings-field-wide">
+          <span>主题模式</span>
+          <n-select
+            :value="themeMode"
+            :options="themeModeOptions"
+            aria-label="主题模式"
+            @update:value="handleThemeModeChange"
+          />
+          <span class="settings-help">自动模式会在系统主题变化时实时切换。</span>
+        </label>
+      </n-card>
+
       <n-modal
         v-model:show="modelDialogOpen"
         preset="card"
@@ -946,7 +992,7 @@ onMounted(() => {
             <span class="panel-kicker">高级设置</span>
             <strong>Hy 生成与记忆参数</strong>
           </span>
-          <span class="settings-advanced-summary-copy">仅在需要微调时展开，默认设置已适合首次使用。</span>
+          <span class="settings-advanced-summary-copy">生成：文本、OCR、实时；记忆：仅文本、OCR，实时翻译使用独立配置。</span>
         </summary>
       <n-card class="settings-card settings-card-wide" :bordered="false">
         <div class="settings-card-heading">
@@ -959,8 +1005,9 @@ onMounted(() => {
             <template #unchecked>Greedy</template>
           </n-switch>
         </div>
-        <p class="settings-card-copy">
-          Greedy 模式忽略 top-k；开启 sampling 时 top-k 必须大于 0，且最大为 1024。
+        <p class="settings-scope-note">
+          <strong>适用：</strong>文本翻译、OCR 翻译、实时翻译。
+          <span class="settings-scope-warning">maxNewTokens 会在 OCR 与实时翻译中按文本长度自动调整，预热阶段临时使用 1。</span>
         </p>
         <div class="settings-field-grid">
           <label class="settings-field settings-number-field">
@@ -1038,8 +1085,9 @@ onMounted(() => {
             <template #unchecked>Memory off</template>
           </n-switch>
         </div>
-        <p class="settings-card-copy">
-          Stop tokens 用逗号或空白分隔；stop strings 每行一条。记忆关闭时仍保存预算，方便后续重新启用。
+        <p class="settings-scope-note">
+          <strong>Stop tokens / stop strings：</strong>适用于文本、OCR、实时翻译。
+          <strong>记忆开关、token 预算、轮数：</strong>仅适用于文本翻译和 OCR 翻译；实时翻译使用实时翻译页的独立上下文配置。
         </p>
         <div class="settings-field-grid">
           <label class="settings-field settings-field-wide settings-textarea">
@@ -1096,57 +1144,4 @@ onMounted(() => {
     </div>
   </section>
 </template>
-<style scoped>
-.settings-advanced {
-  display: grid;
-  gap: 16px;
-  min-width: 0;
-}
-
-.settings-advanced-summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 16px;
-  border: 1px solid var(--divider);
-  border-radius: 6px;
-  color: var(--text);
-  background: var(--surface);
-  cursor: pointer;
-}
-
-.settings-advanced-summary::marker {
-  color: var(--primary);
-}
-
-.settings-advanced-summary:focus-visible {
-  outline: 2px solid var(--primary);
-  outline-offset: 2px;
-}
-
-.settings-advanced-summary > span:first-child {
-  display: grid;
-  gap: 4px;
-}
-
-.settings-advanced-summary strong {
-  font-size: 15px;
-}
-
-.settings-advanced-summary-copy {
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.settings-advanced[open] > .settings-advanced-summary {
-  border-color: rgba(64, 158, 255, 0.34);
-}
-
-@media (max-width: 720px) {
-  .settings-advanced-summary {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-}
-</style>
+<style scoped src="../styles/settings-page.css"></style>

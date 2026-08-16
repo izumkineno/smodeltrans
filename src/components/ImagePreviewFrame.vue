@@ -124,13 +124,4 @@ function closeSelectablePreview(): void {
   </n-modal>
 </template>
 
-<style scoped>
-.selectable-preview-trigger {
-  cursor: zoom-in;
-}
-
-.selectable-preview-trigger:focus-visible {
-  outline: 2px solid var(--primary);
-  outline-offset: -2px;
-}
-</style>
+<style scoped src="../styles/image-preview-frame.css"></style>

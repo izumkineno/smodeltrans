@@ -29,13 +29,13 @@ pub(crate) struct GenerationConfig {
 impl Default for GenerationConfig {
     fn default() -> Self {
         Self {
-            max_new_tokens: 128,
-            sampling: false,
-            temperature: 1.0,
-            top_k: 0,
-            top_p: 1.0,
+            max_new_tokens: 4096,
+            sampling: true,
+            temperature: 0.7,
+            top_k: 20,
+            top_p: 0.6,
             seed: None,
-            repetition_penalty: 1.0,
+            repetition_penalty: 1.05,
             frequency_penalty: 0.0,
             stop_tokens: Vec::new(),
             stop_strings: Vec::new(),
@@ -215,6 +215,18 @@ mod tests {
             ..GenerationConfig::default()
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn generation_defaults_match_requested_hy_parameters() {
+        let defaults = GenerationConfig::default();
+
+        assert_eq!(defaults.max_new_tokens, 4096);
+        assert!(defaults.sampling);
+        assert_eq!(defaults.temperature, 0.7);
+        assert_eq!(defaults.top_k, 20);
+        assert_eq!(defaults.top_p, 0.6);
+        assert_eq!(defaults.repetition_penalty, 1.05);
     }
 
     #[test]

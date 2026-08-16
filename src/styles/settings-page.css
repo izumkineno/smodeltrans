@@ -1,0 +1,52 @@
+.settings-advanced {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.settings-advanced-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.settings-advanced-summary::marker {
+  color: var(--primary);
+}
+
+.settings-advanced-summary:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.settings-advanced-summary > span:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-advanced-summary strong {
+  font-size: 15px;
+}
+
+.settings-advanced-summary-copy {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.settings-advanced[open] > .settings-advanced-summary {
+  border-color: rgba(var(--primary-rgb), 0.34);
+}
+
+@media (max-width: 720px) {
+  .settings-advanced-summary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
