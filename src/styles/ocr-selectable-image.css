@@ -62,19 +62,26 @@
 }
 
 .selectable-image-canvas {
-  display: flex;
   min-height: 0;
   flex: 1;
-  align-items: center;
-  justify-content: center;
-  overflow: auto;
-  padding: 12px;
   background: var(--surface-hover);
 }
 
+.selectable-image-canvas :deep(.selectable-image-scroll-content) {
+  display: flex;
+  min-width: 100%;
+  min-height: 100%;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+}
+
 .is-preview .selectable-image-canvas {
-  padding: 32px;
   background: #17191c;
+}
+
+.is-preview .selectable-image-canvas :deep(.selectable-image-scroll-content) {
+  padding: 32px;
 }
 
 .selectable-image-stage {
@@ -168,7 +175,7 @@
     flex-wrap: wrap;
   }
 
-  .is-preview .selectable-image-canvas {
+  .is-preview .selectable-image-canvas :deep(.selectable-image-scroll-content) {
     padding: 16px;
   }
 

@@ -12,6 +12,7 @@ import {
   NSpin,
   NSwitch,
   NTag,
+  NScrollbar,
   useMessage,
 } from "naive-ui";
 import {
@@ -1159,30 +1160,32 @@ onBeforeUnmount(cleanupPage);
       </div>
 
       <n-empty v-if="debugRecords.length === 0" size="small" description="等待 OCR 或翻译事件。" />
-      <ol v-else class="debug-records" aria-label="OCR 与翻译调试记录">
-        <li v-for="record in debugRecords" :key="`${record.sessionId}-${record.sequence}`" class="debug-record">
-          <header class="debug-record-header">
-            <span class="debug-record-stage">{{ record.stage === "ocr" ? "OCR" : "翻译" }}</span>
-            <strong>{{ debugOutcomeLabel(record.outcome) }}</strong>
-            <time>{{ formatDebugTime(record.observedAtEpochMs) }}</time>
-          </header>
-          <dl class="debug-record-meta">
-            <div><dt>ROI 版本</dt><dd>{{ record.roiVersion }}</dd></div>
-            <div><dt>文本区域</dt><dd>{{ record.regionCount }}</dd></div>
-            <div><dt>耗时</dt><dd>{{ record.durationMs }} ms</dd></div>
-            <div><dt>目标语言</dt><dd>{{ record.targetLanguage }}</dd></div>
-          </dl>
-          <div v-if="record.sourceText" class="debug-record-text">
-            <span>OCR 输出</span>
-            <pre>{{ record.sourceText }}</pre>
-          </div>
-          <div v-if="record.translatedText !== undefined" class="debug-record-text">
-            <span>翻译输出</span>
-            <pre>{{ record.translatedText || "（空）" }}</pre>
-          </div>
-          <p v-if="record.message" class="debug-record-error">{{ record.message }}</p>
-        </li>
-      </ol>
+      <n-scrollbar v-else class="debug-records-scrollbar" content-class="debug-records-scroll-content">
+        <ol class="debug-records" aria-label="OCR 与翻译调试记录">
+          <li v-for="record in debugRecords" :key="`${record.sessionId}-${record.sequence}`" class="debug-record">
+            <header class="debug-record-header">
+              <span class="debug-record-stage">{{ record.stage === "ocr" ? "OCR" : "翻译" }}</span>
+              <strong>{{ debugOutcomeLabel(record.outcome) }}</strong>
+              <time>{{ formatDebugTime(record.observedAtEpochMs) }}</time>
+            </header>
+            <dl class="debug-record-meta">
+              <div><dt>ROI 版本</dt><dd>{{ record.roiVersion }}</dd></div>
+              <div><dt>文本区域</dt><dd>{{ record.regionCount }}</dd></div>
+              <div><dt>耗时</dt><dd>{{ record.durationMs }} ms</dd></div>
+              <div><dt>目标语言</dt><dd>{{ record.targetLanguage }}</dd></div>
+            </dl>
+            <div v-if="record.sourceText" class="debug-record-text">
+              <span>OCR 输出</span>
+              <pre>{{ record.sourceText }}</pre>
+            </div>
+            <div v-if="record.translatedText !== undefined" class="debug-record-text">
+              <span>翻译输出</span>
+              <pre>{{ record.translatedText || "（空）" }}</pre>
+            </div>
+            <p v-if="record.message" class="debug-record-error">{{ record.message }}</p>
+          </li>
+        </ol>
+      </n-scrollbar>
     </n-card>
     </section>
 

@@ -9,6 +9,7 @@ import {
   NIcon,
   NInputNumber,
   NProgress,
+  NScrollbar,
   NSpace,
   NTag,
   NText,
@@ -691,16 +692,16 @@ onBeforeUnmount(() => {
 
       <div
         v-if="sizingEnabled"
-        ref="subtitleToolbar"
         class="subtitle-panel-toolbar"
         aria-label="实时字幕工具栏"
       >
-        <n-space
-          class="subtitle-toolbar-space"
-          align="center"
-          :size="4"
-          :wrap="false"
-        >
+        <n-scrollbar class="subtitle-toolbar-space" x-scrollable>
+          <div ref="subtitleToolbar" class="subtitle-toolbar-scroll-content">
+          <n-space
+            align="center"
+            :size="4"
+            :wrap="false"
+          >
           <n-tooltip placement="top" trigger="hover">
             <template #trigger>
               <n-button
@@ -887,7 +888,9 @@ onBeforeUnmount(() => {
               <template #suffix>px</template>
             </n-input-number>
           </div>
-        </n-space>
+          </n-space>
+          </div>
+        </n-scrollbar>
       </div>
 
       <n-alert
@@ -933,19 +936,21 @@ onBeforeUnmount(() => {
       </n-space>
 
       <div class="subtitle-panel-content">
-        <n-space vertical :size="6" class="subtitle-copy">
-          <n-text v-if="!hasLiveSubtitle" tag="p" class="translated-text">
-            {{ standbyText }}
-          </n-text>
-          <template v-else>
-            <n-text tag="p" class="translated-text">
-              {{ subtitle?.translatedText || "翻译中…" }}
+        <n-scrollbar class="subtitle-panel-scrollbar" content-class="subtitle-panel-scroll-content">
+          <n-space vertical :size="6" class="subtitle-copy">
+            <n-text v-if="!hasLiveSubtitle" tag="p" class="translated-text">
+              {{ standbyText }}
             </n-text>
-            <n-text v-if="showSource && subtitle?.sourceText" tag="p" class="source-text">
-              {{ subtitle.sourceText }}
-            </n-text>
-          </template>
-        </n-space>
+            <template v-else>
+              <n-text tag="p" class="translated-text">
+                {{ subtitle?.translatedText || "翻译中…" }}
+              </n-text>
+              <n-text v-if="showSource && subtitle?.sourceText" tag="p" class="source-text">
+                {{ subtitle.sourceText }}
+              </n-text>
+            </template>
+          </n-space>
+        </n-scrollbar>
       </div>
     </n-card>
   </div>

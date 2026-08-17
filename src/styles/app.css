@@ -288,8 +288,10 @@ a:focus-visible {
 }
 
 .workspace-main > .n-layout-scroll-container > .content {
+  display: flex;
   flex: 1;
   min-height: 0;
+  flex-direction: column;
 }
 
 .sidebar {
@@ -498,7 +500,16 @@ a:focus-visible {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+}
+
+.content > .n-scrollbar {
+  min-height: 0;
+  flex: 1;
+}
+
+.content-scroll {
+  min-width: 100%;
+  min-height: 100%;
   padding: 24px clamp(24px, 3vw, 48px) 20px;
 }
 
@@ -1009,12 +1020,20 @@ h1 {
 }
 
 .result-preview-canvas {
-  display: grid;
   min-height: 0;
   flex: 1;
+}
+
+.image-preview-scroll-content {
+  display: grid;
+  min-width: 100%;
+  min-height: 100%;
   place-items: center;
+  padding: 12px;
+}
+
+.result-preview-canvas .image-preview-scroll-content {
   padding: 8px;
-  overflow: auto;
 }
 
 .result-image {
@@ -1084,11 +1103,8 @@ h1 {
 
 
 .preview-canvas {
-  display: grid;
   min-height: 0;
   flex: 1;
-  place-items: center;
-  padding: 12px;
   background:
     linear-gradient(45deg, rgba(var(--shadow-rgb, 48, 49, 51), 0.035) 25%, transparent 25%),
     linear-gradient(-45deg, rgba(var(--shadow-rgb, 48, 49, 51), 0.035) 25%, transparent 25%),

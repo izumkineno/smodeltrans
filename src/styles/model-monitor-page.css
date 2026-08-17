@@ -326,13 +326,17 @@
 }
 
 .event-table-wrap {
-  overflow-x: auto;
   border: 1px solid var(--divider);
   border-radius: 4px;
 }
 
+.event-table-wrap :deep(.event-table-scroll-content) {
+  min-width: 100%;
+}
+
 .event-table {
   width: 100%;
+  min-width: max-content;
   border-collapse: collapse;
   color: var(--text-soft);
   font-size: 12px;

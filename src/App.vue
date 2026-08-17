@@ -925,7 +925,12 @@ onBeforeUnmount(() => {
           </n-layout-sider>
 
           <n-layout class="workspace-main">
-            <n-layout-content id="main-content" class="content">
+            <n-layout-content
+              id="main-content"
+              class="content"
+              :native-scrollbar="false"
+              content-class="content-scroll"
+            >
               <section class="workspace-header" :aria-labelledby="pageMetadata.titleId">
                 <h1 :id="pageMetadata.titleId">{{ pageMetadata.title }}</h1>
                 <n-tag

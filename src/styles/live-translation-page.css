@@ -435,14 +435,22 @@
   line-height: 1.6;
 }
 
+.debug-records-scrollbar {
+  min-height: 0;
+  max-height: 560px;
+}
+
+.debug-records-scrollbar :deep(.debug-records-scroll-content) {
+  min-width: 100%;
+}
+
 .debug-records {
   display: flex;
-  max-height: 560px;
+  width: 100%;
   flex-direction: column;
   gap: 10px;
   margin: 0;
   padding: 0;
-  overflow: auto;
   list-style: none;
 }
 

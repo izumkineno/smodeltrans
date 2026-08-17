@@ -7,7 +7,7 @@ import {
   ref,
   watch,
 } from "vue";
-import { NButton } from "naive-ui";
+import { NButton, NScrollbar } from "naive-ui";
 import type { OcrRegion } from "../services/translation-provider";
 import {
   buildOcrSelectionModel,
@@ -171,6 +171,7 @@ function handlePreviewWheel(event: WheelEvent): void {
   if (!props.previewMode) {
     return;
   }
+  event.preventDefault();
   setZoom(zoom.value + (event.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP));
 }
 
@@ -215,7 +216,12 @@ onBeforeUnmount(() => {
         </template>
       </span>
     </div>
-    <div class="selectable-image-canvas" @wheel.prevent="handlePreviewWheel">
+    <n-scrollbar
+      class="selectable-image-canvas"
+      x-scrollable
+      content-class="selectable-image-scroll-content"
+      @wheel="handlePreviewWheel"
+    >
       <div class="selectable-image-stage" :style="{ transform: `scale(${zoom})` }">
         <img class="selectable-image" :src="src" :alt="alt" draggable="false" />
         <svg
@@ -241,7 +247,7 @@ onBeforeUnmount(() => {
           />
         </svg>
       </div>
-    </div>
+    </n-scrollbar>
     <pre ref="selectionSource" class="native-selection-source" aria-hidden="true">{{ selectionModel.text }}</pre>
   </div>
 </template>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, type VNodeChild } from "vue";
-import { NImage, NModal, type ImageRenderToolbarProps } from "naive-ui";
+import { NImage, NModal, NScrollbar, type ImageRenderToolbarProps } from "naive-ui";
 import type { OcrRegion } from "../services/translation-provider";
 import OcrSelectableImage from "./OcrSelectableImage.vue";
 
@@ -75,8 +75,10 @@ function closeSelectablePreview(): void {
         <slot name="actions" />
       </div>
     </div>
-    <div
+    <n-scrollbar
       :class="[canvasClass, { 'selectable-preview-trigger': hasSelectablePreview }]"
+      x-scrollable
+      content-class="image-preview-scroll-content"
       :role="hasSelectablePreview ? 'button' : undefined"
       :tabindex="hasSelectablePreview ? 0 : undefined"
       :aria-label="hasSelectablePreview ? `放大${title}并选择 OCR 文字` : undefined"
@@ -95,7 +97,7 @@ function closeSelectablePreview(): void {
         :render-toolbar="renderToolbar"
         @error="emit('error')"
       />
-    </div>
+    </n-scrollbar>
   </div>
 
   <n-modal

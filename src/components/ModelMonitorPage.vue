@@ -8,6 +8,7 @@ import {
   NProgress,
   NSpin,
   NTag,
+  NScrollbar,
   useMessage,
 } from "naive-ui";
 import {
@@ -401,7 +402,12 @@ onBeforeUnmount(stopPolling);
           </div>
           <span>最近 {{ runtimeStatus.recentEvents.length }} 条</span>
         </div>
-        <div v-if="runtimeStatus.recentEvents.length" class="event-table-wrap">
+        <n-scrollbar
+          v-if="runtimeStatus.recentEvents.length"
+          class="event-table-wrap"
+          x-scrollable
+          content-class="event-table-scroll-content"
+        >
           <table class="event-table">
             <thead>
               <tr>
@@ -429,7 +435,7 @@ onBeforeUnmount(stopPolling);
               </tr>
             </tbody>
           </table>
-        </div>
+        </n-scrollbar>
         <n-empty v-else size="small" description="完成一次 OCR、翻译或模型控制后，这里会显示运行记录。" />
       </n-card>
     </template>
