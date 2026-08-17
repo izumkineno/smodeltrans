@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, h, onBeforeUnmount, onMounted, ref } from "vue";
 import type { CSSProperties } from "vue";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, Window } from "@tauri-apps/api/window";
 import {
   darkTheme,
   lightTheme,
@@ -30,8 +30,10 @@ import {
 } from "./services/workspace-settings";
 import { loadPersistedThemeMode, resolvedTheme } from "./services/theme-settings";
 import { stopLiveSession } from "./services/live-translation-provider";
+import { initializeQuickTranslationSettings } from "./services/quick-translation-settings";
 import LiveSelectionWindow from "./components/LiveSelectionWindow.vue";
 import LiveSubtitleOverlay from "./components/LiveSubtitleOverlay.vue";
+import QuickTranslationOverlay from "./components/QuickTranslationOverlay.vue";
 
 loadPersistedThemeMode();
 
@@ -532,7 +534,9 @@ const appWindow = isDesktopRuntime ? getCurrentWindow() : null;
 const windowLabel = appWindow?.label ?? "main";
 const isLiveSelectorWindow = windowLabel === "live-selector";
 const isLiveOverlayWindow = windowLabel === "live-overlay";
-const isMainWorkspaceWindow = !isLiveSelectorWindow && !isLiveOverlayWindow;
+const isQuickTranslationWindow = windowLabel === "quick-translation";
+const isMainWorkspaceWindow =
+  !isLiveSelectorWindow && !isLiveOverlayWindow && !isQuickTranslationWindow;
 const isWindowMaximized = ref(false);
 let windowStateUnlisten: (() => void) | undefined;
 let windowStateListenerActive = true;
@@ -663,6 +667,12 @@ async function bindWindowStateListener() {
   }
 }
 
+async function destroyWorkspaceWindows(): Promise<void> {
+  const quickTranslationWindow = await Window.getByLabel("quick-translation").catch(() => null);
+  await quickTranslationWindow?.destroy().catch(() => undefined);
+  await appWindow?.destroy().catch(() => undefined);
+}
+
 async function bindMainWindowCloseListener(): Promise<void> {
   if (!appWindow || !isMainWorkspaceWindow) {
     return;
@@ -675,11 +685,11 @@ async function bindMainWindowCloseListener(): Promise<void> {
       }
       closeCleanupInFlight = true;
       // Let the close event return first so backend window cleanup can use
-      // the Tauri main thread before destroying the main window.
+      // the Tauri main thread before destroying every remaining app window.
       void stopLiveSession()
         .catch(() => undefined)
         .finally(() => {
-          void appWindow.destroy().catch(() => undefined);
+          void destroyWorkspaceWindows();
         });
     });
     if (!windowStateListenerActive) {
@@ -760,6 +770,11 @@ onMounted(() => {
     return;
   }
   loadPersistedTargetLanguage();
+  if (isDesktopRuntime) {
+    void initializeQuickTranslationSettings().catch((error) => {
+      console.error("初始化快捷翻译设置失败", error);
+    });
+  }
   void syncWindowState();
   void bindWindowStateListener();
   void bindMainWindowCloseListener();
@@ -786,6 +801,7 @@ onBeforeUnmount(() => {
 
       <LiveSelectionWindow v-if="isLiveSelectorWindow" />
       <LiveSubtitleOverlay v-else-if="isLiveOverlayWindow" />
+      <QuickTranslationOverlay v-else-if="isQuickTranslationWindow" />
       <div v-else class="app-shell" :style="appThemeStyle">
         <header
           class="titlebar"
@@ -868,8 +884,7 @@ onBeforeUnmount(() => {
               </section>
 
               <section class="nav-section" aria-labelledby="nav-one-shot-heading">
-                <p id="nav-one-shot-heading" class="nav-heading">一次性工具</p>
-                <p class="nav-context">按内容选择文本、OCR 或 OCR 翻译。</p>
+                <p id="nav-one-shot-heading" class="nav-heading">工具</p>
                 <n-menu
                   :value="activeMenu"
                   :icon-size="16"
@@ -880,7 +895,6 @@ onBeforeUnmount(() => {
 
               <section class="nav-section" aria-labelledby="nav-operations-heading">
                 <p id="nav-operations-heading" class="nav-heading">操作</p>
-                <p class="nav-context">准备模型和目标语言，或查看运行状态。</p>
                 <n-menu
                   :value="activeMenu"
                   :icon-size="16"

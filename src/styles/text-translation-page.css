@@ -10,6 +10,35 @@
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
 }
+.text-quick-settings-card {
+  margin-top: 16px;
+}
+
+.text-quick-settings-heading {
+  margin-bottom: 14px;
+}
+
+.text-quick-settings-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr);
+  gap: 14px;
+}
+
+.text-quick-settings-grid .text-option-field {
+  max-width: none;
+}
+
+.text-quick-settings-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.text-quick-settings-actions .text-option-help {
+  margin: 0;
+}
 
 .text-page-card {
   min-height: max(520px, calc(100dvh - 360px));
@@ -268,6 +297,15 @@
 
   .text-page-card {
     min-height: 0;
+  }
+
+  .text-quick-settings-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .text-quick-settings-actions {
+    align-items: stretch;
+    flex-direction: column;
   }
 }
 

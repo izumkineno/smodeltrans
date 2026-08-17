@@ -235,9 +235,7 @@ impl PpOcrProvider {
         let detector_normalizer =
             ImageNormalizer::new([0.485, 0.456, 0.406], [0.229, 0.224, 0.225], device).map_err(
                 |error| {
-                    BackendFailure::ocr(format!(
-                        "prepare PP-OCR detector normalization: {error:#}"
-                    ))
+                    BackendFailure::ocr(format!("prepare PP-OCR detector normalization: {error:#}"))
                 },
             )?;
         let recognizer_normalizer =
@@ -331,9 +329,10 @@ impl OcrPort for PpOcrProvider {
             .map_err(|error| BackendFailure::ocr(format!("run detector graph: {error:#}")))?;
         let detector_forward_ms = detector_forward_started.elapsed().as_millis();
         let detector_postprocess_started = Instant::now();
-        let quads = detector_quads(&detector_output, profile, self.postprocess).map_err(
-            |error| BackendFailure::ocr(format!("postprocess detector output: {error:#}")),
-        )?;
+        let quads =
+            detector_quads(&detector_output, profile, self.postprocess).map_err(|error| {
+                BackendFailure::ocr(format!("postprocess detector output: {error:#}"))
+            })?;
         let detector_postprocess_ms = detector_postprocess_started.elapsed().as_millis();
         cancellation.check()?;
         if quads.is_empty() {
@@ -865,7 +864,6 @@ fn fill_recognition_tensor(
     Ok(())
 }
 
-
 fn recognition_batch_tensor(
     jobs: &[RecognitionJob],
     device: &Device,
@@ -936,7 +934,6 @@ fn decode_recognizer_token_ids(
         confidence_milli: 0,
     })
 }
-
 
 fn decode_recognizer_batch_detailed(
     output: &RecognizerOutput,
@@ -1010,7 +1007,6 @@ fn decode_recognizer_batch_detailed(
     }
     Ok(decoded)
 }
-
 
 fn character_records(
     job: &RecognitionJob,
@@ -1688,7 +1684,6 @@ mod cuda_model_pair_tests {
         }
     }
 
-
     fn run_model_pair(
         label: &str,
         detector_dir: &str,
@@ -1715,7 +1710,10 @@ mod cuda_model_pair_tests {
             .iter()
             .map(|region| region.source_text.as_str())
             .collect::<String>();
-        if !image_text.chars().any(|character| character.is_alphanumeric()) {
+        if !image_text
+            .chars()
+            .any(|character| character.is_alphanumeric())
+        {
             return Err(format!(
                 "image OCR produced no recognized text: {image_text:?}"
             ));
@@ -1736,7 +1734,10 @@ mod cuda_model_pair_tests {
             .map_err(|error| format!("run {label} live OCR on CUDA: {error:#}"))?
             .ok_or_else(|| "live OCR produced no region".to_owned())?;
         let live_text = live_region.source_text;
-        if !live_text.chars().any(|character| character.is_alphanumeric()) {
+        if !live_text
+            .chars()
+            .any(|character| character.is_alphanumeric())
+        {
             return Err(format!(
                 "live OCR produced no recognized text: {live_text:?}"
             ));
@@ -1766,9 +1767,7 @@ mod cuda_model_pair_tests {
                 &cancellation,
             ) {
                 Ok((image_text, live_text)) => {
-                    eprintln!(
-                        "[cuda-ocr] {label}: image={image_text:?}; live={live_text:?}"
-                    );
+                    eprintln!("[cuda-ocr] {label}: image={image_text:?}; live={live_text:?}");
                 }
                 Err(error) => failures.push(format!("{label}: {error}")),
             }
@@ -1781,4 +1780,3 @@ mod cuda_model_pair_tests {
         );
     }
 }
-

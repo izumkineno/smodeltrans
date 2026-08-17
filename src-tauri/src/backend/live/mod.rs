@@ -516,6 +516,13 @@ impl LiveSessionManager {
             )
         };
         close_window(app, SELECTOR_LABEL);
+        create_overlay_window(
+            app,
+            session_id,
+            geometry,
+            overlay_settings,
+            overlay_content_size,
+        )?;
         position_overlay(
             app,
             geometry,
@@ -525,6 +532,7 @@ impl LiveSessionManager {
             overlay_position_offset,
             overlay_resize_locked,
         );
+        set_overlay_visible(app, true);
         update_status(&self.status, app, |status| {
             status.state = state;
             status.roi = Some(display_roi);
@@ -1147,10 +1155,15 @@ impl SessionLoop {
             {
                 trigger_pending = true;
                 trigger_wait_started = Some(Instant::now());
+                if let Err(error) = self.ensure_overlay_window() {
+                    terminal_message = Some(error.message().to_owned());
+                    break;
+                }
             } else if config.recognition_settings.mode != LiveRecognitionMode::KeyTrigger {
                 trigger_pending = false;
                 trigger_wait_started = None;
             }
+
             if config.recognition_settings.mode == LiveRecognitionMode::KeyTrigger
                 && !trigger_pending
             {
@@ -1631,6 +1644,36 @@ impl SessionLoop {
                 )
             })
             .unwrap_or_default()
+    }
+    fn ensure_overlay_window(&self) -> Result<(), BackendFailure> {
+        let geometry = platform::target_geometry(&self.target_id)?;
+        let (
+            overlay_settings,
+            overlay_content_size,
+            overlay_position_locked,
+            overlay_position_offset,
+            overlay_resize_locked,
+        ) = self.config_overlay_layout();
+        if !overlay_window_exists(&self.app)? {
+            create_overlay_window(
+                &self.app,
+                &self.session_id,
+                geometry,
+                overlay_settings,
+                overlay_content_size,
+            )?;
+        }
+        position_overlay(
+            &self.app,
+            geometry,
+            overlay_settings,
+            overlay_content_size,
+            overlay_position_locked,
+            overlay_position_offset,
+            overlay_resize_locked,
+        );
+        set_overlay_visible(&self.app, true);
+        Ok(())
     }
 
     fn roi_is_current(&self, version: u64) -> bool {
@@ -2278,6 +2321,12 @@ fn position_overlay(
         Ok(())
     });
 }
+fn overlay_window_exists(app: &tauri::AppHandle) -> Result<bool, BackendFailure> {
+    let app = app.clone();
+    run_window_operation_on_main_thread(app.clone(), move || {
+        Ok(app.get_webview_window(OVERLAY_LABEL).is_some())
+    })
+}
 
 fn close_window(app: &tauri::AppHandle, label: &str) {
     let app = app.clone();
@@ -2294,12 +2343,13 @@ fn close_window_now(app: &tauri::AppHandle, label: &str) {
     }
 }
 
-fn run_window_operation_on_main_thread<F>(
+fn run_window_operation_on_main_thread<T, F>(
     app: tauri::AppHandle,
     operation: F,
-) -> Result<(), BackendFailure>
+) -> Result<T, BackendFailure>
 where
-    F: FnOnce() -> Result<(), BackendFailure> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, BackendFailure> + Send + 'static,
 {
     let (sender, receiver) = mpsc::sync_channel(1);
     app.run_on_main_thread(move || {

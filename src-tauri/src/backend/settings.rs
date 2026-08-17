@@ -899,7 +899,8 @@ fn probe_ocr_dir(dir: &Path) -> Option<(GraphRole, PpOcrVariant)> {
             PpOcrVariant::from_model_name(GraphRole::Recognizer, model_name)
                 .map(|variant| (GraphRole::Recognizer, variant))
         })
-}fn display_name_for_ocr_dir(dir_name: &str, variant: &str) -> String {
+}
+fn display_name_for_ocr_dir(dir_name: &str, variant: &str) -> String {
     let trimmed = dir_name
         .trim_end_matches("_safetensors")
         .trim_end_matches("_det")
@@ -1488,7 +1489,10 @@ mod tests {
             .update_from_request(mixed)
             .expect_err("cross-tier pairs must be rejected");
         assert!(error.contains("不一致"), "unexpected error: {error}");
-        assert!(error.contains("v6-tiny") && error.contains("v6-medium"), "{error}");
+        assert!(
+            error.contains("v6-tiny") && error.contains("v6-medium"),
+            "{error}"
+        );
 
         let medium_det = root.join("medium_det");
         std::fs::create_dir_all(&medium_det).expect("medium det dir");
@@ -1556,4 +1560,3 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 }
-

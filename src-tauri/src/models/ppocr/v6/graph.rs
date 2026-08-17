@@ -34,15 +34,16 @@ fn count_safetensors_tensors(path: &std::path::Path) -> Result<usize> {
         "safetensors file is too short: {}",
         path.display()
     );
-    let header_len: usize = u64::from_le_bytes(bytes[0..8].try_into().expect("8-byte header length"))
-        .try_into()
-        .context("safetensors header length overflows usize")?;
+    let header_len: usize =
+        u64::from_le_bytes(bytes[0..8].try_into().expect("8-byte header length"))
+            .try_into()
+            .context("safetensors header length overflows usize")?;
     ensure!(
         header_len < bytes.len(),
         "safetensors header length exceeds file size"
     );
-    let header: Value = serde_json::from_slice(&bytes[8..8 + header_len])
-        .context("parse safetensors header")?;
+    let header: Value =
+        serde_json::from_slice(&bytes[8..8 + header_len]).context("parse safetensors header")?;
     let map = header
         .as_object()
         .context("safetensors header must be a JSON object")?;
@@ -95,12 +96,8 @@ impl PpOcrV6Detector {
             .get("backbone_config")
             .context("v6 detector config has no backbone_config")?;
         let vb = load_mmaped_weights(assets, device)?;
-        let backbone = PpLcNetV4::load(
-            vb.pp("model").pp("backbone"),
-            backbone_config,
-            true,
-        )
-        .context("load native PP-OCRv6 detector PPLCNetV4 backbone")?;
+        let backbone = PpLcNetV4::load(vb.pp("model").pp("backbone"), backbone_config, true)
+            .context("load native PP-OCRv6 detector PPLCNetV4 backbone")?;
         let neck = match assets.variant {
             PpOcrVariant::V6Medium => {
                 let out_channels = config_value
@@ -109,7 +106,11 @@ impl PpOcrV6Detector {
                     .map(|value| value as usize)
                     .context("v6 medium detector config has no neck_out_channels")?;
                 let in_channels = backbone_stage_out_channels(backbone_config);
-                V6DetNeck::Pan(DetNeck::load(vb.pp("model").pp("neck"), in_channels, out_channels)?)
+                V6DetNeck::Pan(DetNeck::load(
+                    vb.pp("model").pp("neck"),
+                    in_channels,
+                    out_channels,
+                )?)
             }
             _ => {
                 let out_channels = config_value
@@ -226,12 +227,8 @@ impl PpOcrV6Recognizer {
             .get("backbone_config")
             .context("v6 recognizer config has no backbone_config")?;
         let vb = load_mmaped_weights(assets, device)?;
-        let backbone = PpLcNetV4::load(
-            vb.pp("model").pp("backbone"),
-            backbone_config,
-            false,
-        )
-        .context("load native PP-OCRv6 recognizer PPLCNetV4 backbone")?;
+        let backbone = PpLcNetV4::load(vb.pp("model").pp("backbone"), backbone_config, false)
+            .context("load native PP-OCRv6 recognizer PPLCNetV4 backbone")?;
         let head = match assets.variant {
             PpOcrVariant::V6Tiny => {
                 let hidden_size = config_value
@@ -321,5 +318,3 @@ impl V6RecHead {
         }
     }
 }
-
-

@@ -233,7 +233,11 @@ fn parse_db_postprocess(inference: &YamlNode) -> Option<DetectorPostProcess> {
     }
     let binary_thresh = postprocess.get("thresh")?.as_scalar()?.parse().ok()?;
     let box_thresh = postprocess.get("box_thresh")?.as_scalar()?.parse().ok()?;
-    let max_candidates = postprocess.get("max_candidates")?.as_scalar()?.parse().ok()?;
+    let max_candidates = postprocess
+        .get("max_candidates")?
+        .as_scalar()?
+        .parse()
+        .ok()?;
     let unclip_ratio = postprocess.get("unclip_ratio")?.as_scalar()?.parse().ok()?;
     Some(DetectorPostProcess {
         binary_thresh,
@@ -365,4 +369,3 @@ fn attach_yaml_node(
         }
     }
 }
-

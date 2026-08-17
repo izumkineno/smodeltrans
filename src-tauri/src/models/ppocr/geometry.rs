@@ -504,4 +504,3 @@ pub fn crop_region(image: &RgbImage, quad: QuadI) -> Result<RegionCrop> {
         rotated,
     })
 }
-

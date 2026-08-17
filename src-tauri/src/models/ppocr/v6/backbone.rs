@@ -103,7 +103,10 @@ impl LcNetV4Block {
             )?)
         };
         let se = if use_se {
-            Some(SeBlock::load(vb.pp("token_squeeze_excitation"), in_channels)?)
+            Some(SeBlock::load(
+                vb.pp("token_squeeze_excitation"),
+                in_channels,
+            )?)
         } else {
             None
         };
@@ -236,7 +239,16 @@ impl ConvBn {
         padding: (usize, usize),
         groups: usize,
     ) -> Result<Self> {
-        Self::load_with_same_pad(vb, in_channels, out_channels, kernel, stride, padding, groups, false)
+        Self::load_with_same_pad(
+            vb,
+            in_channels,
+            out_channels,
+            kernel,
+            stride,
+            padding,
+            groups,
+            false,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -278,8 +290,7 @@ impl ConvBn {
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = if self.same_pad {
-            xs.pad_with_zeros(2, 0, 1)?
-                .pad_with_zeros(3, 0, 1)?
+            xs.pad_with_zeros(2, 0, 1)?.pad_with_zeros(3, 0, 1)?
         } else {
             xs.clone()
         };
@@ -308,7 +319,10 @@ impl Stem {
     fn load(vb: VarBuilder, kind: StemKind, mid: usize, out: usize) -> Result<Self> {
         match kind {
             StemKind::Branch => {
-                let conv = |name: &str, in_c: usize, out_c: usize, kernel: (usize, usize),
+                let conv = |name: &str,
+                            in_c: usize,
+                            out_c: usize,
+                            kernel: (usize, usize),
                             stride: (usize, usize)| {
                     ConvBn::load(
                         vb.pp(name),
@@ -321,8 +335,7 @@ impl Stem {
                     )
                 };
                 Ok(Self::Branch {
-                    stem1: conv("stem1", 3, mid, (3, 3), (2, 2))
-                        .context("load LCNetV4 stem1")?,
+                    stem1: conv("stem1", 3, mid, (3, 3), (2, 2)).context("load LCNetV4 stem1")?,
                     stem2a: ConvBn::load_with_same_pad(
                         vb.pp("stem2a"),
                         mid,
@@ -347,33 +360,16 @@ impl Stem {
                     .context("load LCNetV4 stem2b")?,
                     stem3: conv("stem3", mid * 2, mid, (3, 3), (2, 2))
                         .context("load LCNetV4 stem3")?,
-                    stem4: conv("stem4", mid, out, (1, 1), (1, 1))
-                        .context("load LCNetV4 stem4")?,
+                    stem4: conv("stem4", mid, out, (1, 1), (1, 1)).context("load LCNetV4 stem4")?,
                 })
             }
             StemKind::Simple => {
-                let conv1 = ConvBn::load(
-                    vb.pp("conv1"),
-                    3,
-                    mid,
-                    (3, 3),
-                    (2, 2),
-                    (1, 1),
-                    1,
-                )
-                .context("load LCNetV4 simple stem conv1")?;
+                let conv1 = ConvBn::load(vb.pp("conv1"), 3, mid, (3, 3), (2, 2), (1, 1), 1)
+                    .context("load LCNetV4 simple stem conv1")?;
                 Ok(Self::Simple {
                     conv1,
-                    conv2: ConvBn::load(
-                        vb.pp("conv2"),
-                        mid,
-                        out,
-                        (3, 3),
-                        (2, 2),
-                        (1, 1),
-                        1,
-                    )
-                    .context("load LCNetV4 simple stem conv2")?,
+                    conv2: ConvBn::load(vb.pp("conv2"), mid, out, (3, 3), (2, 2), (1, 1), 1)
+                        .context("load LCNetV4 simple stem conv2")?,
                 })
             }
         }
@@ -394,9 +390,7 @@ impl Stem {
                 let xs = stem1.forward(xs)?.relu()?;
                 let x2 = stem2a.forward(&xs)?.relu()?;
                 let x2 = stem2b.forward(&x2)?.relu()?;
-                let padded = xs
-                    .pad_with_zeros(2, 0, 1)?
-                    .pad_with_zeros(3, 0, 1)?;
+                let padded = xs.pad_with_zeros(2, 0, 1)?.pad_with_zeros(3, 0, 1)?;
                 let x1 = padded.max_pool2d_with_stride((2, 2), (1, 1))?;
                 let xs = Tensor::cat(&[&x1, &x2], 1)?;
                 let xs = stem3.forward(&xs)?.relu()?;
@@ -418,12 +412,7 @@ pub(super) struct PpLcNetV4 {
     stages: Vec<Vec<LcNetV4Block>>,
 }
 impl PpLcNetV4 {
-
-    pub(super) fn load(
-        vb: VarBuilder,
-        backbone_config: &Value,
-        det: bool,
-    ) -> Result<Self> {
+    pub(super) fn load(vb: VarBuilder, backbone_config: &Value, det: bool) -> Result<Self> {
         let vb = vb.pp("encoder");
         let stem_channels = backbone_config
             .get("stem_channels")
@@ -436,7 +425,9 @@ impl PpLcNetV4 {
             })
             .flatten()
             .filter(|values| values.len() == 3)
-            .ok_or_else(|| anyhow::anyhow!("backbone_config.stem_channels must be [3, mid, out]"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("backbone_config.stem_channels must be [3, mid, out]")
+            })?;
         let mid = stem_channels[1];
         let out = stem_channels[2];
         let stem_type = backbone_config
@@ -448,8 +439,8 @@ impl PpLcNetV4 {
             "small" | "simple" => StemKind::Simple,
             other => anyhow::bail!("unsupported LCNetV4 stem_type {other}"),
         };
-        let stem = Stem::load(vb.pp("convolution"), stem_kind, mid, out)
-            .context("load LCNetV4 stem")?;
+        let stem =
+            Stem::load(vb.pp("convolution"), stem_kind, mid, out).context("load LCNetV4 stem")?;
         let channel_act = ChannelAct::from_config(backbone_config)?;
         let block_configs = backbone_config
             .get("block_configs")
@@ -526,7 +517,6 @@ impl PpLcNetV4 {
         Ok(levels)
     }
 
-
     pub(super) fn forward_rec(&self, xs: &Tensor) -> Result<Tensor> {
         let mut hidden = self.stem.forward(xs)?;
         for stage in &self.stages {
@@ -565,7 +555,6 @@ fn forward_stage(stage: &[LcNetV4Block], xs: Tensor) -> Result<Tensor> {
     }
     Ok(hidden)
 }
-
 
 /// Paddle hard-swish: `x * clip(x + 3.0, 0.0, 6.0) / 6.0`.
 pub(super) fn hswish(xs: &Tensor) -> candle_core::Result<Tensor> {

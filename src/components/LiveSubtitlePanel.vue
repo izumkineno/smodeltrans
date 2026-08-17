@@ -1,6 +1,19 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import type { ComponentPublicInstance, CSSProperties } from "vue";
+import {
+  NAlert,
+  NButton,
+  NCard,
+  NDivider,
+  NIcon,
+  NInputNumber,
+  NProgress,
+  NSpace,
+  NTag,
+  NText,
+  NTooltip,
+} from "naive-ui";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -16,6 +29,7 @@ import type {
   LiveOverlaySizing,
   LiveSessionState,
   LiveSubtitle,
+  SubtitleProgress,
 } from "../services/live-translation-provider";
 import type { LiveSubtitleStyleSettings } from "../services/workspace-settings";
 import {
@@ -36,12 +50,20 @@ const props = defineProps<{
   subtitle?: LiveSubtitle;
   showSource: boolean;
   styleSettings: LiveSubtitleStyleSettings;
+  sizingMode?: "live" | "content";
+  showClose?: boolean;
+  progress?: SubtitleProgress;
+}>();
+const emit = defineEmits<{
+  (event: "close"): void;
 }>();
 
 const sessionId = props.sessionId;
 const state = computed(() => props.state);
 const subtitle = computed(() => props.subtitle);
 const showSource = computed(() => props.showSource);
+const showClose = computed(() => props.showClose === true);
+const progress = computed(() => props.progress);
 const HORIZONTAL_OVERLAY_PADDING = 0;
 const VERTICAL_OVERLAY_PADDING = 0;
 const query = new URLSearchParams(window.location.search);
@@ -109,7 +131,10 @@ const standbyText = computed(() => {
   }
   return "模型准备完成，等待翻译";
 });
-const sizingEnabled = computed(() => sessionId.length > 0);
+const sizingEnabled = computed(
+  () => props.sizingMode !== "content" && sessionId.length > 0,
+);
+const contentSizing = computed(() => props.sizingMode === "content");
 const canOpenRegionSelector = computed(
   () =>
     sessionId.length > 0 &&
@@ -132,28 +157,39 @@ const subtitlePanelStyle = computed<CSSProperties>(() => {
     ? Math.max(1, nativeWindowSize.value.height / deviceScaleFactor - VERTICAL_OVERLAY_PADDING)
     : undefined;
   const useNativeWindowSize =
-    nativeResizeActive.value && nativePanelWidth !== undefined && nativePanelHeight !== undefined;
+    !contentSizing.value &&
+    nativeResizeActive.value &&
+    nativePanelWidth !== undefined &&
+    nativePanelHeight !== undefined;
   return {
-    width: useNativeWindowSize
-      ? `${nativePanelWidth}px`
-      : liveOverlaySettings.value.autoWidth
-        ? "max-content"
-        : `${manualPanelWidth}px`,
-    height: useNativeWindowSize
-      ? `${nativePanelHeight}px`
-      : liveOverlaySettings.value.autoHeight
-        ? "fit-content"
-        : `${manualPanelHeight}px`,
-    maxWidth: useNativeWindowSize
-      ? `${nativePanelWidth}px`
-      : liveOverlaySettings.value.autoWidth
-        ? `${automaticPanelWidthLimit}px`
-        : `${manualPanelWidth}px`,
-    maxHeight: useNativeWindowSize
-      ? `${nativePanelHeight}px`
-      : liveOverlaySettings.value.autoHeight
-        ? `${automaticPanelHeightLimit}px`
-        : `${manualPanelHeight}px`,
+    width: contentSizing.value
+      ? "max-content"
+      : useNativeWindowSize
+        ? `${nativePanelWidth}px`
+        : liveOverlaySettings.value.autoWidth
+          ? "max-content"
+          : `${manualPanelWidth}px`,
+    height: contentSizing.value
+      ? "fit-content"
+      : useNativeWindowSize
+        ? `${nativePanelHeight}px`
+        : liveOverlaySettings.value.autoHeight
+          ? "fit-content"
+          : `${manualPanelHeight}px`,
+    maxWidth: contentSizing.value
+      ? `${automaticPanelWidthLimit}px`
+      : useNativeWindowSize
+        ? `${nativePanelWidth}px`
+        : liveOverlaySettings.value.autoWidth
+          ? `${automaticPanelWidthLimit}px`
+          : `${manualPanelWidth}px`,
+    maxHeight: contentSizing.value
+      ? `${automaticPanelHeightLimit}px`
+      : useNativeWindowSize
+        ? `${nativePanelHeight}px`
+        : liveOverlaySettings.value.autoHeight
+          ? `${automaticPanelHeightLimit}px`
+          : `${manualPanelHeight}px`,
     color: props.styleSettings.fontColor,
     backgroundColor: liveSubtitleBackgroundRgba(
       props.styleSettings.backgroundColor,
@@ -515,20 +551,13 @@ async function openRegionSelector(): Promise<void> {
   }
 }
 
-function commitManualDimension(axis: "width" | "height", event: Event): void {
-  const input = event.target as HTMLInputElement;
-  const value = Number(input.value);
+function commitManualDimension(axis: "width" | "height", value: number | null): void {
   const minimum =
     axis === "width" ? LIVE_SUBTITLE_MANUAL_WIDTH_MIN : LIVE_SUBTITLE_MANUAL_HEIGHT_MIN;
   const maximum =
     axis === "width" ? LIVE_SUBTITLE_MANUAL_WIDTH_MAX : LIVE_SUBTITLE_MANUAL_HEIGHT_MAX;
-  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+  if (value === null || !Number.isInteger(value) || value < minimum || value > maximum) {
     layoutError.value = `${axis === "width" ? "宽度" : "高度"}必须为 ${minimum} 到 ${maximum} 的整数。`;
-    input.value = String(
-      axis === "width"
-        ? liveOverlaySettings.value.manualWidth
-        : liveOverlaySettings.value.manualHeight,
-    );
     return;
   }
   if (
@@ -640,140 +669,285 @@ onBeforeUnmount(() => {
     }"
     :style="subtitlePanelStyle"
   >
-    <div
-      v-if="sizingEnabled"
-      ref="subtitleToolbar"
-      class="subtitle-panel-toolbar"
-      aria-label="实时字幕工具栏"
-    >
-      <button
-        type="button"
-        class="subtitle-tool-button subtitle-toolbar-drag-handle"
-        :class="{ 'is-active': overlayDragging }"
-        :aria-busy="overlayDragging"
-        aria-label="拖动字幕窗口"
-        title="拖动字幕窗口"
-        @mousedown.left.stop.prevent="startOverlayDrag"
+    <n-card class="subtitle-panel-card" :bordered="false" size="small">
+      <n-button
+        v-if="showClose"
+        class="subtitle-close-button"
+        quaternary
+        circle
+        size="small"
+        aria-label="关闭字幕窗口"
+        title="关闭字幕窗口"
+        @click.stop="emit('close')"
       >
-        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-          <path d="M5 4.5h6M5 8h6M5 11.5h6" />
-        </svg>
-      </button>
-      <button
-        type="button"
-        class="subtitle-tool-button"
-        :class="{ 'is-active': state === 'selecting' }"
-        :disabled="!canOpenRegionSelector"
-        :aria-busy="selectionOpening"
-        aria-label="手动框选翻译区域"
-        title="手动框选翻译区域"
-        @click="openRegionSelector"
-      >
-        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-          <path d="M2.5 6V3.5h2.5M13.5 6V3.5H11M2.5 10v2.5H5M13.5 10v2.5H11" />
-        </svg>
-      </button>
-      <button
-        type="button"
-        class="subtitle-tool-button"
-        :class="{ 'is-active': liveOverlaySettings.autoWidth }"
-        :aria-pressed="liveOverlaySettings.autoWidth"
-        :aria-label="liveOverlaySettings.autoWidth ? '关闭自适应宽度' : '开启自适应宽度'"
-        :title="liveOverlaySettings.autoWidth ? '关闭自适应宽度' : '开启自适应宽度'"
-        @click="toggleAutoWidth"
-      >
-        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-          <path d="M2 8h12M4.5 5.5 2 8l2.5 2.5M11.5 5.5 14 8l-2.5 2.5" />
-          <path d="M5.5 4v8M10.5 4v8" />
-        </svg>
-      </button>
-      <button
-        type="button"
-        class="subtitle-tool-button"
-        :class="{ 'is-active': liveOverlaySettings.autoHeight }"
-        :aria-pressed="liveOverlaySettings.autoHeight"
-        :aria-label="liveOverlaySettings.autoHeight ? '关闭自适应高度' : '开启自适应高度'"
-        :title="liveOverlaySettings.autoHeight ? '关闭自适应高度' : '开启自适应高度'"
-        @click="toggleAutoHeight"
-      >
-        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-          <path d="M8 2v12M5.5 4.5 8 2l2.5 2.5M5.5 11.5 8 14l2.5-2.5" />
-          <path d="M4 5.5h8M4 10.5h8" />
-        </svg>
-      </button>
-      <button
-        type="button"
-        class="subtitle-tool-button"
-        :class="{ 'is-active': sizingEditorOpen }"
-        :aria-expanded="sizingEditorOpen"
-        aria-label="编辑手动宽度和高度"
-        title="编辑手动宽度和高度"
-        @click="toggleSizingEditor"
-      >
-        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-          <rect x="2.5" y="2.5" width="11" height="11" rx="1.5" />
-          <path d="M5 11 11 5M8.5 4.8H11.2v2.7" />
-        </svg>
-      </button>
-      <button
-        type="button"
-        class="subtitle-tool-button subtitle-pin-button"
-        :class="{ 'is-active': toolbarPinned }"
-        :aria-pressed="toolbarPinned"
-        :aria-label="toolbarPinned ? '取消固定工具栏' : '固定工具栏'"
-        :title="toolbarPinned ? '取消固定工具栏' : '固定工具栏'"
-        @click="toggleToolbarPinned"
-      >
-        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-          <path d="M5 2.5h6l-.8 3.1 2.3 2.3v1H8.5v4.2L7.5 14V8.9H4.5v-1l2.3-2.3L6 2.5Z" />
-        </svg>
-      </button>
-      <div v-if="sizingEditorOpen" class="subtitle-sizing-editor" aria-label="手动字幕尺寸">
-        <label class="subtitle-size-field" title="手动宽度（物理像素）">
-          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M2 8h12M4.5 5.5 2 8l2.5 2.5M11.5 5.5 14 8l-2.5 2.5" />
-          </svg>
-          <input
-            :value="liveOverlaySettings.manualWidth"
-            type="number"
-            inputmode="numeric"
-            :min="LIVE_SUBTITLE_MANUAL_WIDTH_MIN"
-            :max="LIVE_SUBTITLE_MANUAL_WIDTH_MAX"
-            step="1"
-            aria-label="手动字幕宽度（物理像素）"
-            @change="commitManualDimension('width', $event)"
-            @keydown.enter.prevent="commitManualDimension('width', $event)"
-          />
-        </label>
-        <label class="subtitle-size-field" title="手动高度（物理像素）">
-          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M8 2v12M5.5 4.5 8 2l2.5 2.5M5.5 11.5 8 14l2.5-2.5" />
-          </svg>
-          <input
-            :value="liveOverlaySettings.manualHeight"
-            type="number"
-            inputmode="numeric"
-            :min="LIVE_SUBTITLE_MANUAL_HEIGHT_MIN"
-            :max="LIVE_SUBTITLE_MANUAL_HEIGHT_MAX"
-            step="1"
-            aria-label="手动字幕高度（物理像素）"
-            @change="commitManualDimension('height', $event)"
-            @keydown.enter.prevent="commitManualDimension('height', $event)"
-          />
-        </label>
-      </div>
-    </div>
-    <p v-if="layoutError" class="subtitle-layout-error" role="status">{{ layoutError }}</p>
+        <template #icon>
+          <n-icon size="16">
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="m4 4 8 8M12 4l-8 8" />
+            </svg>
+          </n-icon>
+        </template>
+      </n-button>
 
-    <div class="subtitle-panel-content">
-      <p v-if="!hasLiveSubtitle" class="translated-text">{{ standbyText }}</p>
-      <template v-else>
-        <p class="translated-text">{{ subtitle?.translatedText || "翻译中…" }}</p>
-        <p v-if="showSource && subtitle?.sourceText" class="source-text">
-          {{ subtitle.sourceText }}
-        </p>
-      </template>
-    </div>
+      <div
+        v-if="sizingEnabled"
+        ref="subtitleToolbar"
+        class="subtitle-panel-toolbar"
+        aria-label="实时字幕工具栏"
+      >
+        <n-space
+          class="subtitle-toolbar-space"
+          align="center"
+          :size="4"
+          :wrap="false"
+        >
+          <n-tooltip placement="top" trigger="hover">
+            <template #trigger>
+              <n-button
+                class="subtitle-tool-button subtitle-toolbar-drag-handle"
+                quaternary
+                circle
+                size="small"
+                :loading="overlayDragging"
+                :aria-busy="overlayDragging"
+                aria-label="拖动字幕窗口"
+                @mousedown.left.stop.prevent="startOverlayDrag"
+              >
+                <template #icon>
+                  <n-icon size="15">
+                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M5 4.5h6M5 8h6M5 11.5h6" />
+                    </svg>
+                  </n-icon>
+                </template>
+              </n-button>
+            </template>
+            拖动字幕窗口
+          </n-tooltip>
+
+          <n-tooltip placement="top" trigger="hover">
+            <template #trigger>
+              <n-button
+                class="subtitle-tool-button"
+                quaternary
+                circle
+                size="small"
+                :type="state === 'selecting' ? 'primary' : 'default'"
+                :loading="selectionOpening"
+                :disabled="!canOpenRegionSelector"
+                :aria-busy="selectionOpening"
+                aria-label="手动框选翻译区域"
+                @click="openRegionSelector"
+              >
+                <template #icon>
+                  <n-icon size="15">
+                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M2.5 6V3.5h2.5M13.5 6V3.5H11M2.5 10v2.5H5M13.5 10v2.5H11" />
+                    </svg>
+                  </n-icon>
+                </template>
+              </n-button>
+            </template>
+            手动框选翻译区域
+          </n-tooltip>
+
+          <n-tooltip placement="top" trigger="hover">
+            <template #trigger>
+              <n-button
+                class="subtitle-tool-button"
+                quaternary
+                circle
+                size="small"
+                :type="liveOverlaySettings.autoWidth ? 'primary' : 'default'"
+                :aria-pressed="liveOverlaySettings.autoWidth"
+                :aria-label="liveOverlaySettings.autoWidth ? '关闭自适应宽度' : '开启自适应宽度'"
+                @click="toggleAutoWidth"
+              >
+                <template #icon>
+                  <n-icon size="15">
+                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M2 8h12M4.5 5.5 2 8l2.5 2.5M11.5 5.5 14 8l-2.5 2.5" />
+                      <path d="M5.5 4v8M10.5 4v8" />
+                    </svg>
+                  </n-icon>
+                </template>
+              </n-button>
+            </template>
+            {{ liveOverlaySettings.autoWidth ? "关闭自适应宽度" : "开启自适应宽度" }}
+          </n-tooltip>
+
+          <n-tooltip placement="top" trigger="hover">
+            <template #trigger>
+              <n-button
+                class="subtitle-tool-button"
+                quaternary
+                circle
+                size="small"
+                :type="liveOverlaySettings.autoHeight ? 'primary' : 'default'"
+                :aria-pressed="liveOverlaySettings.autoHeight"
+                :aria-label="liveOverlaySettings.autoHeight ? '关闭自适应高度' : '开启自适应高度'"
+                @click="toggleAutoHeight"
+              >
+                <template #icon>
+                  <n-icon size="15">
+                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M8 2v12M5.5 4.5 8 2l2.5 2.5M5.5 11.5 8 14l2.5-2.5" />
+                      <path d="M4 5.5h8M4 10.5h8" />
+                    </svg>
+                  </n-icon>
+                </template>
+              </n-button>
+            </template>
+            {{ liveOverlaySettings.autoHeight ? "关闭自适应高度" : "开启自适应高度" }}
+          </n-tooltip>
+
+          <n-tooltip placement="top" trigger="hover">
+            <template #trigger>
+              <n-button
+                class="subtitle-tool-button"
+                quaternary
+                circle
+                size="small"
+                :type="sizingEditorOpen ? 'primary' : 'default'"
+                :aria-expanded="sizingEditorOpen"
+                aria-label="编辑字幕尺寸"
+                @click="toggleSizingEditor"
+              >
+                <template #icon>
+                  <n-icon size="15">
+                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <rect x="2.5" y="2.5" width="11" height="11" rx="1.5" />
+                      <path d="M5 11 11 5M8.5 4.8H11.2v2.7" />
+                    </svg>
+                  </n-icon>
+                </template>
+              </n-button>
+            </template>
+            编辑字幕尺寸
+          </n-tooltip>
+
+          <n-tooltip placement="top" trigger="hover">
+            <template #trigger>
+              <n-button
+                class="subtitle-tool-button subtitle-pin-button"
+                quaternary
+                circle
+                size="small"
+                :type="toolbarPinned ? 'primary' : 'default'"
+                :aria-pressed="toolbarPinned"
+                :aria-label="toolbarPinned ? '取消固定工具栏' : '固定工具栏'"
+                @click="toggleToolbarPinned"
+              >
+                <template #icon>
+                  <n-icon size="15">
+                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M5 2.5h6l-.8 3.1 2.3 2.3v1H8.5v4.2L7.5 14V8.9H4.5v-1l2.3-2.3L6 2.5Z" />
+                    </svg>
+                  </n-icon>
+                </template>
+              </n-button>
+            </template>
+            {{ toolbarPinned ? "取消固定工具栏" : "固定工具栏" }}
+          </n-tooltip>
+
+          <n-divider vertical class="subtitle-toolbar-divider" />
+
+          <div
+            v-if="sizingEditorOpen"
+            class="subtitle-sizing-editor"
+            aria-label="手动字幕尺寸"
+          >
+            <n-text depth="3" class="subtitle-sizing-label">尺寸</n-text>
+            <n-input-number
+              class="subtitle-size-field"
+              size="small"
+              :value="liveOverlaySettings.manualWidth"
+              :min="LIVE_SUBTITLE_MANUAL_WIDTH_MIN"
+              :max="LIVE_SUBTITLE_MANUAL_WIDTH_MAX"
+              :step="1"
+              :show-button="false"
+              aria-label="手动字幕宽度（物理像素）"
+              @update:value="commitManualDimension('width', $event)"
+            >
+              <template #prefix>宽</template>
+              <template #suffix>px</template>
+            </n-input-number>
+            <n-input-number
+              class="subtitle-size-field"
+              size="small"
+              :value="liveOverlaySettings.manualHeight"
+              :min="LIVE_SUBTITLE_MANUAL_HEIGHT_MIN"
+              :max="LIVE_SUBTITLE_MANUAL_HEIGHT_MAX"
+              :step="1"
+              :show-button="false"
+              aria-label="手动字幕高度（物理像素）"
+              @update:value="commitManualDimension('height', $event)"
+            >
+              <template #prefix>高</template>
+              <template #suffix>px</template>
+            </n-input-number>
+          </div>
+        </n-space>
+      </div>
+
+      <n-alert
+        v-if="layoutError"
+        class="subtitle-layout-error"
+        type="error"
+        :show-icon="false"
+        role="status"
+      >
+        {{ layoutError }}
+      </n-alert>
+
+      <n-space
+        v-if="progress?.active"
+        class="subtitle-progress"
+        vertical
+        :size="8"
+        role="status"
+        :aria-label="progress.label"
+      >
+        <n-space class="subtitle-progress-meta" justify="space-between" align="center" :wrap="false">
+          <n-tag size="small" round :bordered="false" :type="progress.overall >= 100 ? 'success' : 'info'">
+            {{ progress.label }}
+          </n-tag>
+          <n-text depth="3">
+            <template v-if="progress.mode === 'live'">
+              OCR {{ progress.ocr }}% · 翻译 {{ progress.translation }}%
+            </template>
+            <template v-else>{{ progress.translation }}%</template>
+          </n-text>
+        </n-space>
+        <n-progress
+          class="subtitle-progress-bar"
+          type="line"
+          :percentage="Math.min(100, Math.max(0, progress.overall))"
+          :show-indicator="false"
+          :processing="progress.overall < 100"
+          :height="4"
+          color="#38bdf8"
+          rail-color="rgba(148, 163, 184, 0.28)"
+          :status="progress.overall >= 100 ? 'success' : 'info'"
+        />
+      </n-space>
+
+      <div class="subtitle-panel-content">
+        <n-space vertical :size="6" class="subtitle-copy">
+          <n-text v-if="!hasLiveSubtitle" tag="p" class="translated-text">
+            {{ standbyText }}
+          </n-text>
+          <template v-else>
+            <n-text tag="p" class="translated-text">
+              {{ subtitle?.translatedText || "翻译中…" }}
+            </n-text>
+            <n-text v-if="showSource && subtitle?.sourceText" tag="p" class="source-text">
+              {{ subtitle.sourceText }}
+            </n-text>
+          </template>
+        </n-space>
+      </div>
+    </n-card>
   </div>
 </template>
 

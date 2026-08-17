@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main", "live-selector", "live-overlay"],
+  "windows": ["main", "live-selector", "live-overlay", "quick-translation"],
   "permissions": [
     "core:window:default",
     "core:window:allow-close",
@@ -11,7 +11,12 @@
     "core:window:allow-start-dragging",
     "core:window:allow-start-resize-dragging",
     "core:window:allow-destroy",
+    "core:window:allow-hide",
+    "core:window:allow-set-size",
     "core:event:default",
+    "mcp-bridge:default",
+    "global-shortcut:allow-register",
+    "global-shortcut:allow-unregister",
     "clipboard-manager:allow-read-image",
     "dialog:allow-open"
   ]

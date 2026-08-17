@@ -19,12 +19,7 @@ struct InputLayer {
 }
 
 impl InputLayer {
-    fn load(
-        vb: VarBuilder,
-        channels: usize,
-        kernel: usize,
-        se_name: &str,
-    ) -> Result<Self> {
+    fn load(vb: VarBuilder, channels: usize, kernel: usize, se_name: &str) -> Result<Self> {
         let padding = (kernel - 1) / 2;
         let depthwise = Conv2dLayer::load(
             vb.pp("depthwise_convolution"),

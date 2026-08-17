@@ -5,12 +5,14 @@
 //! - Small/medium tiers: `EncoderWithLightSVTR` (PaddleOCR `rnn.py`) followed
 //!   by the CTC linear projection.
 
-use super::backbone::hswish;
 use super::super::common::{Activation, Conv2dLayer, ConvNormAct};
+use super::backbone::hswish;
 use anyhow::{Context, Result};
 use candle_core::Tensor;
-use candle_nn::{BatchNorm, BatchNormConfig, LayerNorm, Linear, Module, ModuleT, VarBuilder, batch_norm, layer_norm, linear};
-
+use candle_nn::{
+    BatchNorm, BatchNormConfig, LayerNorm, Linear, Module, ModuleT, VarBuilder, batch_norm,
+    layer_norm, linear,
+};
 
 /// Exported Conv1d wrapper: the tiny reshape-CTC head ships its depthwise
 /// (and pointwise) convolutions as 3D `[out, in/groups, kernel]` tensors.
@@ -64,10 +66,7 @@ impl Conv1dLayer {
             output = output.broadcast_add(&bias.reshape((1, self.out_channels, 1, 1))?)?;
         }
         if output.dim(3)? != width {
-            candle_core::bail!(
-                "Conv1d width mismatch: input {width} -> {}",
-                output.dim(3)?
-            );
+            candle_core::bail!("Conv1d width mismatch: input {width} -> {}", output.dim(3)?);
         }
         let _ = (batch, channels, height);
         Ok(output)
@@ -111,15 +110,8 @@ impl TinyCtcHead {
             vb.pp("norm1"),
         )
         .context("load tiny CTC head first batch norm")?;
-        let conv2 = Conv1dLayer::load(
-            vb.pp("conv2"),
-            in_channels,
-            in_channels,
-            1,
-            1,
-            None,
-        )
-        .context("load tiny CTC head pointwise convolution")?;
+        let conv2 = Conv1dLayer::load(vb.pp("conv2"), in_channels, in_channels, 1, 1, None)
+            .context("load tiny CTC head pointwise convolution")?;
         let norm2 = batch_norm(
             in_channels,
             BatchNormConfig {
@@ -345,7 +337,10 @@ impl LightSvtrHead {
                 eps: 1e-5,
                 ..Default::default()
             },
-            vb.pp("encoder").pp("conv_block").pp("2").pp("normalization"),
+            vb.pp("encoder")
+                .pp("conv_block")
+                .pp("2")
+                .pp("normalization"),
         )
         .context("load LightSVTR local batch norm")?;
         let mut svtr_block = Vec::with_capacity(depth);

@@ -143,6 +143,16 @@ export interface LiveSubtitle {
   isStreaming: boolean;
   observedAtEpochMs: number;
 }
+export type SubtitleProgressMode = "translation" | "live";
+
+export interface SubtitleProgress {
+  mode: SubtitleProgressMode;
+  active: boolean;
+  overall: number;
+  ocr: number;
+  translation: number;
+  label: string;
+}
 
 export type LiveDebugStage = "ocr" | "translation";
 

@@ -5,5 +5,4 @@ mod graph;
 mod head;
 mod neck;
 
-
 pub(crate) use graph::{PpOcrV6Detector, PpOcrV6Recognizer};

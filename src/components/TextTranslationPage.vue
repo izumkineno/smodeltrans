@@ -9,8 +9,10 @@ import {
   NEmpty,
   NInput,
   NProgress,
+  NSelect,
   NSpin,
   NSpace,
+  NSwitch,
   NTag,
   useMessage,
 } from "naive-ui";
@@ -23,10 +25,17 @@ import {
 import type { TranslationProgress } from "../services/translation-provider";
 import { targetLanguage } from "../services/workspace-settings";
 import { showWorkspaceToast, type WorkspaceToastType } from "../services/workspace-toast";
+import {
+  loadPersistedQuickTranslationSettings,
+  quickTranslationSettings,
+  quickTranslationShortcutOptions,
+  saveQuickTranslationSettings,
+} from "../services/quick-translation-settings";
 
 type TextWorkflowState = "idle" | "processing" | "result" | "cancelled" | "error";
 type TagType = "default" | "success" | "warning" | "error" | "info";
 
+loadPersistedQuickTranslationSettings();
 
 const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const sourceText = ref("");
@@ -40,6 +49,9 @@ const progress = ref(0);
 const workflowState = ref<TextWorkflowState>("idle");
 const pageRoot = ref<HTMLElement | null>(null);
 const activeController = ref<AbortController | null>(null);
+const quickTranslationEnabled = ref(quickTranslationSettings.value.enabled);
+const quickTranslationShortcut = ref(quickTranslationSettings.value.shortcut);
+const quickTranslationSettingsSaving = ref(false);
 let progressUnlisten: UnlistenFn | undefined;
 
 const toast = useMessage();
@@ -267,6 +279,26 @@ function saveResult() {
     setActionFeedback("error", "译文无法保存，请重试。");
   }
 }
+async function saveQuickTranslationConfiguration(): Promise<void> {
+  quickTranslationSettingsSaving.value = true;
+  try {
+    const saved = await saveQuickTranslationSettings({
+      enabled: quickTranslationEnabled.value,
+      shortcut: quickTranslationShortcut.value,
+    });
+    quickTranslationEnabled.value = saved.enabled;
+    quickTranslationShortcut.value = saved.shortcut;
+    notify("success", "快捷翻译设置已保存并立即生效。");
+  } catch (error) {
+    notify(
+      "error",
+      error instanceof Error ? error.message : "快捷翻译设置保存失败，请重试。",
+    );
+  } finally {
+    quickTranslationSettingsSaving.value = false;
+  }
+}
+
 
 function handleSourceInput() {
   if (workflowState.value === "result" || workflowState.value === "error") {
@@ -455,6 +487,51 @@ onBeforeUnmount(() => {
         </div>
       </n-card>
     </div>
+
+    <n-card class="panel text-quick-settings-card" :bordered="false">
+      <div class="panel-heading text-card-heading text-quick-settings-heading">
+        <div class="panel-title text-card-title">
+          <span class="section-number text-section-number">03</span>
+          <div>
+            <p class="panel-kicker text-panel-kicker">快捷翻译 / Windows UI Automation</p>
+            <h2>选中文字快捷翻译</h2>
+            <p class="panel-copy text-panel-copy">
+              在其他应用中选中文字后按全局快捷键，使用 UI Automation 读取选区，并复用实时字幕框显示译文。
+            </p>
+          </div>
+        </div>
+        <n-switch
+          v-model:value="quickTranslationEnabled"
+          aria-label="启用选中文字快捷翻译"
+        />
+      </div>
+
+      <div class="text-quick-settings-grid">
+        <label class="text-option-field">
+          <span>全局快捷键</span>
+          <n-select
+            v-model:value="quickTranslationShortcut"
+            :options="quickTranslationShortcutOptions"
+            :disabled="!quickTranslationEnabled"
+            aria-label="快捷翻译全局快捷键"
+          />
+        </label>
+      </div>
+
+      <div class="text-quick-settings-actions">
+        <p class="text-option-help">
+          快捷翻译窗口沿用实时字幕框样式，并根据原文和译文内容自动调整尺寸。
+        </p>
+        <n-button
+          type="primary"
+          :loading="quickTranslationSettingsSaving"
+          :disabled="!isDesktopRuntime"
+          @click="saveQuickTranslationConfiguration"
+        >
+          保存快捷翻译设置
+        </n-button>
+      </div>
+    </n-card>
 
     <footer class="text-page-footer">
       <span>Hy-MT2 直接翻译</span>

@@ -3,14 +3,24 @@ mod model_config;
 mod model_support;
 mod models;
 mod output;
+mod quick_translation;
+mod selection;
 
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build());
+
+    #[cfg(debug_assertions)]
+    {
+        builder = builder.plugin(tauri_plugin_mcp_bridge::init());
+    }
+
+    builder
         .setup(|app| {
             let resource_root = app.path().resource_dir().ok();
             let config_path = app
@@ -26,9 +36,11 @@ pub fn run() {
             let live_manager = backend::live::LiveSessionManager::new(state.clone());
             app.manage(state);
             app.manage(live_manager);
+            quick_translation::setup(app);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            quick_translation::configure_quick_translation,
             backend::commands::get_backend_status,
             backend::commands::get_model_runtime_status,
             backend::commands::control_model,
