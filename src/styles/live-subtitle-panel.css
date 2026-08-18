@@ -102,6 +102,80 @@
   stroke-linejoin: round;
 }
 
+.subtitle-drag-regions {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.subtitle-drag-outline {
+  position: absolute;
+  inset: 5px;
+  border: 1px dashed rgba(148, 163, 184, 0.28);
+  border-radius: 10px;
+  pointer-events: none;
+  transition:
+    border-color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.subtitle-drag-region {
+  position: absolute;
+  z-index: 1;
+  display: block;
+  padding: 0;
+  border: 0;
+  background: rgba(56, 189, 248, 0.035);
+  cursor: move;
+  pointer-events: auto;
+  touch-action: none;
+  transition: background-color 150ms ease;
+}
+
+.subtitle-drag-region-top {
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 10px;
+  border-radius: 14px 14px 0 0;
+}
+
+.subtitle-drag-region-right {
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 10px;
+  border-radius: 0 14px 14px 0;
+}
+
+.subtitle-drag-region-bottom {
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 10px;
+  border-radius: 0 0 14px 14px;
+}
+
+.subtitle-drag-region-left {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 10px;
+  border-radius: 14px 0 0 14px;
+}
+
+.subtitle-drag-region:hover,
+.subtitle-drag-regions.is-dragging .subtitle-drag-region {
+  background: var(--subtitle-accent-soft);
+}
+
+.subtitle-panel:hover .subtitle-drag-outline,
+.subtitle-drag-regions.is-dragging .subtitle-drag-outline {
+  border-color: rgba(125, 211, 252, 0.72);
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.1);
+}
+
 .subtitle-panel-toolbar {
   position: absolute;
   top: 10px;
@@ -191,10 +265,6 @@
   transform: none;
 }
 
-.subtitle-toolbar-drag-handle {
-  cursor: move;
-  touch-action: none;
-}
 
 .subtitle-sizing-editor {
   display: flex;
@@ -411,7 +481,9 @@
   .subtitle-panel .subtitle-close-button.n-button,
   .subtitle-panel .subtitle-tool-button.n-button,
   .subtitle-panel .subtitle-copy-button.n-button,
-  .subtitle-panel-toolbar {
+  .subtitle-panel-toolbar,
+  .subtitle-drag-outline,
+  .subtitle-drag-region {
     transition: none;
   }
 }

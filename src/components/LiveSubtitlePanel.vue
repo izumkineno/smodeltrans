@@ -82,6 +82,7 @@ const layoutError = ref("");
 const selectionOpening = ref(false);
 const toolbarPinned = ref(false);
 const overlayDragging = ref(false);
+const subtitleDragEdges = ["top", "right", "bottom", "left"] as const;
 const nativeResizeActive = ref(false);
 let layoutSyncInFlight = false;
 let layoutSyncPending = false;
@@ -536,24 +537,24 @@ function toggleToolbarPinned(): void {
 }
 
 async function startOverlayDrag(event: MouseEvent): Promise<void> {
-  if (
-    event.button !== 0 ||
-    !sessionId ||
-    !overlayWindow ||
-    overlayDragging.value
-  ) {
+  if (event.button !== 0 || !overlayWindow || overlayDragging.value) {
     return;
   }
   event.preventDefault();
+  event.stopPropagation();
   overlayDragging.value = true;
   try {
-    await beginLiveOverlayDrag(sessionId);
+    if (sessionId) {
+      await beginLiveOverlayDrag(sessionId);
+    }
     await overlayWindow.startDragging();
-    const position = await overlayWindow.outerPosition();
-    await updateLiveOverlayPosition(sessionId, {
-      x: position.x,
-      y: position.y,
-    });
+    if (sessionId) {
+      const position = await overlayWindow.outerPosition();
+      await updateLiveOverlayPosition(sessionId, {
+        x: position.x,
+        y: position.y,
+      });
+    }
     layoutError.value = "";
   } catch (error) {
     layoutError.value = `拖动字幕失败：${errorText(error)}`;
@@ -715,6 +716,24 @@ onBeforeUnmount(() => {
           </n-icon>
         </template>
       </n-button>
+      <div
+        v-if="overlayWindow"
+        class="subtitle-drag-regions"
+        :class="{ 'is-dragging': overlayDragging }"
+        role="group"
+        aria-label="拖动字幕窗口"
+      >
+        <span class="subtitle-drag-outline" aria-hidden="true"></span>
+        <span
+          v-for="edge in subtitleDragEdges"
+          :key="edge"
+          class="subtitle-drag-region"
+          :class="`subtitle-drag-region-${edge}`"
+          aria-hidden="true"
+          title="拖动字幕窗口"
+          @mousedown.left.stop.prevent="startOverlayDrag"
+        ></span>
+      </div>
 
       <div
         v-if="liveSizingEnabled"
@@ -728,29 +747,6 @@ onBeforeUnmount(() => {
             :size="4"
             :wrap="false"
           >
-          <n-tooltip placement="top" trigger="hover">
-            <template #trigger>
-              <n-button
-                class="subtitle-tool-button subtitle-toolbar-drag-handle"
-                quaternary
-                circle
-                size="small"
-                :loading="overlayDragging"
-                :aria-busy="overlayDragging"
-                aria-label="拖动字幕窗口"
-                @mousedown.left.stop.prevent="startOverlayDrag"
-              >
-                <template #icon>
-                  <n-icon size="15">
-                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                      <path d="M5 4.5h6M5 8h6M5 11.5h6" />
-                    </svg>
-                  </n-icon>
-                </template>
-              </n-button>
-            </template>
-            拖动字幕窗口
-          </n-tooltip>
 
           <n-tooltip placement="top" trigger="hover">
             <template #trigger>
