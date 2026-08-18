@@ -12,12 +12,6 @@ const QUICK_TRANSLATION_EVENT: &str = "quick-translation-request";
 const QUICK_TRANSLATION_GAP: i32 = 12;
 const DEFAULT_QUICK_TRANSLATION_WIDTH: u32 = 320;
 const DEFAULT_QUICK_TRANSLATION_HEIGHT: u32 = 104;
-const SUPPORTED_SHORTCUTS: [&str; 4] = [
-    DEFAULT_SHORTCUT,
-    "CommandOrControl+Alt+T",
-    "CommandOrControl+Shift+E",
-    "Alt+Shift+E",
-];
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -187,11 +181,14 @@ fn clamp_window_position(preferred: i32, minimum: i32, maximum: i32, window_size
 }
 
 fn validate_shortcut(value: &str) -> Result<&str, String> {
-    SUPPORTED_SHORTCUTS
-        .iter()
-        .copied()
-        .find(|shortcut| *shortcut == value)
-        .ok_or_else(|| "不支持该快捷键组合。".to_owned())
+    let shortcut = value.trim();
+    if shortcut.is_empty() {
+        return Err("快捷键不能为空。".to_owned());
+    }
+    shortcut
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+        .map(|_| shortcut)
+        .map_err(|error| format!("不支持该快捷键组合：{error}"))
 }
 
 #[tauri::command]

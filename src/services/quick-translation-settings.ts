@@ -2,29 +2,148 @@ import { invoke } from "@tauri-apps/api/core";
 import { ref } from "vue";
 
 const QUICK_TRANSLATION_STORAGE_KEY = "smodeltrans.quickTranslationSettings";
+const QUICK_TRANSLATION_MODIFIER_ALIASES: Record<string, string> = {
+  ALT: "Alt",
+  CMD: "Command",
+  CMDORCONTROL: "CommandOrControl",
+  CMDORCTRL: "CommandOrControl",
+  COMMAND: "Command",
+  COMMANDORCONTROL: "CommandOrControl",
+  COMMANDORCTRL: "CommandOrControl",
+  CONTROL: "Control",
+  CTRL: "Control",
+  OPTION: "Alt",
+  SHIFT: "Shift",
+  SUPER: "Super",
+};
+const QUICK_TRANSLATION_MODIFIER_CODES: Record<string, true> = {
+  AltLeft: true,
+  AltRight: true,
+  ControlLeft: true,
+  ControlRight: true,
+  MetaLeft: true,
+  MetaRight: true,
+  ShiftLeft: true,
+  ShiftRight: true,
+};
+const QUICK_TRANSLATION_KEY_PATTERN = /^(?:[A-Z]|[0-9]|Key[A-Z]|Digit[0-9]|Backquote|Backslash|BracketLeft|BracketRight|Pause|Comma|Equal|Minus|Period|Quote|Semicolon|Slash|Backspace|CapsLock|Enter|Space|Tab|Delete|End|Home|Insert|PageDown|PageUp|PrintScreen|ScrollLock|Arrow(?:Down|Left|Right|Up)|NumLock|Numpad(?:[0-9]|Add|Decimal|Divide|Enter|Equal|Multiply|Subtract)|Escape|F(?:[1-9]|1[0-9]|2[0-4])|AudioVolume(?:Down|Up|Mute)|Media(?:Play|Pause|PlayPause|Stop|TrackNext|TrackPrevious))$/;
+const QUICK_TRANSLATION_KEY_LABELS: Record<string, string> = {
+  ARROWDOWN: "Arrow Down",
+  ARROWLEFT: "Arrow Left",
+  ARROWRIGHT: "Arrow Right",
+  ARROWUP: "Arrow Up",
+  ALT: "Alt",
+  BACKQUOTE: "`",
+  BACKSLASH: "\\",
+  BACKSPACE: "Backspace",
+  BRACKETLEFT: "[",
+  BRACKETRIGHT: "]",
+  CAPSLOCK: "Caps Lock",
+  CMD: "Win",
+  CMDORCONTROL: "Ctrl",
+  CMDORCTRL: "Ctrl",
+  COMMAND: "Win",
+  COMMANDORCONTROL: "Ctrl",
+  COMMANDORCTRL: "Ctrl",
+  COMMA: ",",
+  CONTROL: "Ctrl",
+  CTRL: "Ctrl",
+  DELETE: "Delete",
+  END: "End",
+  ENTER: "Enter",
+  ESCAPE: "Esc",
+  EQUAL: "=",
+  HOME: "Home",
+  INSERT: "Insert",
+  MINUS: "-",
+  OPTION: "Alt",
+  PAGEDOWN: "Page Down",
+  PAGEUP: "Page Up",
+  PERIOD: ".",
+  PRINTSCREEN: "Print Screen",
+  QUOTE: "'",
+  SHIFT: "Shift",
+  SLASH: "/",
+  SPACE: "Space",
+  SUPER: "Win",
+  TAB: "Tab",
+};
+const DEFAULT_QUICK_TRANSLATION_SHORTCUT = "CommandOrControl+Alt+E";
 
 export interface QuickTranslationSettings {
   enabled: boolean;
   shortcut: string;
 }
 
-export const quickTranslationShortcutOptions: Array<{ label: string; value: string }> = [
-  { label: "Ctrl + Alt + E", value: "CommandOrControl+Alt+E" },
-  { label: "Ctrl + Alt + T", value: "CommandOrControl+Alt+T" },
-  { label: "Ctrl + Shift + E", value: "CommandOrControl+Shift+E" },
-  { label: "Alt + Shift + E", value: "Alt+Shift+E" },
-];
-
 const defaultSettings: QuickTranslationSettings = {
   enabled: true,
-  shortcut: quickTranslationShortcutOptions[0].value,
+  shortcut: DEFAULT_QUICK_TRANSLATION_SHORTCUT,
 };
 
 export const quickTranslationSettings = ref<QuickTranslationSettings>({ ...defaultSettings });
 let persistedSettingsLoaded = false;
 
-function isSupportedShortcut(value: unknown): value is string {
-  return quickTranslationShortcutOptions.some((option) => option.value === value);
+function normalizeQuickTranslationShortcut(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const tokens = value
+    .trim()
+    .split("+")
+    .map((token) => token.trim())
+    .filter(Boolean);
+  if (tokens.length < 2 || tokens.length > 5) {
+    return null;
+  }
+
+  const modifiers = tokens
+    .slice(0, -1)
+    .map((token) => QUICK_TRANSLATION_MODIFIER_ALIASES[token.toUpperCase()] ?? null);
+  const key = tokens[tokens.length - 1];
+  if (
+    modifiers.some((modifier) => modifier === null) ||
+    new Set(modifiers).size !== modifiers.length ||
+    !QUICK_TRANSLATION_KEY_PATTERN.test(key)
+  ) {
+    return null;
+  }
+  const normalizedModifiers = modifiers.filter(
+    (modifier): modifier is string => modifier !== null,
+  );
+  return [...normalizedModifiers, key].join("+");
+}
+
+export function isQuickTranslationShortcutModifierCode(code: string): boolean {
+  return QUICK_TRANSLATION_MODIFIER_CODES[code] === true;
+}
+
+export function quickTranslationShortcutFromKeyboardEvent(event: KeyboardEvent): string | null {
+  const code = event.code.trim();
+  if (
+    !code ||
+    isQuickTranslationShortcutModifierCode(code) ||
+    !QUICK_TRANSLATION_KEY_PATTERN.test(code)
+  ) {
+    return null;
+  }
+
+  const modifiers: string[] = [];
+  if (event.ctrlKey) {
+    modifiers.push("CommandOrControl");
+  }
+  if (event.altKey) {
+    modifiers.push("Alt");
+  }
+  if (event.shiftKey) {
+    modifiers.push("Shift");
+  }
+  if (event.metaKey) {
+    modifiers.push("Command");
+  }
+  if (modifiers.length === 0) {
+    return null;
+  }
+  return [...modifiers, code].join("+");
 }
 
 function normalizeSettings(value: unknown): QuickTranslationSettings | null {
@@ -32,12 +151,13 @@ function normalizeSettings(value: unknown): QuickTranslationSettings | null {
     return null;
   }
   const candidate = value as Partial<QuickTranslationSettings>;
-  if (typeof candidate.enabled !== "boolean" || !isSupportedShortcut(candidate.shortcut)) {
+  const shortcut = normalizeQuickTranslationShortcut(candidate.shortcut);
+  if (typeof candidate.enabled !== "boolean" || !shortcut) {
     return null;
   }
   return {
     enabled: candidate.enabled,
-    shortcut: candidate.shortcut,
+    shortcut,
   };
 }
 
@@ -62,10 +182,30 @@ export function loadPersistedQuickTranslationSettings(): string | null {
   }
 }
 
+function formatShortcutToken(token: string): string {
+  const normalized = token.trim();
+  const namedLabel = QUICK_TRANSLATION_KEY_LABELS[normalized.toUpperCase()];
+  if (namedLabel) {
+    return namedLabel;
+  }
+  const uppercase = normalized.toUpperCase();
+  if (/^KEY[A-Z]$/.test(uppercase)) {
+    return uppercase.slice(3);
+  }
+  if (/^DIGIT[0-9]$/.test(uppercase)) {
+    return uppercase.slice(5);
+  }
+  if (/^NUMPAD[0-9]$/.test(uppercase)) {
+    return `Numpad ${uppercase.slice(6)}`;
+  }
+  return normalized;
+}
+
 export function quickTranslationShortcutLabel(shortcut: string): string {
-  return (
-    quickTranslationShortcutOptions.find((option) => option.value === shortcut)?.label ?? shortcut
-  );
+  return shortcut
+    .split("+")
+    .map(formatShortcutToken)
+    .join(" + ");
 }
 
 async function applyShortcutSettings(settings: QuickTranslationSettings): Promise<void> {

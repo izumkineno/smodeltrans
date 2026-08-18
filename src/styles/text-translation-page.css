@@ -27,6 +27,38 @@
 .text-quick-settings-grid .text-option-field {
   max-width: none;
 }
+.text-quick-shortcut-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.text-quick-shortcut-value {
+  display: flex;
+  min-height: 34px;
+  flex: 1;
+  align-items: center;
+  padding: 0 12px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-soft);
+  background: var(--surface-soft);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.text-quick-shortcut-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
 
 .text-quick-settings-actions {
   display: flex;
@@ -322,6 +354,10 @@
 
   .text-shortcut-hint {
     width: 100%;
+  }
+  .text-quick-shortcut-control {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .text-result-actions,

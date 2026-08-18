@@ -26,9 +26,11 @@ import type { TranslationProgress } from "../services/translation-provider";
 import { targetLanguage } from "../services/workspace-settings";
 import { showWorkspaceToast, type WorkspaceToastType } from "../services/workspace-toast";
 import {
+  isQuickTranslationShortcutModifierCode,
   loadPersistedQuickTranslationSettings,
   quickTranslationSettings,
-  quickTranslationShortcutOptions,
+  quickTranslationShortcutFromKeyboardEvent,
+  quickTranslationShortcutLabel,
   saveQuickTranslationSettings,
 } from "../services/quick-translation-settings";
 
@@ -52,6 +54,8 @@ const activeController = ref<AbortController | null>(null);
 const quickTranslationEnabled = ref(quickTranslationSettings.value.enabled);
 const quickTranslationShortcut = ref(quickTranslationSettings.value.shortcut);
 const quickTranslationSettingsSaving = ref(false);
+const isCapturingQuickTranslationShortcut = ref(false);
+const quickTranslationShortcutCaptureHint = ref("");
 let progressUnlisten: UnlistenFn | undefined;
 
 const toast = useMessage();
@@ -280,6 +284,9 @@ function saveResult() {
   }
 }
 async function saveQuickTranslationConfiguration(): Promise<void> {
+  if (isCapturingQuickTranslationShortcut.value) {
+    return;
+  }
   quickTranslationSettingsSaving.value = true;
   try {
     const saved = await saveQuickTranslationSettings({
@@ -290,6 +297,8 @@ async function saveQuickTranslationConfiguration(): Promise<void> {
     quickTranslationShortcut.value = saved.shortcut;
     notify("success", "快捷翻译设置已保存并立即生效。");
   } catch (error) {
+    quickTranslationEnabled.value = quickTranslationSettings.value.enabled;
+    quickTranslationShortcut.value = quickTranslationSettings.value.shortcut;
     notify(
       "error",
       error instanceof Error ? error.message : "快捷翻译设置保存失败，请重试。",
@@ -297,6 +306,70 @@ async function saveQuickTranslationConfiguration(): Promise<void> {
   } finally {
     quickTranslationSettingsSaving.value = false;
   }
+}
+
+function stopQuickTranslationShortcutCapture(): void {
+  if (typeof window !== "undefined") {
+    window.removeEventListener("keydown", handleQuickTranslationShortcutCapture, true);
+    window.removeEventListener("blur", handleQuickTranslationShortcutCaptureBlur, true);
+  }
+  isCapturingQuickTranslationShortcut.value = false;
+}
+
+function handleQuickTranslationShortcutCaptureBlur(): void {
+  stopQuickTranslationShortcutCapture();
+  quickTranslationShortcutCaptureHint.value = "窗口失去焦点，已取消快捷键录入。";
+}
+
+function handleQuickTranslationEnabledChange(enabled: boolean): void {
+  if (!enabled && isCapturingQuickTranslationShortcut.value) {
+    stopQuickTranslationShortcutCapture();
+    quickTranslationShortcutCaptureHint.value = "已取消快捷键录入。";
+  }
+}
+
+function handleQuickTranslationShortcutCapture(event: KeyboardEvent): void {
+  event.preventDefault();
+  event.stopPropagation();
+  if (event.isComposing || event.repeat) {
+    return;
+  }
+  if (event.code === "Escape") {
+    stopQuickTranslationShortcutCapture();
+    quickTranslationShortcutCaptureHint.value = "已取消快捷键录入。";
+    return;
+  }
+  if (isQuickTranslationShortcutModifierCode(event.code)) {
+    return;
+  }
+
+  const shortcut = quickTranslationShortcutFromKeyboardEvent(event);
+  if (!shortcut) {
+    quickTranslationShortcutCaptureHint.value =
+      event.ctrlKey || event.altKey || event.shiftKey || event.metaKey
+        ? "该按键暂不支持，请改用字母、数字、功能键、方向键或其他标准键。"
+        : "请先按住 Ctrl、Alt、Shift 或 Win，再按最后一个按键。";
+    return;
+  }
+  quickTranslationShortcut.value = shortcut;
+  quickTranslationShortcutCaptureHint.value = `已录入 ${quickTranslationShortcutLabel(shortcut)}，点击保存后生效。`;
+  stopQuickTranslationShortcutCapture();
+}
+
+function toggleQuickTranslationShortcutCapture(): void {
+  if (isCapturingQuickTranslationShortcut.value) {
+    stopQuickTranslationShortcutCapture();
+    quickTranslationShortcutCaptureHint.value = "已取消快捷键录入。";
+    return;
+  }
+  if (!isDesktopRuntime || typeof window === "undefined") {
+    return;
+  }
+  quickTranslationShortcutCaptureHint.value =
+    "请同时按住 Ctrl、Alt、Shift 或 Win，再按最后一个按键；Esc 取消。";
+  isCapturingQuickTranslationShortcut.value = true;
+  window.addEventListener("keydown", handleQuickTranslationShortcutCapture, true);
+  window.addEventListener("blur", handleQuickTranslationShortcutCaptureBlur, true);
 }
 
 
@@ -309,6 +382,9 @@ function handleSourceInput() {
 }
 
 function handleTranslationShortcut(event: KeyboardEvent) {
+  if (isCapturingQuickTranslationShortcut.value) {
+    return;
+  }
   const isShortcut =
     event.key === "Enter" &&
     (event.ctrlKey || event.metaKey) &&
@@ -338,9 +414,13 @@ function unbindTranslationShortcut() {
 }
 
 onActivated(bindTranslationShortcut);
-onDeactivated(unbindTranslationShortcut);
+onDeactivated(() => {
+  stopQuickTranslationShortcutCapture();
+  unbindTranslationShortcut();
+});
 
 onBeforeUnmount(() => {
+  stopQuickTranslationShortcutCapture();
   unbindTranslationShortcut();
   activeController.value?.abort();
   activeController.value = null;
@@ -503,19 +583,34 @@ onBeforeUnmount(() => {
         <n-switch
           v-model:value="quickTranslationEnabled"
           aria-label="启用选中文字快捷翻译"
+          @update:value="handleQuickTranslationEnabledChange"
         />
       </div>
 
       <div class="text-quick-settings-grid">
-        <label class="text-option-field">
+        <div class="text-option-field">
           <span>全局快捷键</span>
-          <n-select
-            v-model:value="quickTranslationShortcut"
-            :options="quickTranslationShortcutOptions"
-            :disabled="!quickTranslationEnabled"
-            aria-label="快捷翻译全局快捷键"
-          />
-        </label>
+          <div class="text-quick-shortcut-control">
+            <div
+              class="text-quick-shortcut-value"
+              role="status"
+              :title="quickTranslationShortcut"
+              aria-label="当前快捷翻译全局快捷键"
+            >
+              {{ quickTranslationShortcutLabel(quickTranslationShortcut) }}
+            </div>
+            <n-button
+              secondary
+              :disabled="!quickTranslationEnabled || quickTranslationSettingsSaving"
+              @click="toggleQuickTranslationShortcutCapture"
+            >
+              {{ isCapturingQuickTranslationShortcut ? "取消录入" : "录入快捷键" }}
+            </n-button>
+          </div>
+          <p v-if="quickTranslationShortcutCaptureHint" class="text-quick-shortcut-hint" role="status">
+            {{ quickTranslationShortcutCaptureHint }}
+          </p>
+        </div>
       </div>
 
       <div class="text-quick-settings-actions">
