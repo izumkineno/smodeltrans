@@ -569,7 +569,6 @@ pub(crate) enum LiveDebugStage {
 pub(crate) enum LiveDebugOutcome {
     Confirmed,
     Completed,
-    Cancelled,
     SkippedEmptySource,
     Failed,
 }
@@ -682,7 +681,7 @@ mod tests {
         DEFAULT_KEY_TRIGGER_TIMEOUT_MS, DEFAULT_STABILITY_WAIT_MS, LiveRecognitionMode,
         LiveRecognitionSettings, LiveRecognitionTrigger, LiveRoi, LiveSessionState,
         LiveSessionStatus, LiveTranslationSettings, MAX_KEY_TRIGGER_TIMEOUT_MS,
-        MAX_LIVE_SUPPLEMENTAL_PROMPT_CHARS, MAX_STABILITY_WAIT_MS, MIN_KEY_TRIGGER_TIMEOUT_MS,
+        MAX_STABILITY_WAIT_MS, MIN_KEY_TRIGGER_TIMEOUT_MS,
     };
     use crate::model_config::{MAX_MEMORY_TOKENS, MAX_MEMORY_TURNS};
 

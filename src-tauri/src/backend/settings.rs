@@ -386,16 +386,6 @@ pub(crate) struct BackendStatus {
 }
 
 impl BackendSettings {
-    pub(crate) fn from_environment() -> Result<Self, String> {
-        Self::from_environment_with_resource_root_and_config(None, None)
-    }
-
-    pub(crate) fn from_environment_with_resource_root(
-        resource_root: Option<PathBuf>,
-    ) -> Result<Self, String> {
-        Self::from_environment_with_resource_root_and_config(resource_root, None)
-    }
-
     pub(crate) fn from_environment_with_resource_root_and_config(
         resource_root: Option<PathBuf>,
         config_path: Option<&Path>,

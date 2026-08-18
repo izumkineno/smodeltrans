@@ -14,7 +14,6 @@ pub(crate) const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedImage {
     canvas: Arc<RgbImage>,
-    encoded_bytes: Arc<[u8]>,
     file_name: String,
     target_language: String,
 }
@@ -24,12 +23,9 @@ impl DecodedImage {
         self.canvas.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn canvas_identity(&self) -> usize {
         Arc::as_ptr(&self.canvas) as usize
-    }
-
-    pub(crate) fn encoded_bytes(&self) -> &[u8] {
-        &self.encoded_bytes
     }
 
     pub(crate) fn file_name(&self) -> &str {
@@ -47,7 +43,6 @@ impl DecodedImage {
     ) -> Self {
         Self {
             canvas,
-            encoded_bytes: Arc::from([]),
             file_name: file_name.into(),
             target_language: target_language.into(),
         }
@@ -60,7 +55,6 @@ impl DecodedImage {
     ) -> Self {
         Self {
             canvas: Arc::new(canvas),
-            encoded_bytes: Arc::from([]),
             file_name: file_name.into(),
             target_language: target_language.into(),
         }
@@ -164,7 +158,6 @@ fn decode_encoded_image(
     }
     Ok(DecodedImage {
         canvas: Arc::new(canvas),
-        encoded_bytes: Arc::from(encoded_bytes.into_boxed_slice()),
         file_name,
         target_language,
     })

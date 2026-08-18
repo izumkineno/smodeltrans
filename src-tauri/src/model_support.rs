@@ -95,7 +95,6 @@ struct ActiveRun {
 #[derive(Clone, Debug)]
 struct Tombstone {
     created: Instant,
-    generation: u64,
 }
 
 #[derive(Debug, Default)]
@@ -173,12 +172,10 @@ impl RunRegistry {
             return Ok(());
         }
         if !inner.tombstones.contains_key(run_id.as_str()) {
-            let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
             inner.tombstones.insert(
                 run_id.as_str().to_owned(),
                 Tombstone {
                     created: Instant::now(),
-                    generation,
                 },
             );
             inner.tombstone_order.push_back(run_id.as_str().to_owned());
@@ -262,14 +259,6 @@ pub(crate) struct RunLease {
 impl RunLease {
     pub(crate) fn token(&self) -> &CancellationToken {
         &self.token
-    }
-
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub(crate) fn run_id(&self) -> &RunId {
-        &self.run_id
     }
 
     pub(crate) fn finalize_success(&self) -> Result<(), BackendFailure> {

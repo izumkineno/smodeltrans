@@ -22,6 +22,7 @@ pub(crate) struct RegionRecord {
 }
 
 impl RegionRecord {
+    #[cfg(test)]
     pub(crate) fn untranslated(
         order: u32,
         quad_points: [[i32; 2]; 4],
@@ -78,17 +79,6 @@ pub(crate) trait OcrPort: Send {
         image: &DecodedImage,
         cancellation: &CancellationToken,
     ) -> Result<OcrDocument, BackendFailure>;
-}
-
-pub(crate) trait HyPort: Send {
-    fn translate(
-        &mut self,
-        regions: &[TranslationRegion],
-        target_language: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<Vec<TranslatedRegion>, BackendFailure>;
-
-    fn loaded(&self) -> bool;
 }
 
 pub(crate) trait OutputPort: Send {

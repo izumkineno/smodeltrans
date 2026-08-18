@@ -148,15 +148,6 @@ pub(crate) struct ModelConfig {
 }
 
 impl ModelConfig {
-    pub(crate) fn for_target(target_language: &str) -> Result<Self> {
-        Self::from_parts(
-            target_language,
-            PromptConfig::default(),
-            GenerationConfig::default(),
-            MemoryConfig::default(),
-        )
-    }
-
     pub(crate) fn from_parts(
         target_language: &str,
         prompt: PromptConfig,

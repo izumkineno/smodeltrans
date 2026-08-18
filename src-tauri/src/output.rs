@@ -370,10 +370,6 @@ fn write_ocr_markdown(file_name: &str, regions: &[RegionRecord]) -> Result<Strin
     Ok(markdown)
 }
 
-pub(crate) fn max_data_url_chars() -> usize {
-    MAX_DATA_URL_CHARS
-}
-
 #[cfg(test)]
 mod tests {
     use super::write_ocr_markdown;

@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     backend::{
-        contracts::{HyPort, TranslatedRegion, TranslationRegion},
+        contracts::{TranslatedRegion, TranslationRegion},
         failure::BackendFailure,
     },
     model_config::{GenerationConfig, MAX_NEW_TOKENS, MemoryConfig, PromptConfig},
@@ -27,25 +27,12 @@ const OCR_TRANSLATION_TOKENS_PER_SOURCE_CHAR: usize = 2;
 const MIN_PROMPT_ECHO_CHARS: usize = 16;
 
 /// Loaded Hy translation session. The concrete GGUF/session state remains
-/// private to this provider and only the neutral HyPort is exposed.
+/// private to this provider.
 pub(crate) struct HyTranslator {
     session: HySessionDriver,
     generation: GenerationConfig,
     prompt: PromptConfig,
     warmed_up: bool,
-}
-pub(crate) fn load(
-    model_path: &Path,
-    device: &Device,
-    memory: MemoryConfig,
-) -> Result<HyTranslator> {
-    load_with_config(
-        model_path,
-        device,
-        memory,
-        GenerationConfig::default(),
-        PromptConfig::default(),
-    )
 }
 
 pub(crate) fn load_with_config(
@@ -64,34 +51,6 @@ pub(crate) fn load_with_config(
         prompt,
         warmed_up: false,
     })
-}
-
-pub(crate) fn load_port(
-    model_path: &Path,
-    device: &Device,
-    memory: MemoryConfig,
-    generation: GenerationConfig,
-    prompt: PromptConfig,
-) -> std::result::Result<HyTranslator, BackendFailure> {
-    if !device.is_cuda() {
-        return Err(BackendFailure::device("Hy requires a CUDA device"));
-    }
-    let assets = HyAssets::preflight(model_path)?;
-    HySessionDriver::new(&assets.model, device, memory)
-        .map(|session| HyTranslator {
-            session,
-            generation,
-            prompt,
-            warmed_up: false,
-        })
-        .map_err(|error| {
-            let message = error.to_string();
-            if message.contains("flash-attn") || message.contains("CUDA") {
-                BackendFailure::device(format!("initialize Hy device path: {message}"))
-            } else {
-                BackendFailure::translation(format!("load Hy GGUF model: {message}"))
-            }
-        })
 }
 
 impl HyTranslator {
@@ -453,21 +412,6 @@ impl HyTranslator {
                 translated_text,
             })
             .collect())
-    }
-}
-
-impl HyPort for HyTranslator {
-    fn translate(
-        &mut self,
-        regions: &[TranslationRegion],
-        target_language: &str,
-        cancellation: &CancellationToken,
-    ) -> std::result::Result<Vec<TranslatedRegion>, BackendFailure> {
-        self.translate_structured_regions(regions, target_language, cancellation, "", false)
-    }
-
-    fn loaded(&self) -> bool {
-        true
     }
 }
 

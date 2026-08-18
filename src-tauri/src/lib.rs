@@ -45,6 +45,7 @@ pub fn run() {
             backend::commands::get_model_runtime_status,
             backend::commands::control_model,
             backend::commands::update_backend_settings,
+            backend::commands::cancel_translation,
             backend::commands::list_model_catalog,
             backend::commands::save_model_catalog,
             backend::commands::translate_image,

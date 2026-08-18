@@ -35,14 +35,6 @@ pub(crate) struct BackendState {
 }
 
 impl BackendState {
-    pub(crate) fn new() -> Self {
-        Self::new_with_resource_root_and_config(None, None)
-    }
-
-    pub(crate) fn new_with_resource_root(resource_root: Option<PathBuf>) -> Self {
-        Self::new_with_resource_root_and_config(resource_root, None)
-    }
-
     pub(crate) fn new_with_resource_root_and_config(
         resource_root: Option<PathBuf>,
         config_path: Option<PathBuf>,
@@ -184,13 +176,6 @@ impl ModelTarget {
             )),
         }
     }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Ocr => "PP-OCR",
-            Self::Translator => "Hy-MT2",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -207,13 +192,6 @@ impl ModelAction {
             _ => Err(BackendFailure::arguments(
                 "action must be 'load' or 'unload'",
             )),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Load => "加载",
-            Self::Unload => "卸载",
         }
     }
 }

@@ -562,51 +562,10 @@ pub(super) fn finalize_live_regions(regions: &mut Vec<RegionRecord>) {
     }
 }
 
-fn ordered_regions(regions: &[RegionRecord]) -> Vec<&RegionRecord> {
-    let mut ordered = regions.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|region| {
-        let top = region
-            .quad_points
-            .iter()
-            .map(|point| point[1])
-            .min()
-            .unwrap_or(0);
-        let left = region
-            .quad_points
-            .iter()
-            .map(|point| point[0])
-            .min()
-            .unwrap_or(0);
-        let bottom = region
-            .quad_points
-            .iter()
-            .map(|point| point[1])
-            .max()
-            .unwrap_or(0);
-        let right = region
-            .quad_points
-            .iter()
-            .map(|point| point[0])
-            .max()
-            .unwrap_or(0);
-        (top, left, bottom, right, region.order)
-    });
-    ordered
-}
-
 fn ordered_live_regions(regions: &[RegionRecord]) -> Vec<&RegionRecord> {
     let mut ordered = regions.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|region| region.order);
     ordered
-}
-
-pub(super) fn normalized_region_text(regions: &[RegionRecord]) -> String {
-    ordered_regions(regions)
-        .into_iter()
-        .map(|region| normalize_text(&region.source_text))
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 pub(super) fn live_translated_region_text(regions: &[RegionRecord]) -> String {

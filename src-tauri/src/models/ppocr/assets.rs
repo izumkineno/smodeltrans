@@ -9,7 +9,6 @@
 
 use crate::backend::failure::BackendFailure;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -98,14 +97,10 @@ pub(crate) struct DetectorPostProcess {
 pub(crate) struct PpOcrAssets {
     pub(crate) role: GraphRole,
     pub(crate) variant: PpOcrVariant,
-    pub(crate) directory: PathBuf,
     pub(crate) weights: PathBuf,
     pub(crate) config: PathBuf,
-    pub(crate) preprocessor: PathBuf,
-    pub(crate) inference: PathBuf,
     pub(crate) character_list: Vec<String>,
     pub(crate) postprocess: Option<DetectorPostProcess>,
-    pub(crate) manifest_digest: String,
 }
 
 impl PpOcrAssets {
@@ -195,34 +190,14 @@ impl PpOcrAssets {
         } else {
             None
         };
-        let mut digest = Sha256::new();
-        for path in [&weights, &config, &preprocessor, &inference] {
-            let bytes = fs::read(path)
-                .map_err(|error| BackendFailure::asset(format!("hash OCR asset: {error}")))?;
-            digest.update(
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default()
-                    .as_bytes(),
-            );
-            digest.update(bytes);
-        }
         Ok(Self {
             role,
             variant,
-            directory,
             weights,
             config,
-            preprocessor,
-            inference,
             character_list,
             postprocess,
-            manifest_digest: format_digest(digest.finalize()),
         })
-    }
-
-    pub(crate) fn validate(&self) -> Result<(), BackendFailure> {
-        Self::preflight(self.role, &self.directory).map(|_| ())
     }
 }
 
@@ -245,14 +220,6 @@ fn parse_db_postprocess(inference: &YamlNode) -> Option<DetectorPostProcess> {
         max_candidates,
         unclip_ratio,
     })
-}
-
-fn format_digest(digest: impl AsRef<[u8]>) -> String {
-    digest
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
