@@ -311,6 +311,45 @@
   max-width: min(760px, calc(100vw - 82px));
   text-align: center;
 }
+.subtitle-panel-content-sizing .subtitle-copy {
+  max-width: 760px;
+}
+
+.subtitle-copy-actions {
+  width: 100%;
+  margin-top: 4px;
+}
+
+.subtitle-copy-button.n-button {
+  min-width: 48px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid rgba(226, 232, 240, 0.2);
+  border-radius: 9px;
+  color: rgba(226, 232, 240, 0.92);
+  background: rgba(15, 23, 42, 0.76);
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.12);
+  font-size: 11px;
+  font-weight: 600;
+  transition:
+    color 150ms ease,
+    border-color 150ms ease,
+    background-color 150ms ease,
+    transform 150ms ease;
+}
+
+.subtitle-copy-button.n-button:hover,
+.subtitle-copy-button.n-button:focus-visible {
+  border-color: rgba(125, 211, 252, 0.78);
+  color: #e0f2fe;
+  background: rgba(56, 189, 248, 0.2);
+  outline: none;
+  transform: translateY(-1px);
+}
+
+.subtitle-copy-button.n-button:active {
+  transform: translateY(0);
+}
 
 .subtitle-panel.is-native-resizing .subtitle-panel-content {
   pointer-events: none;
@@ -357,6 +396,9 @@
   .subtitle-copy {
     max-width: calc(100vw - 70px);
   }
+  .subtitle-panel-content-sizing .subtitle-copy {
+    max-width: 760px;
+  }
 
   .subtitle-panel .subtitle-size-field.n-input-number {
     width: 78px;
@@ -368,6 +410,7 @@
   .subtitle-panel,
   .subtitle-panel .subtitle-close-button.n-button,
   .subtitle-panel .subtitle-tool-button.n-button,
+  .subtitle-panel .subtitle-copy-button.n-button,
   .subtitle-panel-toolbar {
     transition: none;
   }

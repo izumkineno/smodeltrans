@@ -1,8 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { listen } from "@tauri-apps/api/event";
-import { NButton } from "naive-ui";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { copyTranslationText } from "../services/file-adapter";
 import {
@@ -24,7 +23,7 @@ import {
   targetLanguage,
 } from "../services/workspace-settings";
 import LiveSubtitlePanel from "./LiveSubtitlePanel.vue";
-import "../styles/quick-translation.css";
+import "../styles/live-subtitle-overlay.css";
 
 type QuickTranslationEvent = {
   text: string | null;
@@ -35,7 +34,6 @@ type QuickWorkflowState = "idle" | "processing" | "result" | "error";
 
 const QUICK_TRANSLATION_EVENT = "quick-translation-request";
 const quickWindow = getCurrentWindow();
-const quickOverlay = ref<HTMLElement | null>(null);
 const sourceText = ref("");
 const translatedText = ref("");
 const errorMessage = ref("");
@@ -46,11 +44,6 @@ const activeController = ref<AbortController | null>(null);
 let eventUnlisten: UnlistenFn | undefined;
 let closeUnlisten: UnlistenFn | undefined;
 let progressUnlisten: UnlistenFn | undefined;
-let resizeObserver: ResizeObserver | undefined;
-let resizeFrame: number | undefined;
-let resizeInFlight = false;
-let resizePending = false;
-let lastRequestedSize: { width: number; height: number } | undefined;
 let requestVersion = 0;
 
 function clearProgressListener(): void {
@@ -110,54 +103,6 @@ function clearResult(): void {
   progress.value = 0;
 }
 
-function scheduleWindowResize(): void {
-  if (resizeFrame !== undefined) {
-    return;
-  }
-  resizeFrame = window.requestAnimationFrame(() => {
-    resizeFrame = undefined;
-    void syncWindowSize();
-  });
-}
-
-async function syncWindowSize(): Promise<void> {
-  const overlay = quickOverlay.value;
-  const panel = overlay?.querySelector<HTMLElement>(".subtitle-panel");
-  if (!overlay || !panel) {
-    return;
-  }
-  if (resizeInFlight) {
-    resizePending = true;
-    return;
-  }
-  const bounds = panel.getBoundingClientRect();
-  if (bounds.width <= 0 || bounds.height <= 0) {
-    return;
-  }
-  const size = {
-    width: Math.max(160, Math.ceil(bounds.width)),
-    height: Math.max(72, Math.ceil(bounds.height)),
-  };
-  if (
-    lastRequestedSize?.width === size.width &&
-    lastRequestedSize.height === size.height
-  ) {
-    return;
-  }
-  resizeInFlight = true;
-  try {
-    await quickWindow.setSize(new LogicalSize(size.width, size.height));
-    lastRequestedSize = size;
-  } catch {
-    // The quick window may close while content is being measured.
-  } finally {
-    resizeInFlight = false;
-    if (resizePending) {
-      resizePending = false;
-      scheduleWindowResize();
-    }
-  }
-}
 
 async function hideQuickWindow(): Promise<void> {
   activeController.value?.abort();
@@ -179,16 +124,12 @@ async function translateSelection(payload: QuickTranslationEvent): Promise<void>
     errorMessage.value = payload.error || "未检测到可翻译的文字选区。";
     statusMessage.value = errorMessage.value;
     progress.value = 0;
-    await nextTick();
-    scheduleWindowResize();
     return;
   }
 
   sourceText.value = payload.text;
   workflowState.value = "processing";
   statusMessage.value = "正在读取本地翻译模型。";
-  await nextTick();
-  scheduleWindowResize();
 
   const controller = new AbortController();
   activeController.value = controller;
@@ -205,7 +146,6 @@ async function translateSelection(payload: QuickTranslationEvent): Promise<void>
       }
       progress.value = Math.min(100, Math.max(0, Math.round(event.payload.progress)));
       statusMessage.value = event.payload.stage;
-      scheduleWindowResize();
     });
 
     const result = await textTranslationProvider.translate(
@@ -229,8 +169,6 @@ async function translateSelection(payload: QuickTranslationEvent): Promise<void>
     progress.value = 100;
     workflowState.value = "result";
     statusMessage.value = "快捷翻译完成。";
-    await nextTick();
-    scheduleWindowResize();
   } catch (error) {
     if (controller.signal.aborted || isTranslationCancellation(error)) {
       return;
@@ -241,8 +179,6 @@ async function translateSelection(payload: QuickTranslationEvent): Promise<void>
     workflowState.value = "error";
     errorMessage.value = error instanceof Error ? error.message : "快捷翻译未完成。";
     statusMessage.value = errorMessage.value;
-    await nextTick();
-    scheduleWindowResize();
   } finally {
     clearProgressListener();
     if (activeController.value === controller) {
@@ -279,16 +215,11 @@ async function initialize(): Promise<void> {
 }
 
 onMounted(() => {
-  resizeObserver = new ResizeObserver(() => scheduleWindowResize());
-  if (quickOverlay.value) {
-    resizeObserver.observe(quickOverlay.value);
-  }
   window.addEventListener("keydown", handleKeydown, true);
   void initialize().catch((error) => {
     workflowState.value = "error";
     errorMessage.value = error instanceof Error ? error.message : "快捷翻译初始化失败。";
     statusMessage.value = errorMessage.value;
-    scheduleWindowResize();
   });
 });
 
@@ -296,10 +227,6 @@ onBeforeUnmount(() => {
   requestVersion += 1;
   activeController.value?.abort();
   activeController.value = null;
-  resizeObserver?.disconnect();
-  if (resizeFrame !== undefined) {
-    window.cancelAnimationFrame(resizeFrame);
-  }
   eventUnlisten?.();
   closeUnlisten?.();
   window.removeEventListener("keydown", handleKeydown, true);
@@ -307,7 +234,11 @@ onBeforeUnmount(() => {
 </script>
 <template>
 
-  <main ref="quickOverlay" class="quick-translation-overlay" aria-label="快捷翻译" aria-live="polite">
+  <main
+    class="subtitle-overlay subtitle-overlay-content"
+    aria-label="快捷翻译"
+    aria-live="polite"
+  >
     <LiveSubtitlePanel
       :session-id="''"
       :state="quickLiveState"
@@ -315,26 +246,12 @@ onBeforeUnmount(() => {
       :progress="quickSubtitleProgress"
       :show-source="true"
       :show-close="true"
+      :show-copy="workflowState === 'result'"
       :style-settings="liveSubtitleStyleSettings"
       sizing-mode="content"
       @close="hideQuickWindow"
+      @copy="copyResult"
     />
-
-    <div class="quick-translation-controls" aria-label="快捷翻译操作">
-      <n-button
-        v-if="workflowState === 'result'"
-        class="quick-translation-action"
-        secondary
-        size="small"
-        aria-label="复制译文"
-        title="复制译文"
-        @click.stop="copyResult"
-      >
-        复制
-      </n-button>
-    </div>
-
-    <span class="quick-translation-sr-only" role="status">{{ statusMessage }}</span>
   </main>
 </template>
 

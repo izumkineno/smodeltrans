@@ -24,6 +24,31 @@ body,
   pointer-events: auto;
   user-select: none;
 }
+html:has(.subtitle-overlay-content),
+body:has(.subtitle-overlay-content),
+#app:has(.subtitle-overlay-content) {
+  width: max-content !important;
+  height: max-content !important;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  overflow: hidden;
+  background: transparent !important;
+}
+
+.subtitle-overlay-content {
+  position: relative;
+  display: block;
+  width: max-content;
+  height: max-content;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: text;
+}
+
+.subtitle-overlay-content > .subtitle-panel {
+  pointer-events: auto;
+}
 
 .subtitle-overlay-region-replace {
   display: block;

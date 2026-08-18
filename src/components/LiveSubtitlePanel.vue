@@ -15,7 +15,7 @@ import {
   NText,
   NTooltip,
 } from "naive-ui";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, PhysicalSize } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   beginLiveOverlayDrag,
@@ -53,10 +53,12 @@ const props = defineProps<{
   styleSettings: LiveSubtitleStyleSettings;
   sizingMode?: "live" | "content";
   showClose?: boolean;
+  showCopy?: boolean;
   progress?: SubtitleProgress;
 }>();
 const emit = defineEmits<{
   (event: "close"): void;
+  (event: "copy"): void;
 }>();
 
 const sessionId = props.sessionId;
@@ -64,6 +66,9 @@ const state = computed(() => props.state);
 const subtitle = computed(() => props.subtitle);
 const showSource = computed(() => props.showSource);
 const showClose = computed(() => props.showClose === true);
+const copyVisible = computed(
+  () => props.showCopy === true && !!subtitle.value?.translatedText.trim(),
+);
 const progress = computed(() => props.progress);
 const HORIZONTAL_OVERLAY_PADDING = 0;
 const VERTICAL_OVERLAY_PADDING = 0;
@@ -132,10 +137,11 @@ const standbyText = computed(() => {
   }
   return "模型准备完成，等待翻译";
 });
-const sizingEnabled = computed(
-  () => props.sizingMode !== "content" && sessionId.length > 0,
-);
 const contentSizing = computed(() => props.sizingMode === "content");
+const liveSizingEnabled = computed(() => sessionId.length > 0);
+const sizingEnabled = computed(
+  () => liveSizingEnabled.value || contentSizing.value,
+);
 const canOpenRegionSelector = computed(
   () =>
     sessionId.length > 0 &&
@@ -256,6 +262,12 @@ function measuredContentSize(): LiveOverlayContentSize | undefined {
     ),
   };
 }
+function contentWindowSize(contentSize: LiveOverlayContentSize): PhysicalWindowSize {
+  return {
+    width: Math.max(LIVE_SUBTITLE_MANUAL_WIDTH_MIN, contentSize.width),
+    height: Math.max(LIVE_SUBTITLE_MANUAL_HEIGHT_MIN, contentSize.height),
+  };
+}
 
 function scheduleLayoutSync(force = false): void {
   if (!sizingEnabled.value || typeof window === "undefined") {
@@ -289,6 +301,7 @@ async function syncOverlayLayout(): Promise<void> {
   }
   const sizing = currentSizing();
   const signature = [
+    contentSizing.value ? "content" : "live",
     sizing.autoWidth,
     sizing.autoHeight,
     sizing.manualWidth,
@@ -307,16 +320,28 @@ async function syncOverlayLayout(): Promise<void> {
   }
   layoutSyncInFlight = true;
   try {
-    await updateLiveOverlayLayout(sessionId, sizing, contentSize);
-    if (overlayWindow) {
-      try {
-        const size = await overlayWindow.outerSize();
-        const nextSize = { width: size.width, height: size.height };
-        lastWindowSize = nextSize;
-        nativeWindowSize.value = nextSize;
-        expectedWindowSize = nextSize;
-      } catch {
-        // The overlay may close while the backend finishes the layout update.
+    if (contentSizing.value) {
+      if (!overlayWindow) {
+        lastLayoutSignature = signature;
+        return;
+      }
+      const nextSize = contentWindowSize(contentSize);
+      await overlayWindow.setSize(new PhysicalSize(nextSize.width, nextSize.height));
+      lastWindowSize = nextSize;
+      nativeWindowSize.value = nextSize;
+      expectedWindowSize = nextSize;
+    } else {
+      await updateLiveOverlayLayout(sessionId, sizing, contentSize);
+      if (overlayWindow) {
+        try {
+          const size = await overlayWindow.outerSize();
+          const nextSize = { width: size.width, height: size.height };
+          lastWindowSize = nextSize;
+          nativeWindowSize.value = nextSize;
+          expectedWindowSize = nextSize;
+        } catch {
+          // The overlay may close while the backend finishes the layout update.
+        }
       }
     }
     lastLayoutSignature = signature;
@@ -597,7 +622,7 @@ onMounted(() => {
       panelResizeObserver.observe(subtitlePanel.value);
     }
   }
-  if (overlayWindow && sizingEnabled.value) {
+  if (overlayWindow && liveSizingEnabled.value) {
     void overlayWindow
       .outerSize()
       .then((size) => {
@@ -665,6 +690,7 @@ onBeforeUnmount(() => {
     class="subtitle-panel"
     :class="{
       'subtitle-panel-warming': state === 'warming',
+      'subtitle-panel-content-sizing': contentSizing,
       'is-native-resizing': nativeResizeActive,
       'is-toolbar-pinned': toolbarPinned,
     }"
@@ -691,7 +717,7 @@ onBeforeUnmount(() => {
       </n-button>
 
       <div
-        v-if="sizingEnabled"
+        v-if="liveSizingEnabled"
         class="subtitle-panel-toolbar"
         aria-label="实时字幕工具栏"
       >
@@ -949,6 +975,23 @@ onBeforeUnmount(() => {
                 {{ subtitle.sourceText }}
               </n-text>
             </template>
+            <n-space
+              v-if="copyVisible"
+              class="subtitle-copy-actions"
+              justify="end"
+              :wrap="false"
+            >
+              <n-button
+                class="subtitle-copy-button"
+                secondary
+                size="small"
+                aria-label="复制译文"
+                title="复制译文"
+                @click.stop="emit('copy')"
+              >
+                复制
+              </n-button>
+            </n-space>
           </n-space>
         </n-scrollbar>
       </div>
