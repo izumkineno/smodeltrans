@@ -8,8 +8,9 @@ use std::{
 };
 
 const DEFAULT_HY_FILE: &str = "Hy-MT2-1.8B-Q4_K_M.gguf";
-const DEFAULT_IDLE_UNLOAD_MINUTES: u32 = 30;
-const MAX_IDLE_UNLOAD_MINUTES: u32 = 24 * 60;
+const DEFAULT_IDLE_UNLOAD_SECONDS: u32 = 30 * 60;
+const MAX_IDLE_UNLOAD_SECONDS: u32 = 24 * 60 * 60;
+const LEGACY_MAX_IDLE_UNLOAD_MINUTES: u32 = 24 * 60;
 const DEFAULT_TARGET_LANGUAGE: &str = "Chinese";
 const DEFAULT_REGION_PARALLELISM: usize = 16;
 const DEFAULT_TRANSLATION_BATCH_SIZE: usize = 4;
@@ -52,7 +53,7 @@ pub(crate) struct BackendSettings {
     pub(crate) region_parallelism: usize,
     pub(crate) translation_batch_size: usize,
     pub(crate) device_kind: DeviceKind,
-    pub(crate) idle_unload_minutes: u32,
+    pub(crate) idle_unload_seconds: u32,
     pub(crate) prompt: PromptConfig,
     pub(crate) generation: GenerationConfig,
     pub(crate) memory: MemoryConfig,
@@ -171,7 +172,7 @@ pub(crate) struct BackendSettingsUpdate {
     pub(crate) device: String,
     pub(crate) region_parallelism: usize,
     pub(crate) translation_batch_size: usize,
-    pub(crate) idle_unload_minutes: u32,
+    pub(crate) idle_unload_seconds: u32,
     pub(crate) generation: BackendGenerationSettings,
     pub(crate) memory: BackendMemorySettings,
     pub(crate) prompt: BackendPromptSettings,
@@ -259,6 +260,8 @@ pub(crate) struct PersistedBackendSettings {
     pub(crate) device: Option<String>,
     pub(crate) region_parallelism: Option<usize>,
     pub(crate) translation_batch_size: Option<usize>,
+    pub(crate) idle_unload_seconds: Option<u32>,
+    #[serde(skip_serializing)]
     pub(crate) idle_unload_minutes: Option<u32>,
     pub(crate) generation: Option<PersistedGenerationSettings>,
     pub(crate) memory: Option<PersistedMemorySettings>,
@@ -375,7 +378,7 @@ pub(crate) struct BackendStatus {
     pub(crate) region_parallelism: usize,
     pub(crate) translation_batch_size: usize,
     pub(crate) translator_loaded: bool,
-    pub(crate) idle_unload_minutes: u32,
+    pub(crate) idle_unload_seconds: u32,
     pub(crate) generation: BackendGenerationSettings,
     pub(crate) memory: BackendMemorySettings,
     pub(crate) prompt: BackendPromptSettings,
@@ -463,20 +466,17 @@ impl BackendSettings {
             .as_ref()
             .and_then(|settings| settings.hy_model.clone())
             .unwrap_or_else(|| env_path("SMODELTRANS_HY_MODEL", hy_default, &workspace_root));
-        let idle_unload_minutes = persisted
+        let idle_unload_seconds = persisted
             .as_ref()
-            .and_then(|settings| settings.idle_unload_minutes)
-            .unwrap_or(bounded_env_u32(
-                "SMODELTRANS_IDLE_UNLOAD_MINUTES",
-                DEFAULT_IDLE_UNLOAD_MINUTES,
-                0,
-                MAX_IDLE_UNLOAD_MINUTES,
-            )?);
-        if idle_unload_minutes > MAX_IDLE_UNLOAD_MINUTES {
-            return Err(format!(
-                "idle_unload_minutes must be in 0..={MAX_IDLE_UNLOAD_MINUTES}"
-            ));
-        }
+            .and_then(|settings| settings.idle_unload_seconds)
+            .or_else(|| {
+                persisted
+                    .as_ref()
+                    .and_then(|settings| settings.idle_unload_minutes)
+                    .and_then(|minutes| minutes.checked_mul(60))
+            })
+            .unwrap_or(idle_unload_seconds_from_environment()?);
+        validate_idle_unload_seconds(idle_unload_seconds)?;
         let region_parallelism = persisted
             .as_ref()
             .and_then(|settings| settings.region_parallelism)
@@ -526,7 +526,7 @@ impl BackendSettings {
             region_parallelism,
             translation_batch_size,
             device_kind,
-            idle_unload_minutes,
+            idle_unload_seconds,
             prompt,
             generation,
             memory,
@@ -564,8 +564,8 @@ impl BackendSettings {
         next.region_parallelism = request.region_parallelism;
         validate_translation_batch_size(request.translation_batch_size)?;
         next.translation_batch_size = request.translation_batch_size;
-        validate_idle_unload_minutes(request.idle_unload_minutes)?;
-        next.idle_unload_minutes = request.idle_unload_minutes;
+        validate_idle_unload_seconds(request.idle_unload_seconds)?;
+        next.idle_unload_seconds = request.idle_unload_seconds;
         next.generation = request.generation.into_config()?;
         next.memory = request.memory.into_config()?;
         next.prompt = request.prompt.into_config()?;
@@ -582,7 +582,8 @@ impl BackendSettings {
             device: Some(self.device_kind.as_str().to_owned()),
             region_parallelism: Some(self.region_parallelism),
             translation_batch_size: Some(self.translation_batch_size),
-            idle_unload_minutes: Some(self.idle_unload_minutes),
+            idle_unload_seconds: Some(self.idle_unload_seconds),
+            idle_unload_minutes: None,
             generation: Some(PersistedGenerationSettings::from(&self.generation)),
             memory: Some(PersistedMemorySettings::from(&self.memory)),
             prompt: Some(PersistedPromptSettings::from(&self.prompt)),
@@ -765,7 +766,7 @@ impl BackendSettings {
             region_parallelism: self.region_parallelism,
             translation_batch_size: self.translation_batch_size,
             translator_loaded,
-            idle_unload_minutes: self.idle_unload_minutes,
+            idle_unload_seconds: self.idle_unload_seconds,
             generation: BackendGenerationSettings::from_config(&self.generation),
             memory: BackendMemorySettings::from_config(&self.memory),
             prompt: BackendPromptSettings::from_config(&self.prompt),
@@ -923,7 +924,7 @@ impl BackendStatus {
             region_parallelism: DEFAULT_REGION_PARALLELISM,
             translation_batch_size: DEFAULT_TRANSLATION_BATCH_SIZE,
             translator_loaded: false,
-            idle_unload_minutes: DEFAULT_IDLE_UNLOAD_MINUTES,
+            idle_unload_seconds: DEFAULT_IDLE_UNLOAD_SECONDS,
             generation: BackendGenerationSettings::from_config(&GenerationConfig::default()),
             memory: BackendMemorySettings::from_config(&MemoryConfig::default()),
             prompt: BackendPromptSettings::from_config(&PromptConfig::default()),
@@ -1079,10 +1080,10 @@ fn validate_translation_batch_size(value: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_idle_unload_minutes(value: u32) -> Result<(), String> {
-    if value > MAX_IDLE_UNLOAD_MINUTES {
+fn validate_idle_unload_seconds(value: u32) -> Result<(), String> {
+    if value > MAX_IDLE_UNLOAD_SECONDS {
         return Err(format!(
-            "idle_unload_minutes must be in 0..={MAX_IDLE_UNLOAD_MINUTES}"
+            "idle_unload_seconds must be in 0..={MAX_IDLE_UNLOAD_SECONDS}"
         ));
     }
     Ok(())
@@ -1124,6 +1125,29 @@ fn bounded_env_u32(name: &str, default: u32, min: u32, max: u32) -> Result<u32, 
         return Err(format!("{name} must be in {min}..={max}"));
     }
     Ok(parsed)
+}
+
+fn idle_unload_seconds_from_environment() -> Result<u32, String> {
+    if env::var_os("SMODELTRANS_IDLE_UNLOAD_SECONDS").is_some() {
+        return bounded_env_u32(
+            "SMODELTRANS_IDLE_UNLOAD_SECONDS",
+            DEFAULT_IDLE_UNLOAD_SECONDS,
+            0,
+            MAX_IDLE_UNLOAD_SECONDS,
+        );
+    }
+    if env::var_os("SMODELTRANS_IDLE_UNLOAD_MINUTES").is_some() {
+        let minutes = bounded_env_u32(
+            "SMODELTRANS_IDLE_UNLOAD_MINUTES",
+            0,
+            0,
+            LEGACY_MAX_IDLE_UNLOAD_MINUTES,
+        )?;
+        return minutes
+            .checked_mul(60)
+            .ok_or_else(|| "SMODELTRANS_IDLE_UNLOAD_MINUTES is too large".to_owned());
+    }
+    Ok(DEFAULT_IDLE_UNLOAD_SECONDS)
 }
 
 fn env_path(name: &str, default: PathBuf, base: &Path) -> PathBuf {
@@ -1200,7 +1224,7 @@ mod tests {
             region_parallelism: 16,
             translation_batch_size: 4,
             device_kind: DeviceKind::Cuda,
-            idle_unload_minutes: 30,
+            idle_unload_seconds: 1_800,
             prompt: PromptConfig::default(),
             generation: GenerationConfig::default(),
             memory: MemoryConfig::default(),
@@ -1219,7 +1243,7 @@ mod tests {
             device: "cuda".to_owned(),
             region_parallelism: 8,
             translation_batch_size: 2,
-            idle_unload_minutes: 0,
+            idle_unload_seconds: 0,
             generation: BackendGenerationSettings {
                 max_new_tokens: 64,
                 sampling: true,
@@ -1264,7 +1288,7 @@ mod tests {
         assert_eq!(updated.device_kind, DeviceKind::Cuda);
         assert_eq!(updated.region_parallelism, 8);
         assert_eq!(updated.translation_batch_size, 2);
-        assert_eq!(updated.idle_unload_minutes, 0);
+        assert_eq!(updated.idle_unload_seconds, 0);
         assert_eq!(updated.generation.max_new_tokens, 64);
         assert!(updated.generation.sampling);
         assert_eq!(updated.generation.top_k, 32);

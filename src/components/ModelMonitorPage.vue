@@ -1,16 +1,6 @@
 <script setup lang="ts">
 import { computed, onActivated, onBeforeUnmount, onDeactivated, ref } from "vue";
-import {
-  NAlert,
-  NButton,
-  NCard,
-  NEmpty,
-  NProgress,
-  NSpin,
-  NTag,
-  NScrollbar,
-  useMessage,
-} from "naive-ui";
+import { NAlert, NButton, NCard, NSpin, NTag, useMessage } from "naive-ui";
 import {
   controlModel,
   getModelRuntimeStatus,
@@ -27,35 +17,11 @@ const runtimeStatus = ref<ModelRuntimeStatus | null>(null);
 const refreshing = ref(false);
 const controlKey = ref("");
 const errorMessage = ref("");
-const statusObservedAtMs = ref(Date.now());
-const clockNowMs = ref(Date.now());
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
-let clockTimer: ReturnType<typeof setInterval> | undefined;
-
-const successRate = computed(() => {
-  const status = runtimeStatus.value;
-  if (!status || status.requestCount === 0) {
-    return 0;
-  }
-  return Math.round((status.succeededRequests / status.requestCount) * 100);
-});
 
 const loadedModelCount = computed(() => {
   const status = runtimeStatus.value;
   return status ? Number(status.ocrLoaded) + Number(status.translatorLoaded) : 0;
-});
-
-const idleSeconds = computed(() => {
-  const status = runtimeStatus.value;
-  if (!status || status.busy) {
-    return 0;
-  }
-  const elapsedSinceObservation = Math.max(0, clockNowMs.value - statusObservedAtMs.value);
-  return Math.floor((status.idleForMs + elapsedSinceObservation) / 1000);
-});
-
-const integerFormatter = new Intl.NumberFormat("zh-CN", {
-  maximumFractionDigits: 0,
 });
 
 const runtimeLabel = computed(() => {
@@ -66,8 +32,7 @@ const runtimeLabel = computed(() => {
   if (status.busy) {
     return "处理中";
   }
-  const loadedCount = Number(status.ocrLoaded) + Number(status.translatorLoaded);
-  return loadedCount > 0 ? `已加载 ${loadedCount}/2` : "按需加载";
+  return loadedModelCount.value > 0 ? `已加载 ${loadedModelCount.value}/2` : "按需加载";
 });
 
 const runtimeTagType = computed<"default" | "success" | "warning" | "info">(() => {
@@ -81,22 +46,6 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function formatInteger(value: number): string {
-  return integerFormatter.format(Math.round(value));
-}
-
-function formatMilliseconds(value: number | null): string {
-  return value === null ? "暂无" : formatInteger(value);
-}
-
-function formatEventTime(timestampMs: number): string {
-  return new Intl.DateTimeFormat("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(new Date(timestampMs));
-}
-
 async function refreshStatus(showError = true): Promise<void> {
   if (!isDesktopRuntime || refreshing.value || controlKey.value) {
     return;
@@ -104,10 +53,7 @@ async function refreshStatus(showError = true): Promise<void> {
   refreshing.value = true;
   try {
     const status = await getModelRuntimeStatus();
-    const observedAt = Date.now();
     runtimeStatus.value = status;
-    statusObservedAtMs.value = observedAt;
-    clockNowMs.value = observedAt;
     applySharedModelRuntimeStatus(status);
     errorMessage.value = "";
   } catch (error) {
@@ -127,10 +73,7 @@ async function runModelControl(model: ModelTarget, action: ModelAction): Promise
   controlKey.value = key;
   try {
     const status = await controlModel(model, action);
-    const observedAt = Date.now();
     runtimeStatus.value = status;
-    statusObservedAtMs.value = observedAt;
-    clockNowMs.value = observedAt;
     applySharedModelRuntimeStatus(status);
     errorMessage.value = "";
     const modelLabel = model === "ocr" ? "PP-OCR" : "Hy-MT2";
@@ -145,25 +88,17 @@ async function runModelControl(model: ModelTarget, action: ModelAction): Promise
 }
 
 function startPolling(): void {
-  if (!isDesktopRuntime || refreshTimer || clockTimer) {
+  if (!isDesktopRuntime || refreshTimer) {
     return;
   }
-  clockNowMs.value = Date.now();
   void refreshStatus();
   refreshTimer = setInterval(() => void refreshStatus(false), 2000);
-  clockTimer = setInterval(() => {
-    clockNowMs.value = Date.now();
-  }, 1000);
 }
 
 function stopPolling(): void {
   if (refreshTimer) {
     clearInterval(refreshTimer);
     refreshTimer = undefined;
-  }
-  if (clockTimer) {
-    clearInterval(clockTimer);
-    clockTimer = undefined;
   }
 }
 
@@ -178,7 +113,7 @@ onBeforeUnmount(stopPolling);
       <div class="monitor-title-group">
         <p class="panel-kicker">Operations / Model Runtime</p>
         <h2 id="model-monitor-page-title">模型运行监控</h2>
-        <p>管理本地 OCR 与 Hy-MT2 的驻留状态；运行指标和记录用于诊断。常用模型与目标语言准备请先在设置中完成。</p>
+        <p>管理本地 OCR 与 Hy-MT2 的驻留状态；常用模型与目标语言准备请先在设置中完成。</p>
       </div>
       <div class="monitor-toolbar-actions">
         <n-tag :type="runtimeTagType" round size="small">{{ runtimeLabel }}</n-tag>
@@ -210,7 +145,7 @@ onBeforeUnmount(stopPolling);
           ></span>
           <div>
             <span>Runtime 状态</span>
-            <strong>{{ runtimeStatus.busy ? "正在推理" : `空闲 ${formatInteger(idleSeconds)} s` }}</strong>
+            <strong>{{ runtimeStatus.busy ? "正在推理" : "空闲" }}</strong>
           </div>
         </div>
         <dl class="runtime-facts">
@@ -347,97 +282,6 @@ onBeforeUnmount(stopPolling);
         </div>
       </section>
 
-      <n-card class="monitor-card metrics-card" :bordered="false">
-        <div class="section-heading">
-          <div>
-            <p class="panel-kicker">Runtime Metrics</p>
-            <h3>运行指标</h3>
-          </div>
-          <span>请求耗时按毫秒统计，空闲时间按秒计时</span>
-        </div>
-
-        <div class="runtime-metrics">
-          <div class="metric-tile">
-            <span>请求总数</span>
-            <strong>{{ formatInteger(runtimeStatus.requestCount) }}<small>次</small></strong>
-          </div>
-          <div class="metric-tile metric-tile-success">
-            <span>成功请求</span>
-            <strong>{{ formatInteger(runtimeStatus.succeededRequests) }}<small>次</small></strong>
-          </div>
-          <div class="metric-tile metric-tile-error">
-            <span>失败请求</span>
-            <strong>{{ formatInteger(runtimeStatus.failedRequests) }}<small>次</small></strong>
-          </div>
-          <div class="metric-tile metric-rate">
-            <div>
-              <span>请求成功率</span>
-              <strong>{{ successRate }}<small>%</small></strong>
-            </div>
-            <n-progress type="line" :percentage="successRate" :show-indicator="false" status="success" />
-          </div>
-          <div class="metric-tile metric-tile-latency">
-            <span>平均耗时</span>
-            <strong>{{ formatMilliseconds(runtimeStatus.averageDurationMs) }}<small>ms</small></strong>
-          </div>
-          <div class="metric-tile metric-tile-latency">
-            <span>最近耗时</span>
-            <strong>
-              {{ formatMilliseconds(runtimeStatus.lastDurationMs) }}
-              <small v-if="runtimeStatus.lastDurationMs !== null">ms</small>
-            </strong>
-          </div>
-          <div class="metric-tile metric-tile-idle">
-            <span>空闲计时</span>
-            <strong>{{ formatInteger(idleSeconds) }}<small>s</small></strong>
-          </div>
-        </div>
-      </n-card>
-
-      <n-card class="monitor-card events-card" :bordered="false">
-        <div class="section-heading">
-          <div>
-            <p class="panel-kicker">Recent Activity</p>
-            <h3>最近运行记录</h3>
-          </div>
-          <span>最近 {{ runtimeStatus.recentEvents.length }} 条</span>
-        </div>
-        <n-scrollbar
-          v-if="runtimeStatus.recentEvents.length"
-          class="event-table-wrap"
-          x-scrollable
-          content-class="event-table-scroll-content"
-        >
-          <table class="event-table">
-            <thead>
-              <tr>
-                <th scope="col">时间</th>
-                <th scope="col">操作</th>
-                <th scope="col">状态</th>
-                <th scope="col">耗时（ms）</th>
-                <th scope="col">说明</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="(event, index) in runtimeStatus.recentEvents"
-                :key="`${event.timestampMs}-${event.operation}-${index}`"
-              >
-                <td>{{ formatEventTime(event.timestampMs) }}</td>
-                <td>{{ event.operation }}</td>
-                <td>
-                  <n-tag :type="event.success ? 'success' : 'error'" size="small">
-                    {{ event.success ? "成功" : "失败" }}
-                  </n-tag>
-                </td>
-                <td class="event-duration">{{ formatMilliseconds(event.durationMs) }}</td>
-                <td>{{ event.message }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </n-scrollbar>
-        <n-empty v-else size="small" description="完成一次 OCR、翻译或模型控制后，这里会显示运行记录。" />
-      </n-card>
     </template>
   </section>
 </template>

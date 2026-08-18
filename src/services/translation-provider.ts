@@ -22,6 +22,9 @@ export interface TranslationProgress {
 }
 
 export type DeviceKind = "cpu" | "cuda";
+export const DEFAULT_IDLE_UNLOAD_SECONDS = 1_800;
+export const IDLE_UNLOAD_SECONDS_MIN = 0;
+export const IDLE_UNLOAD_SECONDS_MAX = 86_400;
 
 export interface BackendGenerationSettings {
   maxNewTokens: number;
@@ -60,7 +63,7 @@ export interface BackendStatus {
   regionParallelism: number;
   translationBatchSize: number;
   translatorLoaded: boolean;
-  idleUnloadMinutes: number;
+  idleUnloadSeconds: number;
   generation: BackendGenerationSettings;
   memory: BackendMemorySettings;
   prompt: BackendPromptSettings;
@@ -70,27 +73,12 @@ export interface BackendStatus {
 export type ModelTarget = "ocr" | "translator";
 export type ModelAction = "load" | "unload";
 
-export interface ModelRuntimeEvent {
-  timestampMs: number;
-  operation: string;
-  durationMs: number;
-  success: boolean;
-  message: string;
-}
 
 export interface ModelRuntimeStatus {
   backend: BackendStatus;
   ocrLoaded: boolean;
   translatorLoaded: boolean;
   busy: boolean;
-  idleForMs: number;
-  requestCount: number;
-  succeededRequests: number;
-  failedRequests: number;
-  averageDurationMs: number;
-  lastDurationMs: number | null;
-  lastOperation: string | null;
-  recentEvents: ModelRuntimeEvent[];
 }
 
 export interface BackendSettingsUpdate {
@@ -102,7 +90,7 @@ export interface BackendSettingsUpdate {
   device: DeviceKind;
   regionParallelism: number;
   translationBatchSize: number;
-  idleUnloadMinutes: number;
+  idleUnloadSeconds: number;
   generation: BackendGenerationSettings;
   memory: BackendMemorySettings;
   prompt: BackendPromptSettings;

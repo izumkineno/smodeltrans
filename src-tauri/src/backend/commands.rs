@@ -5,7 +5,6 @@ use super::{
     input::{
         DecodedImage, decode_image, decode_ocr_image, validate_target_language, validate_text,
     },
-    runtime::{RuntimeMetrics, RuntimeMetricsSnapshot},
     settings::{
         BackendSettings, BackendSettingsUpdate, BackendStatus, ModelCatalogOptions,
         ModelCatalogUpdate,
@@ -25,13 +24,11 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{Emitter, State};
-
 #[derive(Clone)]
 pub(crate) struct BackendState {
     pub(crate) settings: Arc<Mutex<Result<BackendSettings, String>>>,
     pub(crate) engine: Arc<Mutex<Option<BackendEngine>>>,
     pub(crate) last_activity: Arc<Mutex<Instant>>,
-    pub(crate) runtime: Arc<Mutex<RuntimeMetrics>>,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) runs: RunRegistry,
     pub(crate) live_active: Arc<AtomicBool>,
@@ -59,7 +56,6 @@ impl BackendState {
             )),
             engine: Arc::new(Mutex::new(None)),
             last_activity: Arc::new(Mutex::new(Instant::now())),
-            runtime: Arc::new(Mutex::new(RuntimeMetrics::default())),
             config_path,
             runs: RunRegistry::default(),
             live_active: Arc::new(AtomicBool::new(false)),
@@ -70,28 +66,27 @@ impl BackendState {
         let settings = Arc::clone(&self.settings);
         let engine = Arc::clone(&self.engine);
         let last_activity = Arc::clone(&self.last_activity);
-        let runtime = Arc::clone(&self.runtime);
         let live_active = Arc::clone(&self.live_active);
         thread::spawn(move || {
             loop {
-                thread::sleep(Duration::from_secs(5));
+                thread::sleep(Duration::from_secs(1));
                 if live_active.load(Ordering::SeqCst) {
                     continue;
                 }
-                let idle_minutes = settings
+                let idle_seconds = settings
                     .lock()
                     .ok()
                     .and_then(|settings| {
                         settings
                             .as_ref()
                             .ok()
-                            .map(|settings| settings.idle_unload_minutes)
+                            .map(|settings| settings.idle_unload_seconds)
                     })
                     .unwrap_or(0);
-                if idle_minutes == 0 {
+                if idle_seconds == 0 {
                     continue;
                 }
-                let idle_for = Duration::from_secs(u64::from(idle_minutes) * 60);
+                let idle_for = Duration::from_secs(u64::from(idle_seconds));
                 let last_used = last_activity
                     .lock()
                     .map(|last_activity| *last_activity)
@@ -102,24 +97,13 @@ impl BackendState {
                 let Ok(mut engine) = engine.try_lock() else {
                     continue;
                 };
-                let unloaded = if last_used.elapsed() >= idle_for {
-                    engine.as_mut().is_some_and(|engine| {
-                        let (ocr_loaded, translator_loaded) = engine.model_states();
+                if last_used.elapsed() >= idle_for
+                    && let Some(engine) = engine.as_mut()
+                {
+                    let (ocr_loaded, translator_loaded) = engine.model_states();
+                    if ocr_loaded || translator_loaded {
                         engine.unload_models();
-                        ocr_loaded || translator_loaded
-                    })
-                } else {
-                    false
-                };
-                drop(engine);
-                if unloaded && let Ok(mut runtime) = runtime.lock() {
-                    runtime.set_model_states(false, false);
-                    runtime.record_control(
-                        "自动卸载全部模型",
-                        Duration::ZERO,
-                        true,
-                        "达到空闲释放时间",
-                    );
+                    }
                 }
             }
         });
@@ -131,36 +115,15 @@ impl BackendState {
         }
     }
 
-    pub(crate) fn set_model_states(&self, ocr_loaded: bool, translator_loaded: bool) {
-        if let Ok(mut runtime) = self.runtime.lock() {
-            runtime.set_model_states(ocr_loaded, translator_loaded);
-        }
-    }
-
-    fn record_request(&self, operation: &str, duration: Duration, success: bool, message: &str) {
-        if let Ok(mut runtime) = self.runtime.lock() {
-            runtime.record_request(operation, duration, success, message);
-        }
-    }
-
-    fn record_control(&self, operation: &str, duration: Duration, success: bool, message: &str) {
-        if let Ok(mut runtime) = self.runtime.lock() {
-            runtime.record_control(operation, duration, success, message);
-        }
-    }
-
-    fn runtime_snapshot(&self) -> Result<RuntimeMetricsSnapshot, BackendFailure> {
-        let idle_for = self
-            .last_activity
+    pub(crate) fn model_states(&self) -> Result<(bool, bool), BackendFailure> {
+        let engine = self
+            .engine
             .lock()
-            .map_err(|_| BackendFailure::internal("后端活动时间锁已损坏"))?
-            .elapsed();
-        let busy = self.runs.is_busy()? || self.live_active.load(Ordering::SeqCst);
-        let runtime = self
-            .runtime
-            .lock()
-            .map_err(|_| BackendFailure::internal("模型运行状态锁已损坏"))?;
-        Ok(runtime.snapshot(idle_for, busy))
+            .map_err(|_| BackendFailure::internal("后端状态锁已损坏"))?;
+        Ok(engine
+            .as_ref()
+            .map(BackendEngine::model_states)
+            .unwrap_or((false, false)))
     }
 }
 
@@ -358,8 +321,9 @@ pub(crate) struct BackendError {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ModelRuntimeStatus {
     pub(crate) backend: BackendStatus,
-    #[serde(flatten)]
-    pub(crate) runtime: RuntimeMetricsSnapshot,
+    pub(crate) ocr_loaded: bool,
+    pub(crate) translator_loaded: bool,
+    pub(crate) busy: bool,
 }
 
 impl From<BackendFailure> for BackendError {
@@ -381,33 +345,18 @@ fn current_backend_status(state: &BackendState) -> Result<BackendStatus, Backend
         Ok(settings) => settings,
         Err(message) => return Ok(BackendStatus::configuration_error(&message)),
     };
-    let translator_loaded = state
-        .runtime
-        .lock()
-        .map_err(|_| BackendFailure::internal("模型运行状态锁已损坏"))?
-        .model_states()
-        .1;
+    let translator_loaded = state.model_states()?.1;
     Ok(settings.status(translator_loaded))
 }
 
 fn current_model_runtime_status(state: &BackendState) -> Result<ModelRuntimeStatus, BackendError> {
+    let (ocr_loaded, translator_loaded) = state.model_states()?;
     Ok(ModelRuntimeStatus {
         backend: current_backend_status(state)?,
-        runtime: state.runtime_snapshot()?,
+        ocr_loaded,
+        translator_loaded,
+        busy: state.runs.is_busy()? || state.live_active.load(Ordering::SeqCst),
     })
-}
-
-fn record_request_result<T>(
-    state: &BackendState,
-    operation: &str,
-    started_at: Instant,
-    result: &Result<T, BackendFailure>,
-) {
-    let (success, message) = match result {
-        Ok(_) => (true, "处理完成"),
-        Err(error) => (false, error.message()),
-    };
-    state.record_request(operation, started_at.elapsed(), success, message);
 }
 
 fn ensure_live_inactive(state: &BackendState) -> Result<(), BackendFailure> {
@@ -464,8 +413,6 @@ pub(crate) fn update_backend_settings(
         .map_err(|_| BackendFailure::internal("后端状态锁已损坏"))?;
     *engine = None;
     drop(engine);
-    state.set_model_states(false, false);
-    state.record_control("重置模型运行时", Duration::ZERO, true, "模型设置已更新");
     state.touch_activity();
     Ok(updated.status(false))
 }
@@ -529,9 +476,6 @@ pub(crate) async fn control_model(
     ensure_live_inactive(state.inner())?;
     let target = ModelTarget::parse(request.model.trim())?;
     let action = ModelAction::parse(request.action.trim())?;
-    let operation = format!("{} {}", action.label(), target.label());
-    let success_message = format!("{}已{}", target.label(), action.label());
-    let started_at = Instant::now();
     let worker_state = state.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || -> Result<(), BackendFailure> {
         if worker_state.runs.is_busy()? {
@@ -569,12 +513,7 @@ pub(crate) async fn control_model(
             (None, _, ModelAction::Unload) => Ok(()),
             (None, _, ModelAction::Load) => Err(BackendFailure::internal("Candle 后端未初始化")),
         };
-        let (ocr_loaded, translator_loaded) = engine
-            .as_ref()
-            .map(BackendEngine::model_states)
-            .unwrap_or((false, false));
         drop(engine);
-        worker_state.set_model_states(ocr_loaded, translator_loaded);
         worker_state.touch_activity();
         result
     })
@@ -583,16 +522,6 @@ pub(crate) async fn control_model(
         BackendFailure::internal(format!("Candle worker exited unexpectedly: {error}"))
     })
     .and_then(|result| result);
-    let event_message = result
-        .as_ref()
-        .map(|_| success_message.as_str())
-        .unwrap_or_else(|error| error.message());
-    state.record_control(
-        &operation,
-        started_at.elapsed(),
-        result.is_ok(),
-        event_message,
-    );
     result?;
     current_model_runtime_status(state.inner())
 }
@@ -621,7 +550,6 @@ pub(crate) async fn translate_image(
     let decoded = decode_request(request)?;
     emit_translation_progress(&app, &run_id, 15, "图片已解码");
     let worker_state = state.inner().clone();
-    let metrics_state = worker_state.clone();
     let app = app.clone();
     let run_id = run_id.clone();
     let result = tauri::async_runtime::spawn_blocking(
@@ -644,7 +572,6 @@ pub(crate) async fn translate_image(
         BackendFailure::internal(format!("Candle worker exited unexpectedly: {error}"))
     })
     .and_then(|result| result);
-    record_request_result(&metrics_state, "图片翻译", started_at, &result);
     result.map_err(BackendError::from)
 }
 
@@ -662,7 +589,6 @@ pub(crate) async fn translate_text(
     let (text, target_language) = decode_text_request(request)?;
     emit_translation_progress(&app, &run_id, 15, "文本请求已验证");
     let worker_state = state.inner().clone();
-    let metrics_state = worker_state.clone();
     let app = app.clone();
     let run_id = run_id.clone();
     let result = tauri::async_runtime::spawn_blocking(
@@ -686,7 +612,6 @@ pub(crate) async fn translate_text(
         BackendFailure::internal(format!("Candle worker exited unexpectedly: {error}"))
     })
     .and_then(|result| result);
-    record_request_result(&metrics_state, "文本翻译", started_at, &result);
     result.map_err(BackendError::from)
 }
 
@@ -704,7 +629,6 @@ pub(crate) async fn ocr_image(
     let decoded = decode_ocr_request(request)?;
     emit_translation_progress(&app, &run_id, 15, "图片已解码");
     let worker_state = state.inner().clone();
-    let metrics_state = worker_state.clone();
     let app = app.clone();
     let run_id = run_id.clone();
     let result =
@@ -726,7 +650,6 @@ pub(crate) async fn ocr_image(
             BackendFailure::internal(format!("Candle worker exited unexpectedly: {error}"))
         })
         .and_then(|result| result);
-    record_request_result(&metrics_state, "OCR 识别", started_at, &result);
     result.map_err(BackendError::from)
 }
 
@@ -763,7 +686,7 @@ fn translate_image_blocking(
         .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
         .clone()
         .map_err(BackendFailure::arguments)?;
-    let (result, (ocr_loaded, translator_loaded)) = {
+    let result = {
         let mut engine = lock_with_cancellation(&state.engine, cancellation)?;
         if engine.is_none() {
             *engine = Some(BackendEngine::new(settings)?);
@@ -771,12 +694,10 @@ fn translate_image_blocking(
         let engine = engine
             .as_mut()
             .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
-        let result = engine.translate(&request, cancellation, |progress, stage| {
+        engine.translate(&request, cancellation, |progress, stage| {
             emit_translation_progress(app, run_id, progress, stage);
-        });
-        (result, engine.model_states())
+        })
     };
-    state.set_model_states(ocr_loaded, translator_loaded);
     state.touch_activity();
     let result = result?;
     let image_base64 = BASE64.encode(result.annotated_png);
@@ -806,7 +727,7 @@ fn translate_text_blocking(
         .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))?
         .clone()
         .map_err(BackendFailure::arguments)?;
-    let (result, (ocr_loaded, translator_loaded)) = {
+    let result = {
         let mut engine = lock_with_cancellation(&state.engine, cancellation)?;
         if engine.is_none() {
             *engine = Some(BackendEngine::new(settings)?);
@@ -814,7 +735,7 @@ fn translate_text_blocking(
         let engine = engine
             .as_mut()
             .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
-        let result = engine.translate_text(
+        engine.translate_text(
             &text,
             &target_language,
             "",
@@ -823,10 +744,8 @@ fn translate_text_blocking(
                 emit_translation_progress(app, run_id, progress, stage);
             },
             |_| {},
-        );
-        (result, engine.model_states())
+        )
     };
-    state.set_model_states(ocr_loaded, translator_loaded);
     state.touch_activity();
     Ok(TextTranslationResponse {
         text: result?,
@@ -851,7 +770,7 @@ fn ocr_image_blocking(
         .clone()
         .map_err(BackendFailure::arguments)?;
     let (image_width, image_height) = request.canvas().dimensions();
-    let (result, (ocr_loaded, translator_loaded)) = {
+    let result = {
         let mut engine = lock_with_cancellation(&state.engine, cancellation)?;
         if engine.is_none() {
             *engine = Some(BackendEngine::new(settings)?);
@@ -859,12 +778,10 @@ fn ocr_image_blocking(
         let engine = engine
             .as_mut()
             .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
-        let result = engine.ocr(&request, cancellation, |progress, stage| {
+        engine.ocr(&request, cancellation, |progress, stage| {
             emit_translation_progress(app, run_id, progress, stage);
-        });
-        (result, engine.model_states())
+        })
     };
-    state.set_model_states(ocr_loaded, translator_loaded);
     state.touch_activity();
     let result = result?;
     let image_base64 = BASE64.encode(result.annotated_png);
@@ -938,7 +855,7 @@ mod tests {
             "device": "cuda",
             "regionParallelism": 8,
             "translationBatchSize": 2,
-            "idleUnloadMinutes": 0,
+            "idleUnloadSeconds": 0,
             "generation": {
                 "maxNewTokens": 64,
                 "sampling": true,

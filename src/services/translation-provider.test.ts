@@ -386,7 +386,7 @@ describe("backend settings commands", () => {
       regionParallelism: 8,
       translationBatchSize: 2,
       translatorLoaded: false,
-      idleUnloadMinutes: 0,
+      idleUnloadSeconds: 0,
       generation: {
         maxNewTokens: 64,
         sampling: true,
@@ -433,7 +433,7 @@ describe("backend settings commands", () => {
       device: "cuda",
       regionParallelism: 8,
       translationBatchSize: 2,
-      idleUnloadMinutes: 0,
+      idleUnloadSeconds: 0,
       generation: {
         maxNewTokens: 64,
         sampling: true,
@@ -478,29 +478,13 @@ describe("backend settings commands", () => {
     ]);
   });
 
-  test("getModelRuntimeStatus preserves live metrics and events", async () => {
+  test("getModelRuntimeStatus returns model residency state", async () => {
     const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
     const status = {
       backend: {} as BackendStatus,
       ocrLoaded: true,
       translatorLoaded: false,
       busy: true,
-      idleForMs: 1200,
-      requestCount: 3,
-      succeededRequests: 2,
-      failedRequests: 1,
-      averageDurationMs: 410,
-      lastDurationMs: 230,
-      lastOperation: "OCR 识别",
-      recentEvents: [
-        {
-          timestampMs: 123,
-          operation: "OCR 识别",
-          durationMs: 230,
-          success: true,
-          message: "处理完成",
-        },
-      ],
     } satisfies ModelRuntimeStatus;
 
     const result = await getModelRuntimeStatus(async <T>(command, args): Promise<T> => {
@@ -508,8 +492,9 @@ describe("backend settings commands", () => {
       return status as T;
     });
 
-    expect(result.requestCount).toBe(3);
-    expect(result.recentEvents[0].operation).toBe("OCR 识别");
+    expect(result.ocrLoaded).toBe(true);
+    expect(result.translatorLoaded).toBe(false);
+    expect(result.busy).toBe(true);
     expect(calls).toEqual([{ command: "get_model_runtime_status", args: undefined }]);
   });
 

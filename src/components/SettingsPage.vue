@@ -14,6 +14,9 @@ import {
   useMessage,
 } from "naive-ui";
 import {
+  DEFAULT_IDLE_UNLOAD_SECONDS,
+  IDLE_UNLOAD_SECONDS_MAX,
+  IDLE_UNLOAD_SECONDS_MIN,
   getModelCatalog,
   saveModelCatalog,
   updateBackendSettings,
@@ -48,7 +51,7 @@ const modelFontPath = ref<string | null>(null);
 const device = ref<DeviceKind>("cuda");
 const regionParallelism = ref(16);
 const translationBatchSize = ref(4);
-const idleUnloadMinutes = ref(30);
+const idleUnloadSeconds = ref(DEFAULT_IDLE_UNLOAD_SECONDS);
 const generationMaxNewTokens = ref(4096);
 const generationSampling = ref(true);
 const generationTemperature = ref(0.7);
@@ -131,7 +134,7 @@ function applyBackendStatus(status: BackendStatus) {
   modelFontPath.value = status.fontPath;
   device.value = status.device === "cpu" ? "cpu" : "cuda";
   translationBatchSize.value = status.translationBatchSize;
-  idleUnloadMinutes.value = status.idleUnloadMinutes;
+  idleUnloadSeconds.value = status.idleUnloadSeconds;
   generationMaxNewTokens.value = status.generation.maxNewTokens;
   generationSampling.value = status.generation.sampling;
   generationTemperature.value = status.generation.temperature;
@@ -567,7 +570,12 @@ async function saveModelSettings() {
     setSettingsFeedback("error", "请选择完整的 PP-OCR 与 Hy-MT2 模型路径。");
     return;
   }
-  const idleMinutes = requireInteger(idleUnloadMinutes.value ?? 0, 0, 1440, "模型空闲释放时间");
+  const idleSeconds = requireInteger(
+    idleUnloadSeconds.value ?? 0,
+    IDLE_UNLOAD_SECONDS_MIN,
+    IDLE_UNLOAD_SECONDS_MAX,
+    "模型空闲释放时间",
+  );
   const ocrParallelism = requireInteger(regionParallelism.value ?? 0, 1, 16, "OCR 并发");
   const batchSize = requireInteger(translationBatchSize.value ?? 0, 1, 4, "Hy 批大小");
   const maxNewTokens = requireInteger(generationMaxNewTokens.value ?? 0, 1, 4096, "最大生成 token");
@@ -575,7 +583,7 @@ async function saveModelSettings() {
   const memoryTokens = requireInteger(memoryMaxTokens.value ?? 0, 1, 262144, "记忆 token 预算");
   const memoryTurns = requireInteger(memoryMaxTurns.value ?? 0, 1, 1024, "记忆轮数");
   if (
-    idleMinutes === null ||
+    idleSeconds === null ||
     ocrParallelism === null ||
     batchSize === null ||
     maxNewTokens === null ||
@@ -643,7 +651,7 @@ async function saveModelSettings() {
     device: device.value,
     regionParallelism: ocrParallelism,
     translationBatchSize: batchSize,
-    idleUnloadMinutes: idleMinutes,
+    idleUnloadSeconds: idleSeconds,
     generation: {
       maxNewTokens,
       sampling: generationSampling.value,
@@ -673,7 +681,7 @@ async function saveModelSettings() {
     applyBackendStatus(status);
     setSettingsFeedback(
       "success",
-      idleMinutes === 0
+      idleSeconds === 0
         ? "设置已保存，下一次翻译会使用新的参数。自动释放已关闭。"
         : "设置已保存，下一次翻译会使用新的参数。",
     );
@@ -914,7 +922,7 @@ onMounted(() => {
           <n-tag type="info" round size="small">CUDA</n-tag>
         </div>
         <p class="settings-card-copy">
-          控制本地推理设备、OCR 区域并发、Hy 翻译批大小，以及翻译完成后保持模型在显存中的时间。
+          控制本地推理设备、OCR 区域并发、Hy 翻译批大小，以及翻译完成后保持模型在显存中的秒数。
         </p>
         <div class="settings-field-grid">
           <label class="settings-field">
@@ -943,15 +951,16 @@ onMounted(() => {
             />
           </label>
           <label class="settings-field settings-number-field">
-            <span>空闲释放时间（分钟）</span>
+            <span>空闲释放时间（秒）</span>
             <n-input-number
-              v-model:value="idleUnloadMinutes"
-              :min="0"
-              :max="1440"
-              :step="5"
-              aria-label="模型空闲释放时间"
+              v-model:value="idleUnloadSeconds"
+              :min="IDLE_UNLOAD_SECONDS_MIN"
+              :max="IDLE_UNLOAD_SECONDS_MAX"
+              :step="30"
+              aria-label="模型空闲释放时间（秒）"
             />
-          </label>
+            <span class="settings-help">设置为 0 可关闭自动卸载；超时后模型会从显存中释放。</span>
+            </label>
         </div>
       </n-card>
       <n-card class="settings-card" :bordered="false">

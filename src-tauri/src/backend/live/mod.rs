@@ -1016,7 +1016,7 @@ impl SessionLoop {
                 config.translation_settings.memory_config(),
             )
         };
-        let (gpu, states) = {
+        let gpu = {
             let mut engine = self
                 .backend
                 .engine
@@ -1029,9 +1029,8 @@ impl SessionLoop {
                 .as_mut()
                 .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
             engine.prepare_live_pipeline(&target_language, memory, &self.cancellation)?;
-            (engine.gpu_resource_info()?, engine.model_states())
+            engine.gpu_resource_info()?
         };
-        self.backend.set_model_states(states.0, states.1);
         self.backend.touch_activity();
 
         if let Some(gpu) = gpu {
@@ -1876,8 +1875,6 @@ impl SessionLoop {
         ));
         let region_count = u32::try_from(regions.len()).unwrap_or(u32::MAX);
         let source_text = normalized_live_region_text(&regions);
-        let states = engine.model_states();
-        self.backend.set_model_states(states.0, states.1);
         Ok(RecognizedFrame {
             source_text,
             region_count,
@@ -1937,8 +1934,6 @@ impl SessionLoop {
             cancellation,
             on_chunk,
         );
-        let states = engine.model_states();
-        self.backend.set_model_states(states.0, states.1);
         self.backend.touch_activity();
         result
     }
@@ -1979,8 +1974,6 @@ impl SessionLoop {
             cancellation,
             on_chunk,
         );
-        let states = engine.model_states();
-        self.backend.set_model_states(states.0, states.1);
         self.backend.touch_activity();
         result
     }
