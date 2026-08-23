@@ -113,7 +113,7 @@ onBeforeUnmount(stopPolling);
       <div class="monitor-title-group">
         <p class="panel-kicker">Operations / Model Runtime</p>
         <h2 id="model-monitor-page-title">模型运行监控</h2>
-        <p>管理本地 OCR 与 Hy-MT2 的驻留状态；常用模型与目标语言准备请先在设置中完成。</p>
+        <p>管理本地 OCR 与 Hy-MT2 的驻留状态；模型安装与参数配置请在模型管理中完成。</p>
       </div>
       <div class="monitor-toolbar-actions">
         <n-tag :type="runtimeTagType" round size="small">{{ runtimeLabel }}</n-tag>

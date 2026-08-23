@@ -468,6 +468,38 @@ function renderModelMonitorIcon() {
   );
 }
 
+function renderModelManagerIcon() {
+  return h(
+    NIcon,
+    { size: 16 },
+    {
+      default: () =>
+        h("svg", { viewBox: "0 0 20 20", fill: "none", "aria-hidden": "true" }, [
+          h("path", {
+            d: "M10 3.5 3.5 7 10 10.5 16.5 7 10 3.5Z",
+            stroke: "currentColor",
+            "stroke-width": "1.2",
+            "stroke-linejoin": "round",
+          }),
+          h("path", {
+            d: "M3.5 10 10 13.5 16.5 10M3.5 13.5 10 17l6.5-3.5",
+            stroke: "currentColor",
+            "stroke-width": "1.2",
+            "stroke-linecap": "round",
+            "stroke-linejoin": "round",
+          }),
+          h("path", {
+            d: "M10 10.5v3",
+            stroke: "currentColor",
+            "stroke-width": "1.2",
+            "stroke-linecap": "round",
+          }),
+        ]),
+    },
+  );
+}
+
+
 function renderNavOptionLabel(title: string, description: string) {
   return () =>
     h("span", { class: "nav-option-label" }, [
@@ -503,6 +535,11 @@ const oneShotMenuOptions: MenuOption[] = [
 ];
 
 const operationsMenuOptions: MenuOption[] = [
+  {
+    label: "模型管理",
+    key: "model-manager",
+    icon: renderModelManagerIcon,
+  },
   {
     label: "设置",
     key: "settings",
@@ -611,6 +648,14 @@ const pageMetadata = computed<PageMetadata>(() => {
         statusLabel: settingsStatusLabel.value,
         statusType: backendStatus.value?.ready ? "success" : "warning",
         statusAriaLabel: "后端状态",
+      };
+    case "model-manager":
+      return {
+        title: "模型管理",
+        titleId: "model-manager-title",
+        statusLabel: settingsStatusLabel.value,
+        statusType: backendStatus.value?.ready ? "success" : "warning",
+        statusAriaLabel: "模型管理状态",
       };
     case "model-monitor":
       return {
