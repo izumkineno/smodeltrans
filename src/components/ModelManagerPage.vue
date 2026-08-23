@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { open as openNativeDialog } from "@tauri-apps/plugin-dialog";
 import {
   NAlert,
@@ -8,6 +8,7 @@ import {
   NInput,
   NInputNumber,
   NModal,
+  NProgress,
   NSelect,
   NSwitch,
   NTag,
@@ -35,6 +36,14 @@ import {
   targetLanguage,
 } from "../services/workspace-settings";
 import { showWorkspaceToast, type WorkspaceToastType } from "../services/workspace-toast";
+import {
+  type DownloadSource,
+  type DownloadTaskState,
+  cancelModelDownload,
+  listDownloadableModels,
+  listenDownloadProgress,
+  startModelDownload,
+} from "../services/model-download-provider";
 
 type TagType = "default" | "success" | "warning" | "error" | "info";
 type ModelDialogMode = "translation" | "ocr" | "font" | null;
@@ -71,6 +80,36 @@ const deviceOptions: Array<{ label: string; value: DeviceKind }> = [
   { label: "CPU（仅用于状态检查；Hy 翻译需要 CUDA）", value: "cpu" },
 ];
 const toast = useMessage();
+
+// --- ModelScope 下载状态，前端以 ModelScope 为默认源 ---
+const downloadSource = ref<DownloadSource>("modelscope");
+const downloadSourceOptions: Array<{ label: string; value: DownloadSource }> = [
+  { label: "ModelScope（默认）", value: "modelscope" },
+  { label: "Hugging Face", value: "huggingface" },
+];
+const downloadTasks = ref<Record<string, DownloadTaskState>>({});
+const downloadableModels = computed(() => listDownloadableModels(downloadSource.value));
+
+function downloadTaskFor(modelId: string): DownloadTaskState | undefined {
+  return downloadTasks.value[modelId];
+}
+
+function isModelInstalled(modelId: string): boolean {
+  if (modelId === "hy-mt2-1.8b-q4") {
+    return Boolean(modelHyPath.value);
+  }
+  const ocrVariantMap: Record<string, string> = {
+    "ppocr-v5-mobile": "v5-mobile",
+    "ppocr-v5-server": "v5-server",
+    "ppocr-v6-tiny": "v6-tiny",
+    "ppocr-v6-small": "v6-small",
+  };
+  const variant = ocrVariantMap[modelId];
+  if (variant) {
+    return backendStatus.value?.detectorVariant === variant;
+  }
+  return false;
+}
 
 function setSettingsFeedback(
   type: WorkspaceToastType,
@@ -644,12 +683,134 @@ async function saveModelSettings() {
   }
 }
 
-onMounted(() => {
+// --- ModelScope 下载交互 ---
+let downloadProgressUnlisten: (() => void) | undefined;
+let mockTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+function handleDownloadProgress(payload: { modelId: string; source: DownloadSource; progress: number; downloadedBytes: number; totalBytes: number; status: string; message?: string }) {
+  const statusMap: Record<string, DownloadTaskState["status"]> = {
+    downloading: "downloading",
+    completed: "completed",
+    error: "error",
+    cancelled: "cancelled",
+    idle: "idle",
+  };
+  const normalizedStatus = (statusMap[payload.status] ?? "downloading") as DownloadTaskState["status"];
+  downloadTasks.value[payload.modelId] = {
+    modelId: payload.modelId,
+    source: payload.source,
+    status: normalizedStatus,
+    progress: payload.progress,
+    downloadedBytes: payload.downloadedBytes,
+    totalBytes: payload.totalBytes,
+    message: payload.message,
+  };
+  if (normalizedStatus === "completed") {
+    setSettingsFeedback("success", `模型 ${payload.modelId} 下载完成，已落盘。`);
+    void loadModelCatalog();
+    void refreshBackendStatus(false);
+  } else if (normalizedStatus === "error") {
+    setSettingsFeedback("error", payload.message || `模型 ${payload.modelId} 下载失败。`);
+  }
+}
+
+async function handleDownload(modelId: string) {
+  if (downloadTasks.value[modelId]?.status === "downloading") return;
+  if (!isDesktopRuntime) {
+    let progress = 0;
+    downloadTasks.value[modelId] = {
+      modelId,
+      source: downloadSource.value,
+      status: "downloading",
+      progress: 0,
+      downloadedBytes: 0,
+      totalBytes: 100,
+    };
+    const timer = setInterval(() => {
+      progress += 7;
+      if (progress >= 100) {
+        progress = 100;
+        downloadTasks.value[modelId] = {
+          modelId,
+          source: downloadSource.value,
+          status: "completed",
+          progress: 100,
+          downloadedBytes: 100,
+          totalBytes: 100,
+          message: "下载完成（浏览器模拟）",
+        };
+        clearInterval(timer);
+        mockTimers.delete(modelId);
+        setSettingsFeedback("success", `模型 ${modelId} 下载完成（模拟）。`);
+      } else {
+        downloadTasks.value[modelId] = {
+          modelId,
+          source: downloadSource.value,
+          status: "downloading",
+          progress,
+          downloadedBytes: progress,
+          totalBytes: 100,
+        };
+      }
+    }, 180);
+    mockTimers.set(modelId, timer);
+    return;
+  }
+  try {
+    const state = await startModelDownload(modelId, downloadSource.value);
+    downloadTasks.value[modelId] = state;
+    setSettingsFeedback("info", `已开始从 ${downloadSource.value === "modelscope" ? "ModelScope" : "Hugging Face"} 下载 ${modelId}。`);
+  } catch (error) {
+    setSettingsFeedback("error", error instanceof Error ? error.message : "无法开始下载。");
+  }
+}
+
+async function handleCancelDownload(modelId: string) {
+  const timer = mockTimers.get(modelId);
+  if (timer) {
+    clearInterval(timer);
+    mockTimers.delete(modelId);
+    downloadTasks.value[modelId] = {
+      modelId,
+      source: downloadSource.value,
+      status: "cancelled",
+      progress: downloadTasks.value[modelId]?.progress ?? 0,
+      downloadedBytes: 0,
+      totalBytes: 100,
+      message: "已取消",
+    };
+    setSettingsFeedback("info", `已取消下载 ${modelId}。`);
+    return;
+  }
+  try {
+    await cancelModelDownload(modelId);
+    const existing = downloadTasks.value[modelId];
+    if (existing) {
+      downloadTasks.value[modelId] = { ...existing, status: "cancelled", message: "已取消" };
+    }
+    setSettingsFeedback("info", `已取消下载 ${modelId}。`);
+  } catch (error) {
+    setSettingsFeedback("error", error instanceof Error ? error.message : "取消失败。");
+  }
+}
+
+onMounted(async () => {
   if (backendStatus.value) {
     applyBackendStatus(backendStatus.value);
   }
   void loadModelCatalog();
   void refreshBackendStatus(false);
+  try {
+    downloadProgressUnlisten = await listenDownloadProgress(handleDownloadProgress);
+  } catch {
+    // 浏览器预览无事件
+  }
+});
+
+onBeforeUnmount(() => {
+  downloadProgressUnlisten?.();
+  mockTimers.forEach((timer) => clearInterval(timer));
+  mockTimers.clear();
 });
 </script>
 
@@ -674,43 +835,70 @@ onMounted(() => {
     </n-alert>
 
     <div class="model-manager-grid">
-      <!-- 下载占位 -->
+      <!-- 下载管理（ModelScope 默认） -->
       <n-card class="settings-card" :bordered="false">
         <div class="settings-card-heading">
           <div>
-            <p class="panel-kicker">Download</p>
+            <p class="panel-kicker">Download · ModelScope</p>
             <h2>模型下载</h2>
           </div>
-          <n-tag type="info" size="small" round>即将上线</n-tag>
+          <n-select
+            v-model:value="downloadSource"
+            :options="downloadSourceOptions"
+            size="small"
+            style="width: 180px"
+            aria-label="下载源"
+          />
         </div>
         <p class="settings-card-copy">
-          后续将支持从 Hugging Face / ModelScope 一键下载推荐模型，自动落盘并注册到本地列表。当前请先通过“本地模型”配置已有路径。
+          默认从 <strong>ModelScope</strong> 拉取（<code>modelscope.cn/models/&lt;repo&gt;/resolve/master</code>），由 Rust 后端 <code>model_download</code> 以 ModelScope 库逻辑进行流式下载与进度上报。切换为 Hugging Face 时走对应源。
         </p>
         <div class="model-download-list">
-          <div class="model-download-item">
+          <div v-for="model in downloadableModels" :key="model.id" class="model-download-item">
             <div>
-              <strong>Hy-MT2 0.3B GGUF</strong>
-              <span>多语言翻译，推荐默认</span>
+              <strong>
+                {{ model.name }}
+                <n-tag v-if="model.recommended" size="tiny" type="success" round>推荐</n-tag>
+                <n-tag v-if="isModelInstalled(model.id)" size="tiny" type="info" round>已安装</n-tag>
+              </strong>
+              <span>{{ model.description }} · {{ model.repoId }} · {{ model.sizeText }}</span>
+              <span class="model-download-files">{{ model.files.join(", ") }}</span>
+              <n-progress
+                v-if="downloadTaskFor(model.id)?.status === 'downloading'"
+                :percentage="downloadTaskFor(model.id)?.progress ?? 0"
+                :show-indicator="true"
+                :height="6"
+                style="margin-top: 6px"
+              />
+              <span v-if="downloadTaskFor(model.id)?.message" class="model-download-message">
+                {{ downloadTaskFor(model.id)?.message }}
+              </span>
             </div>
-            <n-button secondary size="small" disabled>下载</n-button>
-          </div>
-          <div class="model-download-item">
-            <div>
-              <strong>PP-OCR v5 mobile</strong>
-              <span>轻量 OCR，适合实时字幕</span>
+            <div class="model-download-actions">
+              <n-button
+                v-if="!downloadTaskFor(model.id) || downloadTaskFor(model.id)?.status === 'idle' || downloadTaskFor(model.id)?.status === 'cancelled' || downloadTaskFor(model.id)?.status === 'error'"
+                secondary
+                size="small"
+                @click="handleDownload(model.id)"
+              >
+                下载
+              </n-button>
+              <n-button
+                v-else-if="downloadTaskFor(model.id)?.status === 'downloading'"
+                secondary
+                size="small"
+                @click="handleCancelDownload(model.id)"
+              >
+                取消
+              </n-button>
+              <n-tag v-else-if="downloadTaskFor(model.id)?.status === 'completed'" type="success" size="small" round>已完成</n-tag>
+              <n-tag v-else-if="downloadTaskFor(model.id)?.status === 'error'" type="error" size="small" round>失败</n-tag>
             </div>
-            <n-button secondary size="small" disabled>下载</n-button>
-          </div>
-          <div class="model-download-item">
-            <div>
-              <strong>PP-OCR v5 server</strong>
-              <span>高精度 OCR，适合批量图片</span>
-            </div>
-            <n-button secondary size="small" disabled>下载</n-button>
           </div>
         </div>
-        <p class="settings-help">下载能力规划中，当前为占位展示；路径配置与保存已可用。</p>
+        <p class="settings-help">下载由后端 <code>start_model_download</code> 发起，经 <code>model-download-progress</code> 事件推送进度；完成后自动在本地 <code>downloads/&lt;modelId&gt;</code> 落盘并可注册到上方本地模型。</p>
       </n-card>
+
 
       <!-- 本地模型 -->
       <n-card class="settings-card settings-card-wide" :bordered="false">

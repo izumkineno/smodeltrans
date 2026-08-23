@@ -68,11 +68,15 @@
 .model-download-item > div {
   display: flex;
   min-width: 0;
+  flex: 1;
   flex-direction: column;
   gap: 3px;
 }
 
 .model-download-item strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   color: var(--text);
   font-size: 13px;
 }
@@ -80,6 +84,24 @@
 .model-download-item span {
   color: var(--text-muted);
   font-size: 11px;
+}
+
+.model-download-files {
+  color: var(--text-soft);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+}
+
+.model-download-message {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-style: italic;
+}
+
+.model-download-actions {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
 }
 
 @media (max-width: 900px) {
