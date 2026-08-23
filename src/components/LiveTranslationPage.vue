@@ -86,6 +86,8 @@ let debugUnlisten: UnlistenFn | undefined;
 let bindingVersion = 0;
 const isCapturingTriggerKey = ref(false);
 const triggerKeyCaptureHint = ref("");
+const showAdvancedConfig = ref(false);
+const showDiagnostics = ref(false);
 
 function emptyMetrics(): LiveMetrics {
   return {
@@ -607,7 +609,7 @@ onBeforeUnmount(cleanupPage);
           <p>先选择目标窗口与目标语言，再开始实时会话；运行中的暂停、重选区和停止操作集中在会话控制中。</p>
         </div>
       </div>
-    <div class="live-workspace-grid">
+    <div class="live-workspace-grid" :class="{ 'has-active-session': hasActiveSession }">
       <n-card class="live-card" :bordered="false">
         <div class="card-heading">
           <div>
@@ -682,7 +684,7 @@ onBeforeUnmount(cleanupPage);
         </n-button>
       </n-card>
 
-      <n-card class="live-card" :bordered="false">
+      <n-card class="live-card live-card--session" :bordered="false">
         <div class="card-heading">
           <div>
             <span class="step-index">02</span>
@@ -774,9 +776,17 @@ onBeforeUnmount(cleanupPage);
         <div>
           <p class="panel-kicker">Secondary configuration</p>
           <h3 id="live-secondary-config-title">启动前配置</h3>
-          <p>显示、翻译与识别设置按需调整，并在下一次开始抓取字幕时应用。</p>
+          <p>显示、翻译与识别设置按需调整，并在下一次开始抓取字幕时应用。运行中仅显示设置可即时保存。</p>
+        </div>
+        <div class="live-section-heading-actions">
+          <n-tag v-if="hasActiveSession" size="small" type="warning">运行中</n-tag>
+          <n-button secondary size="small" @click="showAdvancedConfig = !showAdvancedConfig">
+            {{ showAdvancedConfig ? "收起" : "展开配置" }}
+          </n-button>
         </div>
       </div>
+      <div v-show="showAdvancedConfig" class="live-config-collapsible">
+        <div class="live-config-grid">
     <n-card class="live-card live-settings-card" :bordered="false">
       <div class="card-heading">
         <div>
@@ -792,7 +802,7 @@ onBeforeUnmount(cleanupPage);
       </div>
 
       <div class="live-settings-grid">
-        <label class="live-field live-field-wide">
+        <label class="live-field">
           <span>显示模式</span>
           <n-select
             v-model:value="liveOverlaySettings.mode"
@@ -1103,9 +1113,9 @@ onBeforeUnmount(cleanupPage);
         }}
       </n-alert>
     </n-card>
+        </div>
+      </div>
     </section>
-
-
 
     <section class="live-observability" aria-labelledby="live-observability-title">
       <div class="live-section-heading">
@@ -1114,8 +1124,16 @@ onBeforeUnmount(cleanupPage);
           <h3 id="live-observability-title">运行数据与诊断</h3>
           <p>指标和调试记录用于会话运行中的状态观察与问题排查，位于主要流程之后。</p>
         </div>
+        <div class="live-section-heading-actions">
+          <n-tag v-if="debugRecords.length" size="small" round>{{ debugRecords.length }}</n-tag>
+          <n-button secondary size="small" @click="showDiagnostics = !showDiagnostics">
+            {{ showDiagnostics ? "收起" : "展开诊断" }}
+          </n-button>
+        </div>
       </div>
-    <n-card class="metrics-card" :bordered="false">
+      <div v-show="showDiagnostics" class="live-observability-collapsible">
+        <div class="live-observability-grid">
+    <n-card class="live-card" :bordered="false">
       <div class="metrics-heading">
         <div>
           <p class="panel-kicker">Live Metrics</p>
@@ -1147,7 +1165,7 @@ onBeforeUnmount(cleanupPage);
       </dl>
     </n-card>
 
-    <n-card class="debug-card" :bordered="false">
+    <n-card class="live-card" :bordered="false">
       <div class="debug-heading">
         <div>
           <p class="panel-kicker">Live Debug</p>
@@ -1187,6 +1205,8 @@ onBeforeUnmount(cleanupPage);
         </ol>
       </n-scrollbar>
     </n-card>
+        </div>
+      </div>
     </section>
 
 
