@@ -9,7 +9,6 @@ import {
   NEmpty,
   NInput,
   NProgress,
-  NSelect,
   NSpin,
   NSpace,
   NSwitch,

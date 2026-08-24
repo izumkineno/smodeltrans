@@ -323,6 +323,121 @@ a:focus-visible {
   min-height: 0;
   flex: 1;
 }
+.sidebar {
+  transition: flex-basis 0.2s ease, width 0.2s ease;
+}
+
+.sidebar.is-collapsed {
+  flex: 0 0 64px;
+}
+
+.sidebar-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.sidebar.is-collapsed .sidebar-toggle {
+  justify-content: center;
+  padding: 10px 8px 8px;
+}
+
+.sidebar-toggle-btn {
+  flex-shrink: 0;
+}
+
+.sidebar-toggle-label {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.sidebar-collapse-icon {
+  display: block;
+  transition: transform 0.2s ease;
+}
+
+.sidebar-collapse-icon.is-collapsed {
+  transform: rotate(180deg);
+}
+
+.sidebar.is-collapsed .nav-heading,
+.sidebar.is-collapsed .nav-context,
+.sidebar.is-collapsed .provider-card div,
+.sidebar.is-collapsed .sidebar-build,
+.sidebar.is-collapsed .nav-option-description {
+  display: none;
+}
+
+.sidebar.is-collapsed .sidebar-nav {
+  gap: 12px;
+  padding: 0 0 12px;
+}
+
+.sidebar.is-collapsed .nav-section {
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.sidebar.is-collapsed .nav-section-primary {
+  padding: 6px 0 4px;
+}
+
+.sidebar.is-collapsed .sidebar-bottom {
+  align-items: center;
+  padding: 10px 8px;
+}
+
+.sidebar.is-collapsed .provider-card {
+  justify-content: center;
+  padding: 8px;
+  gap: 0;
+}
+
+.sidebar.is-collapsed .provider-card .provider-indicator {
+  margin: 0;
+}
+.sidebar.is-collapsed .n-menu {
+  padding: 0;
+}
+
+.sidebar.is-collapsed .n-menu--collapsed {
+  width: 100%;
+}
+
+.sidebar.is-collapsed .n-menu-item {
+  margin: 2px 0;
+}
+
+.sidebar.is-collapsed .n-menu-item-content__icon {
+  margin-right: 0 !important;
+}
+
+.sidebar.is-collapsed .n-menu-item-content__icon {
+  margin-right: 0 !important;
+}
+
+.sidebar.is-collapsed .n-menu-item-content .n-menu-item-content-header,
+.sidebar.is-collapsed .n-menu-item-content__extra,
+.sidebar.is-collapsed .n-menu-item-content-header__extra {
+  display: none !important;
+}
+
+.sidebar.is-collapsed .n-menu-item-content--collapsed {
+  justify-content: center;
+}
+.sidebar.is-collapsed .sidebar-toggle {
+  border-bottom-color: transparent;
+}
+
+.sidebar.is-collapsed .provider-card {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: 8px;
+}
 
 .sidebar-header {
   padding: 24px 20px 22px;
@@ -1449,9 +1564,12 @@ h1 {
 
 
   .sidebar {
-    display: none;
+    display: flex;
   }
 
+  .workspace-shell {
+    flex-direction: row;
+  }
   .content {
     padding: 22px 16px 16px;
   }

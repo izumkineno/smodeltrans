@@ -57,6 +57,24 @@ export const MODELSCOPE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
     recommended: true,
   },
   {
+    id: "hy-mt2-1.8b-q6k",
+    name: "Hy-MT2 1.8B Q6_K",
+    description: "多语言翻译核心，ModelScope: LLM-Research/Hy-MT2",
+    repoId: "LLM-Research/Hy-MT2-1.8B",
+    files: ["Hy-MT2-1.8B-Q6_K.gguf"],
+    sizeText: "~1.5 GB",
+    kind: "translation",
+  },
+  {
+    id: "hy-mt2-1.8b-q8",
+    name: "Hy-MT2 1.8B Q8_0",
+    description: "多语言翻译核心，ModelScope: LLM-Research/Hy-MT2",
+    repoId: "LLM-Research/Hy-MT2-1.8B",
+    files: ["Hy-MT2-1.8B-Q8_0.gguf"],
+    sizeText: "~1.9 GB",
+    kind: "translation",
+  },
+  {
     id: "ppocr-v5-mobile",
     name: "PP-OCR v5 mobile",
     description: "轻量检测+识别，适合实时字幕",
@@ -97,8 +115,17 @@ export const MODELSCOPE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
     kind: "ocr",
     ocrVariant: "v6-small",
   },
+  {
+    id: "ppocr-v6-medium",
+    name: "PP-OCR v6 medium",
+    description: "高精度，适合离线批量",
+    repoId: "damo/PPOCR-v6-medium",
+    files: ["det.onnx", "rec.onnx"],
+    sizeText: "~158 MB",
+    kind: "ocr",
+    ocrVariant: "v6-medium",
+  },
 ];
-
 export const HUGGINGFACE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
   {
     id: "hy-mt2-1.8b-q4",
@@ -111,12 +138,44 @@ export const HUGGINGFACE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
     recommended: true,
   },
 ];
-
 export function listDownloadableModels(source: DownloadSource): DownloadableModel[] {
   return source === "modelscope" ? MODELSCOPE_DOWNLOADABLE_MODELS : HUGGINGFACE_DOWNLOADABLE_MODELS;
 }
 
-/** 浏览器预览时无 Tauri 后端，直接走前端模拟进度 */
+export interface DownloadFamily {
+  id: string;
+  name: string;
+  description: string;
+  kind: "translation" | "ocr" | "mixed";
+  models: DownloadableModel[];
+}
+
+export function listDownloadFamilies(source: DownloadSource): DownloadFamily[] {
+  const models = listDownloadableModels(source);
+  const translation = models.filter((model) => model.kind === "translation");
+  const ocr = models.filter((model) => model.kind === "ocr");
+  const families: DownloadFamily[] = [];
+  if (translation.length) {
+    families.push({
+      id: "translation",
+      name: "Hy-MT2 翻译模型族",
+      description: "ModelScope LLM-Research/Hy-MT2 系列，GGUF 量化",
+      kind: "translation",
+      models: translation,
+    });
+  }
+  if (ocr.length) {
+    families.push({
+      id: "ppocr",
+      name: "PP-OCR 识别模型族",
+      description: "PaddleOCR V5/V6 检测+识别，适配实时与批量",
+      kind: "ocr",
+      models: ocr,
+    });
+  }
+  return families;
+}
+
 function isDesktopRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, h, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { CSSProperties } from "vue";
 import { getCurrentWindow, Window } from "@tauri-apps/api/window";
 import {
@@ -579,6 +579,79 @@ let windowStateUnlisten: (() => void) | undefined;
 let windowStateListenerActive = true;
 let windowCloseUnlisten: (() => void) | undefined;
 let closeCleanupInFlight = false;
+const SIDEBAR_COLLAPSED_KEY = "smodeltrans:sidebar-collapsed";
+
+function loadSidebarCollapsed(): boolean {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return false;
+    const raw = window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY);
+    return raw === "1" || raw === "true";
+  } catch {
+    return false;
+  }
+}
+
+const sidebarCollapsed = ref(loadSidebarCollapsed());
+
+watch(sidebarCollapsed, (value) => {
+  try {
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, value ? "1" : "0");
+  } catch {
+    // ignore storage errors
+  }
+});
+
+function toggleSidebarCollapsed(): void {
+  sidebarCollapsed.value = !sidebarCollapsed.value;
+}
+
+const sidebarSiderWidth = 208;
+const sidebarCollapsedWidth = 64;
+const SIDEBAR_AUTO_COLLAPSE_BREAKPOINT = 720;
+
+function syncSidebarAutoCollapse(): void {
+  if (typeof window === "undefined") return;
+  if (window.innerWidth <= SIDEBAR_AUTO_COLLAPSE_BREAKPOINT && !sidebarCollapsed.value) {
+    sidebarCollapsed.value = true;
+  }
+}
+
+let sidebarAutoCollapseUnlisten: (() => void) | undefined;
+
+function bindSidebarAutoCollapse(): void {
+  if (typeof window === "undefined") return;
+  syncSidebarAutoCollapse();
+  const handler = () => syncSidebarAutoCollapse();
+  window.addEventListener("resize", handler);
+  sidebarAutoCollapseUnlisten = () => window.removeEventListener("resize", handler);
+  // 额外使用 matchMedia 监听断点，兼容窗口未触发 resize 的情况
+  try {
+    const media = window.matchMedia(`(max-width: ${SIDEBAR_AUTO_COLLAPSE_BREAKPOINT}px)`);
+    const mediaHandler = (event: MediaQueryListEvent) => {
+      if (event.matches && !sidebarCollapsed.value) {
+        sidebarCollapsed.value = true;
+      }
+    };
+    // 兼容旧版 addListener
+    if (typeof media.addEventListener === "function") {
+      media.addEventListener("change", mediaHandler);
+      const prev = sidebarAutoCollapseUnlisten;
+      sidebarAutoCollapseUnlisten = () => {
+        prev?.();
+        media.removeEventListener("change", mediaHandler);
+      };
+    } else if (typeof (media as unknown as { addListener: (cb: (e: MediaQueryListEvent) => void) => void }).addListener === "function") {
+      (media as unknown as { addListener: (cb: (e: MediaQueryListEvent) => void) => void }).addListener(mediaHandler);
+    }
+  } catch {
+    // ignore media query errors
+  }
+}
+
+function unbindSidebarAutoCollapse(): void {
+  sidebarAutoCollapseUnlisten?.();
+  sidebarAutoCollapseUnlisten = undefined;
+}
 
 const settingsStatusLabel = computed(() => {
   if (!backendStatus.value) {
@@ -823,6 +896,7 @@ onMounted(() => {
   void syncWindowState();
   void bindWindowStateListener();
   void bindMainWindowCloseListener();
+  bindSidebarAutoCollapse();
   if (isDesktopRuntime) {
     void fetchSharedBackendStatus().catch(() => undefined);
     void fetchSharedModelRuntimeStatus().catch(() => undefined);
@@ -835,6 +909,7 @@ onBeforeUnmount(() => {
   windowStateUnlisten = undefined;
   windowCloseUnlisten?.();
   windowCloseUnlisten = undefined;
+  unbindSidebarAutoCollapse();
 });
 </script>
 
@@ -914,7 +989,43 @@ onBeforeUnmount(() => {
         </header>
 
         <n-layout has-sider class="workspace-shell">
-          <n-layout-sider class="sidebar" bordered :width="208" :native-scrollbar="false">
+          <n-layout-sider
+            class="sidebar"
+            :class="{ 'is-collapsed': sidebarCollapsed }"
+            bordered
+            :width="sidebarSiderWidth"
+            :collapsed-width="sidebarCollapsedWidth"
+            :collapsed="sidebarCollapsed"
+            :show-trigger="false"
+            collapse-mode="width"
+            :native-scrollbar="false"
+          >
+            <div class="sidebar-toggle">
+              <n-button
+                quaternary
+                circle
+                size="small"
+                class="sidebar-toggle-btn"
+                :aria-label="sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'"
+                :title="sidebarCollapsed ? '展开' : '折叠'"
+                @click="toggleSidebarCollapsed"
+              >
+                <template #icon>
+                  <n-icon size="16" class="sidebar-collapse-icon" :class="{ 'is-collapsed': sidebarCollapsed }">
+                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path
+                        d="M10.5 3.5 6 8l4.5 4.5"
+                        stroke="currentColor"
+                        stroke-width="1.5"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      />
+                    </svg>
+                  </n-icon>
+                </template>
+              </n-button>
+              <span v-show="!sidebarCollapsed" class="sidebar-toggle-label">收起</span>
+            </div>
 
             <nav class="sidebar-nav" aria-label="主导航">
               <section class="nav-section nav-section-primary" aria-labelledby="nav-primary-heading">
@@ -923,6 +1034,9 @@ onBeforeUnmount(() => {
                 <n-menu
                   :value="activeMenu"
                   :icon-size="16"
+                  :collapsed="sidebarCollapsed"
+                  :collapsed-width="64"
+                  :collapsed-icon-size="20"
                   :options="primaryMenuOptions"
                   @update:value="handleMenuUpdate"
                 />
@@ -933,6 +1047,9 @@ onBeforeUnmount(() => {
                 <n-menu
                   :value="activeMenu"
                   :icon-size="16"
+                  :collapsed="sidebarCollapsed"
+                  :collapsed-width="64"
+                  :collapsed-icon-size="20"
                   :options="oneShotMenuOptions"
                   @update:value="handleMenuUpdate"
                 />
@@ -943,6 +1060,9 @@ onBeforeUnmount(() => {
                 <n-menu
                   :value="activeMenu"
                   :icon-size="16"
+                  :collapsed="sidebarCollapsed"
+                  :collapsed-width="64"
+                  :collapsed-icon-size="20"
                   :options="operationsMenuOptions"
                   @update:value="handleMenuUpdate"
                 />

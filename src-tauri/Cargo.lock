@@ -4587,6 +4587,7 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "tauri-plugin-mcp-bridge",
  "tokenizers",
+ "tokio",
  "toml 0.8.23",
  "unicode-segmentation",
  "windows 0.61.3",

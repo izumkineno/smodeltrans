@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { open as openNativeDialog } from "@tauri-apps/plugin-dialog";
 import {
   NAlert,
@@ -40,7 +40,7 @@ import {
   type DownloadSource,
   type DownloadTaskState,
   cancelModelDownload,
-  listDownloadableModels,
+  listDownloadFamilies,
   listenDownloadProgress,
   startModelDownload,
 } from "../services/model-download-provider";
@@ -88,14 +88,32 @@ const downloadSourceOptions: Array<{ label: string; value: DownloadSource }> = [
   { label: "Hugging Face", value: "huggingface" },
 ];
 const downloadTasks = ref<Record<string, DownloadTaskState>>({});
-const downloadableModels = computed(() => listDownloadableModels(downloadSource.value));
+const downloadFamilies = computed(() => listDownloadFamilies(downloadSource.value));
+const selectedFamilyModel = ref<Record<string, string>>({});
+
+watch(
+  downloadFamilies,
+  (families) => {
+    for (const family of families) {
+      if (!selectedFamilyModel.value[family.id]) {
+        const recommended = family.models.find((model) => model.recommended);
+        selectedFamilyModel.value[family.id] = recommended?.id ?? family.models[0]?.id ?? "";
+      }
+    }
+  },
+  { immediate: true },
+);
+
+function familySelectedModel(familyId: string): string {
+  return selectedFamilyModel.value[familyId] ?? "";
+}
 
 function downloadTaskFor(modelId: string): DownloadTaskState | undefined {
   return downloadTasks.value[modelId];
 }
 
 function isModelInstalled(modelId: string): boolean {
-  if (modelId === "hy-mt2-1.8b-q4") {
+  if (modelId.startsWith("hy-mt2")) {
     return Boolean(modelHyPath.value);
   }
   const ocrVariantMap: Record<string, string> = {
@@ -103,6 +121,7 @@ function isModelInstalled(modelId: string): boolean {
     "ppocr-v5-server": "v5-server",
     "ppocr-v6-tiny": "v6-tiny",
     "ppocr-v6-small": "v6-small",
+    "ppocr-v6-medium": "v6-medium",
   };
   const variant = ocrVariantMap[modelId];
   if (variant) {
@@ -110,6 +129,28 @@ function isModelInstalled(modelId: string): boolean {
   }
   return false;
 }
+
+
+function selectedModelForFamily(familyId: string) {
+  const family = downloadFamilies.value.find((family) => family.id === familyId);
+  if (!family) return undefined;
+  const selectedId = familySelectedModel(familyId);
+  return family.models.find((model) => model.id === selectedId) ?? family.models[0];
+}
+
+function familyOptions(familyId: string) {
+  const family = downloadFamilies.value.find((family) => family.id === familyId);
+  if (!family) return [];
+  return family.models.map((model) => ({
+    label: `${model.name} · ${model.sizeText}${model.recommended ? " · 推荐" : ""}`,
+    value: model.id,
+  }));
+}
+
+function handleFamilySelect(familyId: string, value: string) {
+  selectedFamilyModel.value[familyId] = value;
+}
+
 
 function setSettingsFeedback(
   type: WorkspaceToastType,
@@ -854,49 +895,65 @@ onBeforeUnmount(() => {
           默认从 <strong>ModelScope</strong> 拉取（<code>modelscope.cn/models/&lt;repo&gt;/resolve/master</code>），由 Rust 后端 <code>model_download</code> 以 ModelScope 库逻辑进行流式下载与进度上报。切换为 Hugging Face 时走对应源。
         </p>
         <div class="model-download-list">
-          <div v-for="model in downloadableModels" :key="model.id" class="model-download-item">
-            <div>
-              <strong>
-                {{ model.name }}
-                <n-tag v-if="model.recommended" size="tiny" type="success" round>推荐</n-tag>
-                <n-tag v-if="isModelInstalled(model.id)" size="tiny" type="info" round>已安装</n-tag>
-              </strong>
-              <span>{{ model.description }} · {{ model.repoId }} · {{ model.sizeText }}</span>
-              <span class="model-download-files">{{ model.files.join(", ") }}</span>
-              <n-progress
-                v-if="downloadTaskFor(model.id)?.status === 'downloading'"
-                :percentage="downloadTaskFor(model.id)?.progress ?? 0"
-                :show-indicator="true"
-                :height="6"
-                style="margin-top: 6px"
+          <div v-for="family in downloadFamilies" :key="family.id" class="model-download-family">
+            <div class="model-download-family-header">
+              <div>
+                <strong>
+                  {{ family.name }}
+                  <n-tag v-if="family.kind === 'translation'" size="tiny" type="info" round>翻译</n-tag>
+                  <n-tag v-else size="tiny" type="warning" round>OCR</n-tag>
+                </strong>
+                <span>{{ family.description }}</span>
+              </div>
+              <n-select
+                :value="familySelectedModel(family.id)"
+                :options="familyOptions(family.id)"
+                size="small"
+                style="min-width: 260px; max-width: 360px"
+                :aria-label="family.name + ' 选择'"
+                @update:value="val => handleFamilySelect(family.id, val)"
               />
-              <span v-if="downloadTaskFor(model.id)?.message" class="model-download-message">
-                {{ downloadTaskFor(model.id)?.message }}
-              </span>
             </div>
-            <div class="model-download-actions">
-              <n-button
-                v-if="!downloadTaskFor(model.id) || downloadTaskFor(model.id)?.status === 'idle' || downloadTaskFor(model.id)?.status === 'cancelled' || downloadTaskFor(model.id)?.status === 'error'"
-                secondary
-                size="small"
-                @click="handleDownload(model.id)"
-              >
-                下载
-              </n-button>
-              <n-button
-                v-else-if="downloadTaskFor(model.id)?.status === 'downloading'"
-                secondary
-                size="small"
-                @click="handleCancelDownload(model.id)"
-              >
-                取消
-              </n-button>
-              <n-tag v-else-if="downloadTaskFor(model.id)?.status === 'completed'" type="success" size="small" round>已完成</n-tag>
-              <n-tag v-else-if="downloadTaskFor(model.id)?.status === 'error'" type="error" size="small" round>失败</n-tag>
-            </div>
+            <template v-if="selectedModelForFamily(family.id)">
+              <div class="model-download-family-detail">
+                <span>{{ selectedModelForFamily(family.id)?.description }} · {{ selectedModelForFamily(family.id)?.repoId }} · {{ selectedModelForFamily(family.id)?.sizeText }}</span>
+                <span class="model-download-files">{{ selectedModelForFamily(family.id)?.files.join(", ") }}</span>
+                <n-tag v-if="isModelInstalled(selectedModelForFamily(family.id)?.id ?? '')" size="tiny" type="success" round>已安装</n-tag>
+                <n-progress
+                  v-if="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'downloading'"
+                  :percentage="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.progress ?? 0"
+                  :show-indicator="true"
+                  :height="6"
+                  style="margin-top: 6px"
+                />
+                <span v-if="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.message" class="model-download-message">
+                  {{ downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.message }}
+                </span>
+              </div>
+              <div class="model-download-actions">
+                <n-button
+                  v-if="!downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '') || downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'idle' || downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'cancelled' || downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'error'"
+                  secondary
+                  size="small"
+                  @click="handleDownload(selectedModelForFamily(family.id)?.id ?? '')"
+                >
+                  下载
+                </n-button>
+                <n-button
+                  v-else-if="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'downloading'"
+                  secondary
+                  size="small"
+                  @click="handleCancelDownload(selectedModelForFamily(family.id)?.id ?? '')"
+                >
+                  取消
+                </n-button>
+                <n-tag v-else-if="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'completed'" type="success" size="small" round>已完成</n-tag>
+                <n-tag v-else-if="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'error'" type="error" size="small" round>失败</n-tag>
+              </div>
+            </template>
           </div>
         </div>
-        <p class="settings-help">下载由后端 <code>start_model_download</code> 发起，经 <code>model-download-progress</code> 事件推送进度；完成后自动在本地 <code>downloads/&lt;modelId&gt;</code> 落盘并可注册到上方本地模型。</p>
+        <p class="settings-help">下载由后端 <code>start_model_download</code> 发起，经 <code>model-download-progress</code> 事件推送进度；完成后自动在本地 <code>downloads/&lt;modelId&gt;</code> 落盘并可注册到上方本地模型。族内通过下拉选择具体版本。</p>
       </n-card>
 
 

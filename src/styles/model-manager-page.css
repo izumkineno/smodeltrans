@@ -97,11 +97,56 @@
   font-size: 11px;
   font-style: italic;
 }
-
 .model-download-actions {
   display: flex;
   align-items: center;
   flex-shrink: 0;
+}
+
+/* 族卡片：合并模型族后，族内通过下拉选择具体版本 */
+.model-download-family {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--divider);
+  border-radius: 4px;
+  background: var(--surface-soft);
+}
+
+.model-download-family-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.model-download-family-header > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.model-download-family-header strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.model-download-family-header span {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.model-download-family-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
 }
 
 @media (max-width: 900px) {
@@ -113,5 +158,16 @@
 @media (max-width: 720px) {
   .model-manager-header {
     flex-direction: column;
+  }
+
+  .model-download-item,
+  .model-download-family-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .model-download-actions {
+    width: 100%;
+    justify-content: flex-end;
   }
 }

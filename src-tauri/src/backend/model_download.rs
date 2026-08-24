@@ -107,6 +107,28 @@ fn downloadable_models() -> Vec<DownloadableModel> {
             recommended: true,
         },
         DownloadableModel {
+            id: "hy-mt2-1.8b-q6k".to_owned(),
+            name: "Hy-MT2 1.8B Q6_K".to_owned(),
+            description: "多语言翻译核心，ModelScope: LLM-Research/Hy-MT2".to_owned(),
+            repo_id: "LLM-Research/Hy-MT2-1.8B".to_owned(),
+            files: vec!["Hy-MT2-1.8B-Q6_K.gguf".to_owned()],
+            size_text: "~1.5 GB".to_owned(),
+            kind: "translation".to_owned(),
+            ocr_variant: None,
+            recommended: false,
+        },
+        DownloadableModel {
+            id: "hy-mt2-1.8b-q8".to_owned(),
+            name: "Hy-MT2 1.8B Q8_0".to_owned(),
+            description: "多语言翻译核心，ModelScope: LLM-Research/Hy-MT2".to_owned(),
+            repo_id: "LLM-Research/Hy-MT2-1.8B".to_owned(),
+            files: vec!["Hy-MT2-1.8B-Q8_0.gguf".to_owned()],
+            size_text: "~1.9 GB".to_owned(),
+            kind: "translation".to_owned(),
+            ocr_variant: None,
+            recommended: false,
+        },
+        DownloadableModel {
             id: "ppocr-v5-mobile".to_owned(),
             name: "PP-OCR v5 mobile".to_owned(),
             description: "轻量检测+识别，适合实时字幕".to_owned(),
@@ -148,6 +170,17 @@ fn downloadable_models() -> Vec<DownloadableModel> {
             size_text: "~22 MB".to_owned(),
             kind: "ocr".to_owned(),
             ocr_variant: Some("v6-small".to_owned()),
+            recommended: false,
+        },
+        DownloadableModel {
+            id: "ppocr-v6-medium".to_owned(),
+            name: "PP-OCR v6 medium".to_owned(),
+            description: "高精度，适合离线批量".to_owned(),
+            repo_id: "damo/PPOCR-v6-medium".to_owned(),
+            files: vec!["det.onnx".to_owned(), "rec.onnx".to_owned()],
+            size_text: "~158 MB".to_owned(),
+            kind: "ocr".to_owned(),
+            ocr_variant: Some("v6-medium".to_owned()),
             recommended: false,
         },
     ]
@@ -211,7 +244,8 @@ pub async fn start_model_download(
 
     // 已在下载中则直接返回当前状态
     {
-        let map = task_map().lock().map_err(|_| "锁失败".to_owned())?;
+        let map_arc = task_map();
+        let map = map_arc.lock().map_err(|_| "锁失败".to_owned())?;
         if let Some(existing) = map.get(&model_id) {
             if existing.status == DownloadStatus::Downloading {
                 return Ok(existing.clone());
@@ -243,7 +277,8 @@ pub async fn start_model_download(
     // 读取模型根目录用于占位文件落盘（不实际下载网络，仅模拟进度）
     let model_root: PathBuf = {
         let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
-        guard.model_root.clone()
+        let settings = guard.as_ref().map_err(|err| err.clone())?;
+        settings.model_root.clone()
     };
 
     let app_clone = app.clone();
@@ -279,8 +314,11 @@ pub async fn start_model_download(
                     total_bytes: u64::from(total_steps),
                     message: Some("已取消".to_owned()),
                 };
-                if let Ok(mut map) = task_map().lock() {
-                    map.insert(model_id_clone.clone(), cancelled_state.clone());
+                {
+                    let map_arc = task_map();
+                    if let Ok(mut map) = map_arc.lock() {
+                        map.insert(model_id_clone.clone(), cancelled_state.clone());
+                    }
                 }
                 emit_progress(&app_clone, &cancelled_state);
                 return;
@@ -304,8 +342,11 @@ pub async fn start_model_download(
                 },
             };
 
-            if let Ok(mut map) = task_map().lock() {
-                map.insert(model_id_clone.clone(), progress_state.clone());
+            {
+                let map_arc = task_map();
+                if let Ok(mut map) = map_arc.lock() {
+                    map.insert(model_id_clone.clone(), progress_state.clone());
+                }
             }
             emit_progress(&app_clone, &progress_state);
 
@@ -321,21 +362,24 @@ pub async fn start_model_download(
 
     Ok(initial)
 }
-
 #[tauri::command]
 pub fn cancel_model_download(request: CancelDownloadRequest) -> Result<(), String> {
     let model_id = request.model_id.trim().to_owned();
     if model_id.is_empty() {
         return Err("modelId 不能为空".to_owned());
     }
-    let mut flags = cancel_flags().lock().map_err(|_| "锁失败".to_owned())?;
+    let flags_arc = cancel_flags();
+    let mut flags = flags_arc.lock().map_err(|_| "锁失败".to_owned())?;
     flags.insert(model_id.clone(), true);
 
-    if let Ok(mut map) = task_map().lock() {
-        if let Some(state) = map.get_mut(&model_id) {
-            if state.status == DownloadStatus::Downloading {
-                state.status = DownloadStatus::Cancelled;
-                state.message = Some("已取消".to_owned());
+    {
+        let map_arc = task_map();
+        if let Ok(mut map) = map_arc.lock() {
+            if let Some(state) = map.get_mut(&model_id) {
+                if state.status == DownloadStatus::Downloading {
+                    state.status = DownloadStatus::Cancelled;
+                    state.message = Some("已取消".to_owned());
+                }
             }
         }
     }

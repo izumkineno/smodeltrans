@@ -1,4 +1,3 @@
-/// <reference lib="esnext.promise" />
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 export const MAX_IMAGE_PIXELS = 20_000_000;
 
@@ -35,23 +34,22 @@ export function validateImageFile(file: File): string | null {
 }
 
 export function validateImagePreview(previewUrl: string): Promise<string | null> {
-  const { promise, resolve } = Promise.withResolvers<string | null>();
-  const image = new Image();
+  return new Promise<string | null>((resolve) => {
+    const image = new Image();
 
-  image.onload = () => {
-    const pixelCount = image.naturalWidth * image.naturalHeight;
-    resolve(
-      pixelCount > MAX_IMAGE_PIXELS
-        ? "图片像素不能超过 20 MP。"
-        : null,
-    );
-  };
-  image.onerror = () => {
-    resolve("图片无法解码，请选择其他文件。");
-  };
-  image.src = previewUrl;
-
-  return promise;
+    image.onload = () => {
+      const pixelCount = image.naturalWidth * image.naturalHeight;
+      resolve(
+        pixelCount > MAX_IMAGE_PIXELS
+          ? "图片像素不能超过 20 MP。"
+          : null,
+      );
+    };
+    image.onerror = () => {
+      resolve("图片无法解码，请选择其他文件。");
+    };
+    image.src = previewUrl;
+  });
 }
 
 export function createImagePreview(file: File): string {
