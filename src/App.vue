@@ -931,10 +931,25 @@ onBeforeUnmount(() => {
           @dblclick="handleTitlebarDoubleClick"
         >
           <div class="titlebar-brand" data-tauri-drag-region>
-            <span class="brand-mark" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none">
-                <path d="M5 5h5v5H5zM14 5h5v5h-5zM5 14h5v5H5z" fill="currentColor" />
-                <path d="M14 14h5M16.5 11.5V19M14 17h5" stroke="currentColor" stroke-width="1.7" />
+            <span class="brand-mark brand-mark--windows" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <rect width="24" height="24" rx="6" fill="#0F6CBD"/>
+                <rect x="3.5" y="3.5" width="17" height="13" rx="2" fill="white" stroke="#E1E8F5" stroke-width="0.6"/>
+                <rect x="3.5" y="3.5" width="17" height="4" rx="2" fill="#F3F6FD"/>
+                <rect x="3.5" y="6.5" width="17" height="1" fill="#F3F6FD"/>
+                <!-- Windows controls -->
+                <rect x="15.5" y="4.7" width="3" height="0.7" rx="0.35" fill="#8A8886"/>
+                <rect x="18.2" y="4.2" width="1.6" height="1.6" fill="none" stroke="#8A8886" stroke-width="0.5"/>
+                <path d="M19.8 4.4 20.6 5.2M20.6 4.4 19.8 5.2" stroke="#8A8886" stroke-width="0.5" stroke-linecap="square"/>
+                <!-- text lines -->
+                <rect x="6" y="9.5" width="8.5" height="1.3" rx="0.65" fill="#E1E8F5"/>
+                <rect x="6" y="11.7" width="7" height="1.3" rx="0.65" fill="#E1E8F5"/>
+                <rect x="6" y="13.9" width="9.5" height="1.3" rx="0.65" fill="#DBEAFE"/>
+                <!-- badge -->
+                <circle cx="17.2" cy="16.5" r="5.2" fill="white" stroke="#E1E8F5" stroke-width="0.6"/>
+                <circle cx="17.2" cy="16.5" r="4.4" fill="#F3F6FD"/>
+                <path d="M15.2 15.5H19.2M18.1 14.4 19.4 15.5 18.1 16.6" stroke="#0F6CBD" stroke-width="0.9" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+                <path d="M19.2 17.5H15.2M16.3 16.4 15 17.5 16.3 18.6" stroke="#115EA3" stroke-width="0.9" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
               </svg>
             </span>
             <span class="titlebar-name">smodeltrans</span>

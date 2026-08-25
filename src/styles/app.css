@@ -194,6 +194,14 @@ a:focus-visible {
   background: var(--surface-active);
 }
 
+.brand-mark--windows {
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: #0F6CBD;
+  box-shadow: 0 1px 4px rgba(15, 108, 189, 0.18);
+}
+
 .brand-mark svg {
   width: 15px;
   height: 15px;

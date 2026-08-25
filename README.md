@@ -1,4 +1,4 @@
-# smodeltrans — 实时翻译工具
+# <img src="src-tauri/icons/icon.png" width="48" height="48" align="center" style="vertical-align: middle; border-radius: 12px;" /> smodeltrans — 实时翻译工具
 
 > Windows 原生实时翻译桌面应用：**窗口捕获 → PP-OCR → Hy-MT2** 全本地推理。Tauri 2 + Vue 3 + Candle，覆盖实时字幕、文本翻译、OCR、OCR 翻译与本地模型管理。
 
