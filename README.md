@@ -2,7 +2,7 @@
 
 > Windows 原生实时翻译桌面应用：**窗口捕获 → PP-OCR → Hy-MT2** 全本地推理。Tauri 2 + Vue 3 + Candle，覆盖实时字幕、文本翻译、OCR、OCR 翻译与本地模型管理。
 
-![实时翻译](docs/images/01-live-translation.webp)
+![实时翻译](docs/images/01-live-translation.png)
 
 ---
 
@@ -16,18 +16,17 @@
 
 ## 预览
 
-> 以下为 Web 预览（`bun run dev`）截图，真实窗口捕获、覆盖层、模型下载与 GPU 推理需在 **Windows Tauri 桌面端**运行。`Tauri` 边界内侧为真实 `candle`/`windows-capture` 调用。
+> 以下为 **Tauri 桌面端实捕**（`tauri-plugin-mcp-bridge` + `tauri-mcp webview-screenshot`）截图，`docs/images/01..07` 为 `1180×760` 原生窗口（`decorations: false`）捕获，非浏览器 `bun run dev` 预览。采集命令见下文“开发”一节。
 
 | 实时翻译（Live） | 文本翻译 | OCR |
 |---|---|---|
-| ![live](docs/images/01-live-translation.webp) | ![translate](docs/images/02-translate.webp) | ![ocr](docs/images/03-ocr.webp) |
+| ![live](docs/images/01-live-translation.png) | ![translate](docs/images/02-translate.png) | ![ocr](docs/images/03-ocr.png) |
 | 选择窗口 → ROI 窗口/全客户区 → 自动/按键触发 → 字幕或逐区覆盖 | 直通 Hy-MT2，无 OCR | 拖拽/粘贴图片，PP-OCR 本地识别 |
 
 | OCR 翻译 | 模型管理 | 设置 / 监控 |
 |---|---|---|
-| ![ocr-translate](docs/images/04-ocr-translate.webp) | ![model-manager](docs/images/05-model-manager.webp) | ![settings](docs/images/06-settings.webp) ![monitor](docs/images/07-model-monitor.webp) |
+| ![ocr-translate](docs/images/04-ocr-translate.png) | ![model-manager](docs/images/05-model-manager.png) | ![settings](docs/images/06-settings.png) ![monitor](docs/images/07-model-monitor.png) |
 | 图片 → OCR → 翻译一键完成 | Hy-MT2 3 档 + PP-OCR V5/V6 5 档，ModelScope 按需下载 | 主题/语言/提示词；运行时监控与空闲卸载 |
-
 ---
 
 ## 功能
@@ -181,6 +180,31 @@ cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --feature
 ```
 
 推荐：VS Code + Vue Official + Tauri + rust-analyzer。
+
+### Tauri 应用截图（tauri-mcp）
+
+本 README 的 `docs/images/01..07` 均通过 `tauri-plugin-mcp-bridge` + `tauri-mcp` 在真实 Tauri 窗口内采集，非浏览器预览：
+
+```bash
+# 1. 启动桌面端（已注册 mcp-bridge，仅 debug 生效）
+bun run tauri dev
+# 日志可见：[MCP][WS_SERVER][INFO] WebSocket server listening on: 0.0.0.0:9224
+
+# 2. 建立驱动会话
+tauri-mcp driver-session start --port 9224
+tauri-mcp driver-session status --json   # connected: true
+tauri-mcp manage-window --action list --json
+
+# 3. 路由跳转 + 截图（已验证 1180×760 原生窗口）
+tauri-mcp webview-execute-js --script "window.location.hash='#/live-translation'"
+tauri-mcp webview-screenshot --file docs/images/01-live-translation.png
+tauri-mcp webview-execute-js --script "window.location.hash='#/translate'"
+tauri-mcp webview-screenshot --file docs/images/02-translate.png
+# 同理：#/ocr、#/ocr-translate、#/model-manager、#/settings、#/model-monitor
+
+# 4. 结束会话
+tauri-mcp driver-session stop
+```
 
 文档：
 - 工程边界与首版工作流：[`docs/ENGINEERING_PLAN.md`](docs/ENGINEERING_PLAN.md)
