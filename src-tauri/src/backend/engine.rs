@@ -314,21 +314,6 @@ impl BackendEngine {
         Ok(output)
     }
 
-    pub(crate) fn translate_regions(
-        &mut self,
-        records: &mut [RegionRecord],
-        target_language: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<(), BackendFailure> {
-        self.translate_regions_with_progress(
-            records,
-            target_language,
-            cancellation,
-            false,
-            "",
-            |_, _| {},
-        )
-    }
 
     pub(crate) fn translate_live_regions(
         &mut self,
