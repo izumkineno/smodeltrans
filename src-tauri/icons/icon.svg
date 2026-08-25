@@ -1,0 +1,108 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+<title id="title">smodeltrans — Windows real-time translation</title>
+<desc id="desc">Windows Fluent icon: blue window with translation badge, optimized for Windows taskbar and CUDA desktop.</desc>
+<defs>
+  <!-- Windows 11 Fluent blue -->
+  <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+    <stop offset="0%" stop-color="#0F6CBD"/>
+    <stop offset="100%" stop-color="#115EA3"/>
+  </linearGradient>
+  <linearGradient id="win" x1="0%" y1="0%" x2="0%" y2="100%">
+    <stop offset="0%" stop-color="#FFFFFF"/>
+    <stop offset="100%" stop-color="#F3F6FD"/>
+  </linearGradient>
+  <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+    <stop offset="0%" stop-color="#0F6CBD"/>
+    <stop offset="100%" stop-color="#2B88D8"/>
+  </linearGradient>
+  <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+    <feDropShadow dx="0" dy="20" stdDeviation="28" flood-color="#0A3A66" flood-opacity="0.28"/>
+    <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#0A3A66" flood-opacity="0.18"/>
+  </filter>
+  <filter id="badgeShadow" x="-20%" y="-20%" width="140%" height="140%">
+    <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#0A3A66" flood-opacity="0.22"/>
+  </filter>
+</defs>
+
+<!-- Windows app background - 20% radius like Windows 11 -->
+<rect width="1024" height="1024" rx="184" fill="url(#bg)"/>
+<!-- Fluent acrylic highlight -->
+<rect width="1024" height="1024" rx="184" fill="none" stroke="white" stroke-opacity="0.12" stroke-width="2"/>
+<!-- Top highlight -->
+<rect x="2" y="2" width="1020" height="420" rx="182" fill="white" opacity="0.07"/>
+
+<!-- Window card — Windows 11 style -->
+<g filter="url(#shadow)">
+  <rect x="144" y="168" width="736" height="576" rx="16" fill="url(#win)" stroke="#E1E8F5" stroke-width="1.5"/>
+  <!-- Title bar — Windows puts controls on right -->
+  <rect x="144" y="168" width="736" height="56" rx="16" fill="#F3F6FD"/>
+  <rect x="144" y="200" width="736" height="24" fill="#F3F6FD"/>
+  <!-- Windows window controls (right) -->
+  <g opacity="0.95">
+    <rect x="760" y="168" width="64" height="56" rx="0" fill="none"/>
+    <path d="M 780 196 H 804" stroke="#605E5C" stroke-width="2.2" stroke-linecap="square"/>
+    <rect x="824" y="168" width="64" height="56" fill="none"/>
+    <rect x="840" y="184" width="20" height="20" fill="none" stroke="#605E5C" stroke-width="2"/>
+    <rect x="864" y="168" width="68" height="56" fill="none"/>
+    <path d="M 884 188 L 904 208 M 904 188 L 884 208" stroke="#605E5C" stroke-width="2.2" stroke-linecap="square"/>
+  </g>
+  <!-- App title — Segoe UI -->
+  <text x="172" y="202" font-family="'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif" font-size="20" font-weight="600" fill="#323130">smodeltrans</text>
+  <text x="305" y="202" font-family="'Segoe UI Variable', 'Segoe UI', system-ui" font-size="18" font-weight="400" fill="#605E5C">— 实时翻译</text>
+
+  <!-- Source text — muted, thicker for small sizes -->
+  <rect x="192" y="272" width="420" height="20" rx="10" fill="#E1E8F5"/>
+  <rect x="192" y="312" width="340" height="20" rx="10" fill="#E1E8F5"/>
+  <rect x="192" y="352" width="480" height="20" rx="10" fill="#E1E8F5"/>
+
+  <!-- Divider — Windows separator -->
+  <rect x="192" y="408" width="640" height="2" rx="1" fill="#EDF1FA"/>
+
+  <!-- Translated text — Windows accent tint -->
+  <rect x="192" y="440" width="400" height="20" rx="10" fill="#D6E8FA"/>
+  <rect x="192" y="480" width="460" height="20" rx="10" fill="#C7DCFA"/>
+  <rect x="192" y="520" width="340" height="20" rx="10" fill="#D6E8FA"/>
+  <rect x="192" y="560" width="520" height="20" rx="10" fill="#E1E8F5"/>
+  <rect x="192" y="600" width="380" height="20" rx="10" fill="#D6E8FA"/>
+
+  <!-- LIVE pill — Windows style, Segoe -->
+  <g transform="translate(632, 272)">
+    <rect x="0" y="0" width="148" height="32" rx="16" fill="#FFF4CE" stroke="#FDE683" stroke-width="1"/>
+    <circle cx="20" cy="16" r="8" fill="#D13438"/>
+    <circle cx="20" cy="16" r="12" fill="#D13438" opacity="0.14"/>
+    <text x="40" y="21.5" font-family="'Segoe UI Variable', 'Segoe UI'" font-size="14" font-weight="700" fill="#8A0B0E" letter-spacing="1.1">LIVE</text>
+    <!-- GPU dot — CUDA hint -->
+    <circle cx="132" cy="8" r="6" fill="#7FBA00" stroke="white" stroke-width="2"/>
+  </g>
+</g>
+
+<!-- Translation badge — Windows Fluent -->
+<g filter="url(#badgeShadow)">
+  <!-- Outer -->
+  <circle cx="728" cy="704" r="152" fill="white" stroke="#E1E8F5" stroke-width="2.5"/>
+  <!-- Inner - subtle blue -->
+  <circle cx="728" cy="704" r="136" fill="#F3F6FD"/>
+  <!-- Accent ring segment — Windows focus -->
+  <circle cx="728" cy="704" r="136" fill="none" stroke="url(#accent)" stroke-width="3" stroke-dasharray="140 280" stroke-dashoffset="70" opacity="0.9" stroke-linecap="round"/>
+  <!-- Arrows — Fluent arrow -->
+  <g transform="translate(728, 704)">
+    <!-- top -->
+    <path d="M -48 -16 H 48" stroke="#0F6CBD" stroke-width="16" stroke-linecap="round" fill="none"/>
+    <path d="M 28 -36 L 52 -16 L 28 4" stroke="#0F6CBD" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+    <!-- bottom -->
+    <path d="M 48 16 H -48" stroke="#115EA3" stroke-width="16" stroke-linecap="round" fill="none"/>
+    <path d="M -28 36 L -52 16 L -28 -4" stroke="#115EA3" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </g>
+  <!-- A — Segoe UI -->
+  <text x="658" y="658" text-anchor="middle" font-family="'Segoe UI Variable', 'Segoe UI', sans-serif" font-size="56" font-weight="800" fill="#323130">A</text>
+  <text x="662" y="678" text-anchor="middle" font-family="'Segoe UI Variable', 'Segoe UI'" font-size="11" font-weight="650" fill="#605E5C" letter-spacing="1.8">EN</text>
+  <!-- 文 — Microsoft YaHei, larger for Windows -->
+  <text x="800" y="764" text-anchor="middle" font-family="'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', sans-serif" font-size="54" font-weight="800" fill="#323130">文</text>
+  <text x="800" y="784" text-anchor="middle" font-family="'Segoe UI Variable', 'Segoe UI'" font-size="11" font-weight="650" fill="#605E5C" letter-spacing="1.8">中文</text>
+</g>
+
+<!-- Windows 11 window highlight — subtle -->
+<g opacity="0">
+  <rect x="144" y="168" width="736" height="576" rx="16" fill="none" stroke="white" stroke-width="1" opacity="0.5"/>
+</g>
+</svg>
