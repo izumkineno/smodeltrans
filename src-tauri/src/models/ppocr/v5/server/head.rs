@@ -5,7 +5,7 @@ use super::super::super::common::{
 };
 use anyhow::Result;
 use candle_core::Tensor;
-use candle_nn::{Module, VarBuilder, ops};
+use candle_nn::{VarBuilder, ops};
 #[derive(Clone, Debug)]
 struct DetSegmentationHead {
     conv_down: ConvNormAct,

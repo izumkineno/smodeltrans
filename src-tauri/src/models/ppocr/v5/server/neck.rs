@@ -3,7 +3,7 @@
 use super::super::super::common::{Activation, Conv2dLayer, ConvNormAct};
 use anyhow::{Context, Result};
 use candle_core::Tensor;
-use candle_nn::{Module, VarBuilder};
+use candle_nn::VarBuilder;
 #[derive(Clone, Debug)]
 struct DetIntraclassBlock {
     conv_reduce_channel: Conv2dLayer,

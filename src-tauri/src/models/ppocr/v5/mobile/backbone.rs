@@ -3,7 +3,7 @@
 use super::super::super::common::{Conv2dLayer, se_gate};
 use anyhow::{Context, Result};
 use candle_core::Tensor;
-use candle_nn::{BatchNorm, BatchNormConfig, Module, ModuleT, VarBuilder, batch_norm};
+use candle_nn::{BatchNorm, BatchNormConfig, ModuleT, VarBuilder, batch_norm};
 /// PaddleOCR's `make_divisible`: round up to the nearest divisor with a guard
 /// that prevents the result from falling below 90% of the requested value.
 fn make_divisible(value: f32, divisor: usize) -> usize {

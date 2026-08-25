@@ -3,7 +3,7 @@
 use super::super::super::common::{Conv2dLayer, se_gate};
 use anyhow::{Context, Result, ensure};
 use candle_core::Tensor;
-use candle_nn::{Module, VarBuilder};
+use candle_nn::VarBuilder;
 /// Neck squeeze-and-excitation module with `conv1`/`conv2` naming.
 #[derive(Clone, Debug)]
 struct NeckSeBlock {

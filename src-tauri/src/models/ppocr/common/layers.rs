@@ -5,7 +5,7 @@
 use super::super::assets::PpOcrAssets;
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{BatchNorm, BatchNormConfig, Module, ModuleT, VarBuilder, batch_norm};
+use candle_nn::{BatchNorm, BatchNormConfig, ModuleT, VarBuilder, batch_norm};
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Activation {
     None,

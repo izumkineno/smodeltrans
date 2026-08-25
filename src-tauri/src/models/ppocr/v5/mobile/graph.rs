@@ -7,7 +7,6 @@ use super::super::super::common::{
 use super::{backbone::PpLcNetV3, neck::RseFpn};
 use anyhow::{Context, Result, ensure};
 use candle_core::{Device, Tensor};
-use candle_nn::Module;
 /// Native PP-OCRv5 mobile detector.
 #[derive(Clone, Debug)]
 pub(crate) struct PpOcrMobileDetector {

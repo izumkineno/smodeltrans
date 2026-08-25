@@ -3,7 +3,7 @@
 use super::super::super::common::{Activation, ConvNormAct};
 use anyhow::{Context, Result};
 use candle_core::Tensor;
-use candle_nn::{Module, VarBuilder};
+use candle_nn::VarBuilder;
 const HG_STAGE_IN: [usize; 4] = [48, 128, 512, 1024];
 const HG_STAGE_MID: [usize; 4] = [48, 96, 192, 384];
 const HG_STAGE_OUT: [usize; 4] = [128, 512, 1024, 2048];

@@ -7,7 +7,6 @@ use super::super::super::common::{
 use super::{backbone::HgBackbone, head::DetHead, neck::DetNeck};
 use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
-use candle_nn::Module;
 /// Native PP-OCRv5 server detector.
 ///
 /// `load` maps the exact local Transformers safetensors file into F32 Candle
