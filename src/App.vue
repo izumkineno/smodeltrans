@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { version as appVersion } from "../package.json";
 import { computed, h, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { CSSProperties } from "vue";
 import { getCurrentWindow, Window } from "@tauri-apps/api/window";
@@ -1085,7 +1086,7 @@ onBeforeUnmount(() => {
                   <span>{{ modelProviderLabel }}</span>
                 </div>
               </button>
-              <p class="sidebar-build">ver. 0.1.0</p>
+              <p class="sidebar-build">ver. {{ appVersion }}</p>
             </div>
           </n-layout-sider>
 
