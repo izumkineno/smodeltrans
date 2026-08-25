@@ -38,7 +38,4 @@ impl HyAssets {
         Ok(Self { model })
     }
 
-    pub(crate) fn validate(&self) -> Result<(), BackendFailure> {
-        Self::preflight(&self.model).map(|_| ())
-    }
 }
