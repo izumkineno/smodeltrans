@@ -15,9 +15,11 @@ use crate::backend::BackendState;
 const MODELSCOPE_BASE: &str = "https://www.modelscope.cn/models";
 const HUGGINGFACE_BASE: &str = "https://huggingface.co";
 /// ModelScope CDN 会拦截空或异常 UA，显式使用浏览器 UA 避免 403 `denied by UA ACL = blacklist`
-const BROWSER_UA: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 smodeltrans/0.1.0";
-const MAX_RETRIES: usize = 3;
+const BROWSER_UA: &str = concat!(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 smodeltrans/",
+    env!("CARGO_PKG_VERSION")
+);
+const MAX_RETRIES: usize = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DownloadFileSpec {
@@ -627,7 +629,6 @@ pub async fn start_model_download(
                                     .connect_timeout(Duration::from_secs(15))
                                     .pool_max_idle_per_host(8)
                             });
-                        #[cfg(feature = "resume")]
                         let builder = builder.resume(true);
                         let res = builder
                             .run(move |total_size, mut info_rx| {
