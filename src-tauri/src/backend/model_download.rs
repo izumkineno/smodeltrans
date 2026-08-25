@@ -841,3 +841,274 @@ pub fn cancel_model_download(request: CancelDownloadRequest) -> Result<(), Strin
     }
     Ok(())
 }
+
+fn download_base_dir(model_root: &Path, model_id: &str) -> PathBuf {
+    model_root.join("downloads").join(model_id)
+}
+
+fn is_model_downloaded_on_disk(model_root: &Path, model: &DownloadableModel) -> bool {
+    let base = download_base_dir(model_root, &model.id);
+    // 优先检查完成标记
+    let marker = base.join(".download_complete");
+    let has_marker = marker.is_file();
+    // 检查所有 file_specs 是否存在
+    let specs: Vec<&DownloadFileSpec> = if !model.file_specs.is_empty() {
+        model.file_specs.iter().collect()
+    } else {
+        return has_marker && base.is_dir();
+    };
+    if specs.is_empty() {
+        return has_marker;
+    }
+    let all_exist = specs.iter().all(|spec| base.join(&spec.dest).is_file());
+    if has_marker {
+        return all_exist;
+    }
+    // 无标记但文件齐全也视为已下载（兼容旧版本）
+    all_exist
+}
+
+fn downloaded_paths_for_model(
+    model_root: &Path,
+    model: &DownloadableModel,
+) -> Option<(PathBuf, Option<PathBuf>)> {
+    let base = download_base_dir(model_root, &model.id);
+    if model.kind == "translation" {
+        let spec = model.file_specs.first()?;
+        return Some((base.join(&spec.dest), None));
+    }
+    // OCR: 推断 det/rec 子目录
+    let mut det_dir: Option<String> = None;
+    let mut rec_dir: Option<String> = None;
+    for spec in &model.file_specs {
+        if let Some(parent) = Path::new(&spec.dest).parent().and_then(|p| p.to_str()) {
+            if parent.contains("det") && det_dir.is_none() {
+                det_dir = Some(parent.to_owned());
+            }
+            if parent.contains("rec") && rec_dir.is_none() {
+                rec_dir = Some(parent.to_owned());
+            }
+        }
+    }
+    let det = det_dir?;
+    let rec = rec_dir?;
+    Some((base.join(det), Some(base.join(rec))))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteDownloadedModelRequest {
+    pub model_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivateDownloadedModelRequest {
+    pub model_id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadedModelInfo {
+    pub model_id: String,
+    pub downloaded: bool,
+    pub base_dir: String,
+}
+
+#[tauri::command]
+pub fn list_downloaded_models(state: State<'_, BackendState>) -> Result<Vec<DownloadedModelInfo>, String> {
+    let model_root: PathBuf = {
+        let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
+        let settings = guard.as_ref().map_err(|err| err.clone())?;
+        settings.model_root.clone()
+    };
+    let models = downloadable_models();
+    let mut result = Vec::new();
+    for model in models {
+        let downloaded = is_model_downloaded_on_disk(&model_root, &model);
+        let base = download_base_dir(&model_root, &model.id);
+        result.push(DownloadedModelInfo {
+            model_id: model.id,
+            downloaded,
+            base_dir: base.to_string_lossy().to_string(),
+        });
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn get_downloaded_model_paths(
+    state: State<'_, BackendState>,
+    request: GetStatusRequest,
+) -> Result<Option<DownloadedModelInfo>, String> {
+    let model_id = request.model_id.trim().to_owned();
+    if model_id.is_empty() {
+        return Err("modelId 不能为空".to_owned());
+    }
+    let model_root: PathBuf = {
+        let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
+        let settings = guard.as_ref().map_err(|err| err.clone())?;
+        settings.model_root.clone()
+    };
+    let model = downloadable_models()
+        .into_iter()
+        .find(|m| m.id == model_id)
+        .ok_or_else(|| format!("未知模型 {model_id}"))?;
+    let downloaded = is_model_downloaded_on_disk(&model_root, &model);
+    let base = download_base_dir(&model_root, &model.id);
+    Ok(Some(DownloadedModelInfo {
+        model_id,
+        downloaded,
+        base_dir: base.to_string_lossy().to_string(),
+    }))
+}
+
+#[tauri::command]
+pub fn activate_downloaded_model(
+    state: State<'_, BackendState>,
+    request: ActivateDownloadedModelRequest,
+) -> Result<crate::backend::settings::BackendStatus, String> {
+    let model_id = request.model_id.trim().to_owned();
+    if model_id.is_empty() {
+        return Err("modelId 不能为空".to_owned());
+    }
+    // 检查实时会话是否活跃
+    if state.live_active.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("实时翻译进行中，请先停止后再切换模型".to_owned());
+    }
+    let models = downloadable_models();
+    let model = models
+        .iter()
+        .find(|m| m.id == model_id)
+        .cloned()
+        .ok_or_else(|| format!("未知模型 {model_id}"))?;
+
+    // 读取当前设置与 model_root
+    let (model_root, current) = {
+        let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
+        let settings = guard.as_ref().map_err(|err| err.clone())?.clone();
+        (settings.model_root.clone(), settings)
+    };
+
+    if !is_model_downloaded_on_disk(&model_root, &model) {
+        return Err(format!("模型 {model_id} 尚未下载完成，请先下载"));
+    }
+
+    let mut updated = current.clone();
+    if model.kind == "translation" {
+        let (hy_path, _) = downloaded_paths_for_model(&model_root, &model)
+            .ok_or_else(|| "无法解析翻译模型路径".to_owned())?;
+        if !hy_path.is_file() {
+            return Err(format!("翻译模型文件不存在: {}", hy_path.display()));
+        }
+        updated.hy_model = hy_path;
+    } else {
+        let (det_dir, rec_opt) = downloaded_paths_for_model(&model_root, &model)
+            .ok_or_else(|| "无法解析 OCR 模型路径".to_owned())?;
+        let rec_dir = rec_opt.ok_or_else(|| "无法解析识别模型路径".to_owned())?;
+        if !det_dir.is_dir() {
+            return Err(format!("检测模型目录不存在: {}", det_dir.display()));
+        }
+        if !rec_dir.is_dir() {
+            return Err(format!("识别模型目录不存在: {}", rec_dir.display()));
+        }
+        // 校验两侧变体一致
+        {
+            use crate::models::ppocr::assets::{GraphRole, PpOcrVariant};
+            match (
+                PpOcrVariant::probe(GraphRole::Detector, &det_dir),
+                PpOcrVariant::probe(GraphRole::Recognizer, &rec_dir),
+            ) {
+                (Some(d), Some(r)) if d != r => {
+                    return Err(format!(
+                        "检测模型变体 {} 与识别模型变体 {} 不一致",
+                        d.label(),
+                        r.label()
+                    ));
+                }
+                _ => {}
+            }
+        }
+        updated.detector_model_dir = det_dir;
+        updated.recognizer_model_dir = rec_dir;
+    }
+
+    // 持久化
+    if let Some(config_path) = state.config_path.as_deref() {
+        let parent = config_path.parent().ok_or_else(|| "模型设置路径无效".to_owned())?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建模型设置目录失败: {e}"))?;
+        let content = serde_json::to_vec_pretty(&updated.persisted())
+            .map_err(|e| format!("序列化模型设置失败: {e}"))?;
+        std::fs::write(config_path, content).map_err(|e| format!("保存模型设置失败: {e}"))?;
+    }
+    {
+        let mut guard = state.settings.lock().map_err(|_| "无法写入设置".to_owned())?;
+        *guard = Ok(updated.clone());
+    }
+    // 清空已加载引擎，下次推理重新加载
+    if let Ok(mut engine) = state.engine.lock() {
+        *engine = None;
+    }
+    state.touch_activity();
+    Ok(updated.status(false))
+}
+#[tauri::command]
+pub fn delete_downloaded_model(
+    state: State<'_, BackendState>,
+    request: DeleteDownloadedModelRequest,
+) -> Result<(), String> {
+    let model_id = request.model_id.trim().to_owned();
+    if model_id.is_empty() {
+        return Err("modelId 不能为空".to_owned());
+    }
+    if state.live_active.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("实时翻译进行中，请先停止后再删除模型".to_owned());
+    }
+    let model = downloadable_models()
+        .into_iter()
+        .find(|m| m.id == model_id)
+        .ok_or_else(|| format!("未知模型 {model_id}"))?;
+    let model_root: PathBuf = {
+        let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
+        let settings = guard.as_ref().map_err(|err| err.clone())?;
+        settings.model_root.clone()
+    };
+    let base = download_base_dir(&model_root, &model.id);
+    if !base.exists() {
+        return Err(format!("模型 {model_id} 未下载，无需删除"));
+    }
+    // 禁止删除当前已启用的模型
+    {
+        let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
+        if let Ok(settings) = guard.as_ref() {
+            let cur_hy = settings.hy_model.to_string_lossy().to_string().replace('\\', "/").to_lowercase();
+            let cur_det = settings.detector_model_dir.to_string_lossy().to_string().replace('\\', "/").to_lowercase();
+            let cur_rec = settings.recognizer_model_dir.to_string_lossy().to_string().replace('\\', "/").to_lowercase();
+            let base_str = base.to_string_lossy().to_string().replace('\\', "/").to_lowercase();
+            let is_active = if model.kind == "translation" {
+                cur_hy.starts_with(&base_str)
+            } else {
+                cur_det.starts_with(&base_str) || cur_rec.starts_with(&base_str)
+            };
+            if is_active {
+                return Err(format!("模型 {model_id} 当前已启用，请先切换到其他模型后再删除"));
+            }
+        }
+    }
+    // 若有正在进行的下载，先取消
+    if let Ok(mut handles) = DOWNLOAD_HANDLES.lock() {
+        if let Some(handle) = handles.remove(&model_id) {
+            handle.abort();
+        }
+    }
+    if let Ok(mut flags) = CANCEL_FLAGS.lock() {
+        flags.remove(&model_id);
+    }
+    if let Ok(mut map) = TASK_MAP.lock() {
+        map.remove(&model_id);
+    }
+    // 删除目录
+    std::fs::remove_dir_all(&base).map_err(|e| format!("删除模型目录失败: {e}"))?;
+    Ok(())
+}
+

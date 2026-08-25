@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { open as openNativeDialog } from "@tauri-apps/plugin-dialog";
 import {
   NAlert,
@@ -8,10 +8,12 @@ import {
   NInput,
   NInputNumber,
   NModal,
+  NPopconfirm,
   NProgress,
   NSelect,
   NSwitch,
   NTag,
+  NTooltip,
   useMessage,
 } from "naive-ui";
 import {
@@ -39,8 +41,11 @@ import { showWorkspaceToast, type WorkspaceToastType } from "../services/workspa
 import {
   type DownloadSource,
   type DownloadTaskState,
+  activateDownloadedModel,
   cancelModelDownload,
-  listDownloadFamilies,
+  deleteDownloadedModel,
+  listDownloadableModels,
+  listDownloadedModels,
   listenDownloadProgress,
   startModelDownload,
 } from "../services/model-download-provider";
@@ -88,25 +93,14 @@ const downloadSourceOptions: Array<{ label: string; value: DownloadSource }> = [
   { label: "Hugging Face", value: "huggingface" },
 ];
 const downloadTasks = ref<Record<string, DownloadTaskState>>({});
-const downloadFamilies = computed(() => listDownloadFamilies(downloadSource.value));
-const selectedFamilyModel = ref<Record<string, string>>({});
-
-watch(
-  downloadFamilies,
-  (families) => {
-    for (const family of families) {
-      if (!selectedFamilyModel.value[family.id]) {
-        const recommended = family.models.find((model) => model.recommended);
-        selectedFamilyModel.value[family.id] = recommended?.id ?? family.models[0]?.id ?? "";
-      }
-    }
-  },
-  { immediate: true },
+const downloadedSet = ref<Set<string>>(new Set());
+const downloadedBaseDir = ref<Record<string, string>>({});
+const translationModels = computed(() =>
+  listDownloadableModels(downloadSource.value).filter((m) => m.kind === "translation"),
 );
-
-function familySelectedModel(familyId: string): string {
-  return selectedFamilyModel.value[familyId] ?? "";
-}
+const ocrModels = computed(() =>
+  listDownloadableModels(downloadSource.value).filter((m) => m.kind === "ocr"),
+);
 
 function downloadTaskFor(modelId: string): DownloadTaskState | undefined {
   return downloadTasks.value[modelId];
@@ -114,7 +108,23 @@ function downloadTaskFor(modelId: string): DownloadTaskState | undefined {
 
 function isModelInstalled(modelId: string): boolean {
   if (modelId.startsWith("hy-mt2")) {
-    return Boolean(modelHyPath.value);
+    const cur = (modelHyPath.value || backendStatus.value?.hyModel || "").trim();
+    if (!cur) return false;
+    const normalizedCur = cur.replace(/\\/g, "/").toLowerCase();
+    const base = downloadedBaseDir.value[modelId];
+    if (base) {
+      const normalizedBase = base.replace(/\\/g, "/").toLowerCase();
+      if (normalizedCur === normalizedBase || normalizedCur.startsWith(normalizedBase + "/")) return true;
+    }
+    // 回退：路径中包含 modelId 目录或以 file 名结尾
+    const model = translationModels.value.find((m) => m.id === modelId);
+    if (model) {
+      if (normalizedCur.includes(`/${modelId.toLowerCase()}/`)) return true;
+      for (const f of model.files) {
+        if (normalizedCur.toLowerCase().endsWith(`/${f.toLowerCase()}`)) return true;
+      }
+    }
+    return false;
   }
   const ocrVariantMap: Record<string, string> = {
     "ppocr-v5-mobile": "v5-mobile",
@@ -130,27 +140,48 @@ function isModelInstalled(modelId: string): boolean {
   return false;
 }
 
-
-function selectedModelForFamily(familyId: string) {
-  const family = downloadFamilies.value.find((family) => family.id === familyId);
-  if (!family) return undefined;
-  const selectedId = familySelectedModel(familyId);
-  return family.models.find((model) => model.id === selectedId) ?? family.models[0];
+function isDownloaded(modelId: string): boolean {
+  return downloadedSet.value.has(modelId);
 }
 
-function familyOptions(familyId: string) {
-  const family = downloadFamilies.value.find((family) => family.id === familyId);
-  if (!family) return [];
-  return family.models.map((model) => ({
-    label: `${model.name} · ${model.sizeText}${model.recommended ? " · 推荐" : ""}`,
-    value: model.id,
-  }));
+async function refreshDownloaded(): Promise<void> {
+  try {
+    const list = await listDownloadedModels();
+    const next = new Set<string>();
+    const base: Record<string, string> = {};
+    for (const item of list) {
+      if (item.downloaded) next.add(item.modelId);
+      base[item.modelId] = item.baseDir;
+    }
+    downloadedSet.value = next;
+    downloadedBaseDir.value = base;
+  } catch {
+    // 忽略
+  }
 }
 
-function handleFamilySelect(familyId: string, value: string) {
-  selectedFamilyModel.value[familyId] = value;
+async function handleSwitchModel(modelId: string): Promise<void> {
+  if (!isDownloaded(modelId)) {
+    setSettingsFeedback("error", "该模型尚未下载，请先下载");
+    return;
+  }
+  if (isModelInstalled(modelId)) {
+    setSettingsFeedback("info", "该模型已是当前启用模型");
+    return;
+  }
+  settingsLoading.value = true;
+  try {
+    const status = (await activateDownloadedModel(modelId)) as BackendStatus;
+    applyBackendStatus(status);
+    await loadModelCatalog();
+    await refreshDownloaded();
+    setSettingsFeedback("success", `已切换到模型 ${modelId}，后端已更新`);
+  } catch (error) {
+    setSettingsFeedback("error", error instanceof Error ? error.message : `切换失败 ${modelId}`);
+  } finally {
+    settingsLoading.value = false;
+  }
 }
-
 
 function setSettingsFeedback(
   type: WorkspaceToastType,
@@ -268,47 +299,6 @@ function pathBaseName(path: string): string {
   return separator >= 0 ? trimmed.slice(separator + 1) : trimmed;
 }
 
-const translationModelPath = computed(
-  () => modelCatalog.value.translation[0]?.path ?? modelHyPath.value ?? "",
-);
-const translationModelOptionsWithCurrent = computed(() =>
-  translationModelPath.value
-    ? [{ label: "Hy-MT2", value: translationModelPath.value }]
-    : [],
-);
-const selectedTranslationValue = computed(() => modelHyPath.value || null);
-
-function resolveOcrEntry(type: OcrModelType): {
-  detectorDir: string;
-  recognizerDir: string;
-} | null {
-  const entry = modelCatalog.value.ocr.find((option) => option.variant === type);
-  if (entry) {
-    return { detectorDir: entry.detectorDir, recognizerDir: entry.recognizerDir };
-  }
-  if (
-    modelDetectorPath.value &&
-    modelRecognizerPath.value &&
-    backendStatus.value?.detectorVariant === type
-  ) {
-    return { detectorDir: modelDetectorPath.value, recognizerDir: modelRecognizerPath.value };
-  }
-  return null;
-}
-
-const ocrModelOptions = computed(() =>
-  OCR_MODEL_TYPES.map(({ label, value }) => {
-    const resolved = resolveOcrEntry(value);
-    return resolved
-      ? { label, value: `${resolved.detectorDir}|${resolved.recognizerDir}` }
-      : {
-          label: `${label}（未配置路径）`,
-          value: `${UNCONFIGURED_OCR_PREFIX}${value}`,
-          disabled: true,
-        };
-  }),
-);
-
 const translationDialogPath = computed(
   () =>
     dialogTranslationPath.value ||
@@ -325,11 +315,7 @@ const translationDialogOptions = computed(() =>
 function selectDialogTranslationModel(value: string | null): void {
   dialogTranslationPath.value = value ?? "";
 }
-const selectedOcrValue = computed(() =>
-  modelDetectorPath.value && modelRecognizerPath.value
-    ? `${modelDetectorPath.value}|${modelRecognizerPath.value}`
-    : null,
-);
+
 
 const SYSTEM_FONT_VALUE = "__system__";
 const fontModelOptions = computed(() => [
@@ -469,7 +455,16 @@ async function saveModelDialog(): Promise<void> {
       setSettingsFeedback("error", "请选择 GGUF 模型文件。");
       return;
     }
-    next.translation.push({ name: entryName, path });
+    const normalized = path.replace(/\\/g, "/").toLowerCase();
+    const exists = next.translation.some((e) => e.path.replace(/\\/g, "/").toLowerCase() === normalized);
+    if (!exists) {
+      next.translation.push({ name: entryName, path });
+    } else {
+      // 已存在则更新路径（避免额外显示重复条目）
+      next.translation = next.translation.map((e) =>
+        e.path.replace(/\\/g, "/").toLowerCase() === normalized ? { name: entryName, path } : e,
+      );
+    }
   } else if (mode === "ocr") {
     entryName = dialogOcrType.value;
     const detectorDir = dialogOcrDetectorPath.value.trim();
@@ -478,7 +473,23 @@ async function saveModelDialog(): Promise<void> {
       setSettingsFeedback("error", "请选择 detector 与 recognizer 两个文件夹。");
       return;
     }
-    next.ocr.push({ name: entryName, detectorDir, recognizerDir });
+    const normDet = detectorDir.replace(/\\/g, "/").toLowerCase();
+    const normRec = recognizerDir.replace(/\\/g, "/").toLowerCase();
+    const exists = next.ocr.some(
+      (e) =>
+        e.detectorDir.replace(/\\/g, "/").toLowerCase() === normDet &&
+        e.recognizerDir.replace(/\\/g, "/").toLowerCase() === normRec,
+    );
+    if (!exists) {
+      next.ocr.push({ name: entryName, detectorDir, recognizerDir });
+    } else {
+      next.ocr = next.ocr.map((e) =>
+        e.detectorDir.replace(/\\/g, "/").toLowerCase() === normDet &&
+        e.recognizerDir.replace(/\\/g, "/").toLowerCase() === normRec
+          ? { name: entryName, detectorDir, recognizerDir }
+          : e,
+      );
+    }
   } else if (mode === "font") {
     entryName = dialogName.value.trim();
     if (!entryName) {
@@ -490,7 +501,16 @@ async function saveModelDialog(): Promise<void> {
       setSettingsFeedback("error", "请选择字体文件。");
       return;
     }
-    next.fonts.push({ name: entryName, path });
+    const normalized = path.replace(/\\/g, "/").toLowerCase();
+    const exists = next.fonts.some((e) => e.path.replace(/\\/g, "/").toLowerCase() === normalized);
+    if (!exists) {
+      next.fonts.push({ name: entryName, path });
+    } else {
+      // 同路径仅更新名称，避免字体下拉额外显示重复条目
+      next.fonts = next.fonts.map((e) =>
+        e.path.replace(/\\/g, "/").toLowerCase() === normalized ? { name: entryName, path } : e,
+      );
+    }
   } else {
     return;
   }
@@ -750,6 +770,7 @@ function handleDownloadProgress(payload: { modelId: string; source: DownloadSour
     setSettingsFeedback("success", `模型 ${payload.modelId} 下载完成，已落盘。`);
     void loadModelCatalog();
     void refreshBackendStatus(false);
+    void refreshDownloaded();
   } else if (normalizedStatus === "error") {
     setSettingsFeedback("error", payload.message || `模型 ${payload.modelId} 下载失败。`);
   }
@@ -834,19 +855,49 @@ async function handleCancelDownload(modelId: string) {
     setSettingsFeedback("error", error instanceof Error ? error.message : "取消失败。");
   }
 }
-
+async function handleDeleteModel(modelId: string): Promise<void> {
+  if (!isDownloaded(modelId)) {
+    setSettingsFeedback("error", "该模型尚未下载，无需删除");
+    return;
+  }
+  if (isModelInstalled(modelId)) {
+    setSettingsFeedback("error", "该模型当前已启用，请先切换到其他模型后再删除");
+    return;
+  }
+  const task = downloadTasks.value[modelId];
+  if (task?.status === "downloading") {
+    setSettingsFeedback("error", "模型正在下载中，请先取消后再删除");
+    return;
+  }
+  settingsLoading.value = true;
+  try {
+    await deleteDownloadedModel(modelId);
+    await refreshDownloaded();
+    // 清理对应的下载任务状态
+    if (downloadTasks.value[modelId]) {
+      delete downloadTasks.value[modelId];
+    }
+    setSettingsFeedback("success", `已删除模型 ${modelId}`);
+  } catch (error) {
+    setSettingsFeedback("error", error instanceof Error ? error.message : `删除失败 ${modelId}`);
+  } finally {
+    settingsLoading.value = false;
+  }
+}
 onMounted(async () => {
   if (backendStatus.value) {
     applyBackendStatus(backendStatus.value);
   }
   void loadModelCatalog();
   void refreshBackendStatus(false);
+  void refreshDownloaded();
   try {
     downloadProgressUnlisten = await listenDownloadProgress(handleDownloadProgress);
   } catch {
     // 浏览器预览无事件
   }
 });
+
 
 onBeforeUnmount(() => {
   downloadProgressUnlisten?.();
@@ -866,6 +917,13 @@ onBeforeUnmount(() => {
         </p>
       </div>
       <div class="model-manager-header-actions">
+        <n-select
+          v-model:value="downloadSource"
+          :options="downloadSourceOptions"
+          size="small"
+          style="width: 150px"
+          aria-label="下载源"
+        />
         <n-tag :type="settingsTagType" round size="small">{{ settingsStatusLabel }}</n-tag>
         <n-button secondary size="small" :loading="settingsLoading" @click="refreshBackendStatus()">刷新状态</n-button>
       </div>
@@ -876,135 +934,133 @@ onBeforeUnmount(() => {
     </n-alert>
 
     <div class="model-manager-grid">
-      <!-- 下载管理（ModelScope 默认） - 占满整行，避免右侧空白 -->
-      <n-card class="settings-card settings-card-wide" :bordered="false">
+      <!-- 翻译模型：平铺，下载与切换合并，两列布局，窄屏自动单列 -->
+      <n-card class="settings-card" :bordered="false">
         <div class="settings-card-heading">
           <div>
-            <p class="panel-kicker">Download · ModelScope</p>
-            <h2>模型下载</h2>
+            <p class="panel-kicker">Translation · Hy-MT2</p>
+            <h2>翻译模型</h2>
           </div>
-          <n-select
-            v-model:value="downloadSource"
-            :options="downloadSourceOptions"
-            size="small"
-            style="width: 180px"
-            aria-label="下载源"
-          />
+          <n-button secondary size="small" @click="openModelDialog('translation')">导入本地…</n-button>
         </div>
         <p class="settings-card-copy">
-          默认从 <strong>ModelScope</strong> 拉取（<code>modelscope.cn/models/&lt;repo&gt;/resolve/master</code>），由 Rust 后端 <code>model_download</code> 以 ModelScope 库逻辑进行流式下载与进度上报。切换为 Hugging Face 时走对应源。
+          共 {{ translationModels.length }} 个量化版本，自动检测 <code>downloads/&lt;modelId&gt;</code> 是否已下载；已下载可一键切换。
         </p>
-        <div class="model-download-list">
-          <div v-for="family in downloadFamilies" :key="family.id" class="model-download-family">
-            <div class="model-download-family-header">
-              <div>
-                <strong>
-                  {{ family.name }}
-                  <n-tag v-if="family.kind === 'translation'" size="tiny" type="info" round>翻译</n-tag>
-                  <n-tag v-else size="tiny" type="warning" round>OCR</n-tag>
-                </strong>
-                <span>{{ family.description }}</span>
+        <div class="model-flat-list">
+          <div v-for="model in translationModels" :key="model.id" class="model-flat-item">
+            <div class="model-flat-main">
+              <div class="model-flat-title">
+                <strong>{{ model.name }}</strong>
+                <n-tag size="tiny" type="info" round>{{ model.sizeText }}</n-tag>
+                <n-tag v-if="model.recommended" size="tiny" type="success" round>推荐</n-tag>
+                <n-tag v-if="isDownloaded(model.id)" size="tiny" type="info" round>已下载</n-tag>
+                <n-tag v-if="isModelInstalled(model.id)" size="tiny" type="success" round>已启用</n-tag>
               </div>
-              <n-select
-                :value="familySelectedModel(family.id)"
-                :options="familyOptions(family.id)"
-                size="small"
-                style="min-width: 260px; max-width: 360px"
-                :aria-label="family.name + ' 选择'"
-                @update:value="val => handleFamilySelect(family.id, val)"
+              <div class="model-flat-desc">{{ model.description }} · {{ model.repoId }}</div>
+              <n-progress
+                v-if="downloadTaskFor(model.id)?.status === 'downloading'"
+                :percentage="downloadTaskFor(model.id)?.progress ?? 0"
+                :show-indicator="true"
+                :height="6"
+                style="margin-top: 6px"
               />
+              <span v-if="downloadTaskFor(model.id)?.message" class="model-download-message">{{ downloadTaskFor(model.id)?.message }}</span>
+              <n-tooltip v-else-if="isDownloaded(model.id) && downloadedBaseDir[model.id]" trigger="hover">
+                <template #trigger>
+                  <span class="model-flat-path" :title="downloadedBaseDir[model.id]">{{ downloadedBaseDir[model.id] }}</span>
+                </template>
+                {{ downloadedBaseDir[model.id] }}
+              </n-tooltip>
             </div>
-            <template v-if="selectedModelForFamily(family.id)">
-              <div class="model-download-family-detail">
-                <span>{{ selectedModelForFamily(family.id)?.description }} · {{ selectedModelForFamily(family.id)?.repoId }} · {{ selectedModelForFamily(family.id)?.sizeText }}</span>
-                <span class="model-download-files">{{ selectedModelForFamily(family.id)?.files.join(", ") }}</span>
-                <n-tag v-if="isModelInstalled(selectedModelForFamily(family.id)?.id ?? '')" size="tiny" type="success" round>已安装</n-tag>
-                <n-progress
-                  v-if="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'downloading'"
-                  :percentage="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.progress ?? 0"
-                  :show-indicator="true"
-                  :height="6"
-                  style="margin-top: 6px"
-                />
-                <span v-if="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.message" class="model-download-message">
-                  {{ downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.message }}
-                </span>
-              </div>
-              <div class="model-download-actions">
-                <n-button
-                  v-if="!downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '') || downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'idle' || downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'cancelled' || downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'error'"
-                  secondary
-                  size="small"
-                  @click="handleDownload(selectedModelForFamily(family.id)?.id ?? '')"
-                >
-                  {{ downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'error' ? '重试' : '下载' }}
-                </n-button>
-                <n-button
-                  v-else-if="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'downloading'"
-                  secondary
-                  size="small"
-                  @click="handleCancelDownload(selectedModelForFamily(family.id)?.id ?? '')"
-                >
-                  取消
-                </n-button>
-                <n-tag v-else-if="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'completed'" type="success" size="small" round>已完成</n-tag>
-                <n-tag v-else-if="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'error'" type="error" size="small" round>失败</n-tag>
-              </div>
-            </template>
+            <div class="model-flat-actions">
+              <n-button v-if="downloadTaskFor(model.id)?.status === 'downloading'" secondary size="small" @click="handleCancelDownload(model.id)">取消</n-button>
+              <template v-else-if="isModelInstalled(model.id)"><n-tag type="success" size="small" round>已启用</n-tag></template>
+              <template v-else-if="isDownloaded(model.id)">
+                <n-button secondary size="small" :loading="settingsLoading" @click="handleSwitchModel(model.id)">切换</n-button>
+                <n-popconfirm @positive-click="handleDeleteModel(model.id)">
+                  <template #trigger>
+                    <n-button secondary size="small" type="error" :loading="settingsLoading" style="margin-left:6px;">删除</n-button>
+                  </template>
+                  确定删除 {{ model.name }}？本地文件将被移除。
+                </n-popconfirm>
+              </template>
+              <template v-else><n-button secondary size="small" @click="handleDownload(model.id)">{{ downloadTaskFor(model.id)?.status === 'error' ? '重试' : '下载' }}</n-button><n-tag v-if="downloadTaskFor(model.id)?.status === 'error'" type="error" size="small" round style="margin-left:6px;">失败</n-tag></template>
+              <n-tag v-if="downloadTaskFor(model.id)?.status === 'completed' && !isDownloaded(model.id)" type="success" size="small" round style="margin-left:6px;">已完成</n-tag>
+            </div>
           </div>
         </div>
-        <p class="settings-help">下载由后端 <code>start_model_download</code> 发起，经 <code>model-download-progress</code> 事件推送进度；完成后自动在本地 <code>downloads/&lt;modelId&gt;</code> 落盘并可注册到上方本地模型。族内通过下拉选择具体版本。</p>
       </n-card>
 
+      <!-- OCR 模型：平铺全部 PP-OCR，下载与切换合并 -->
+      <n-card class="settings-card" :bordered="false">
+        <div class="settings-card-heading">
+          <div>
+            <p class="panel-kicker">OCR · PaddleOCR</p>
+            <h2>OCR 模型</h2>
+          </div>
+          <n-button secondary size="small" @click="openModelDialog('ocr')">导入本地…</n-button>
+        </div>
+        <p class="settings-card-copy">
+          共 {{ ocrModels.length }} 个规格（V5/V6），自动检测是否已下载；已下载可一键切换。
+        </p>
+        <div class="model-flat-list">
+          <div v-for="model in ocrModels" :key="model.id" class="model-flat-item">
+            <div class="model-flat-main">
+              <div class="model-flat-title">
+                <strong>{{ model.name }}</strong>
+                <n-tag size="tiny" type="warning" round>{{ model.sizeText }}</n-tag>
+                <n-tag v-if="model.recommended" size="tiny" type="success" round>推荐</n-tag>
+                <n-tag v-if="isDownloaded(model.id)" size="tiny" type="info" round>已下载</n-tag>
+                <n-tag v-if="isModelInstalled(model.id)" size="tiny" type="success" round>已启用</n-tag>
+              </div>
+              <div class="model-flat-desc">{{ model.description }} · {{ model.repoId }}</div>
+              <n-progress
+                v-if="downloadTaskFor(model.id)?.status === 'downloading'"
+                :percentage="downloadTaskFor(model.id)?.progress ?? 0"
+                :show-indicator="true"
+                :height="6"
+                style="margin-top: 6px"
+              />
+              <span v-if="downloadTaskFor(model.id)?.message" class="model-download-message">{{ downloadTaskFor(model.id)?.message }}</span>
+              <n-tooltip v-else-if="isDownloaded(model.id) && downloadedBaseDir[model.id]" trigger="hover">
+                <template #trigger>
+                  <span class="model-flat-path" :title="downloadedBaseDir[model.id]">{{ downloadedBaseDir[model.id] }}</span>
+                </template>
+                {{ downloadedBaseDir[model.id] }}
+              </n-tooltip>
+            </div>
+            <div class="model-flat-actions">
+              <n-button v-if="downloadTaskFor(model.id)?.status === 'downloading'" secondary size="small" @click="handleCancelDownload(model.id)">取消</n-button>
+              <template v-else-if="isModelInstalled(model.id)"><n-tag type="success" size="small" round>已启用</n-tag></template>
+              <template v-else-if="isDownloaded(model.id)">
+                <n-button secondary size="small" :loading="settingsLoading" @click="handleSwitchModel(model.id)">切换</n-button>
+                <n-popconfirm @positive-click="handleDeleteModel(model.id)">
+                  <template #trigger>
+                    <n-button secondary size="small" type="error" :loading="settingsLoading" style="margin-left:6px;">删除</n-button>
+                  </template>
+                  确定删除 {{ model.name }}？本地文件将被移除。
+                </n-popconfirm>
+              </template>
+              <template v-else><n-button secondary size="small" @click="handleDownload(model.id)">{{ downloadTaskFor(model.id)?.status === 'error' ? '重试' : '下载' }}</n-button><n-tag v-if="downloadTaskFor(model.id)?.status === 'error'" type="error" size="small" round style="margin-left:6px;">失败</n-tag></template>
+              <n-tag v-if="downloadTaskFor(model.id)?.status === 'completed' && !isDownloaded(model.id)" type="success" size="small" round style="margin-left:6px;">已完成</n-tag>
+            </div>
+          </div>
+        </div>
+        <p class="settings-help">切换后持久化到 <code>model-settings.json</code> 并清空引擎，下次推理自动加载。</p>
+      </n-card>
 
-      <!-- 本地模型 -->
+      <!-- 标注字体（保留手动导入） -->
       <n-card class="settings-card settings-card-wide" :bordered="false">
         <div class="settings-card-heading">
           <div>
-            <p class="panel-kicker">01 / 本地模型</p>
-            <h2>本地模型</h2>
+            <p class="panel-kicker">Fonts</p>
+            <h2>标注字体</h2>
           </div>
+          <n-button secondary size="small" @click="openModelDialog('font')">导入字体…</n-button>
         </div>
-        <p class="settings-card-copy">
-          选择 Hy-MT2 与 PP-OCR 模型，标注字体可选。配置路径后，点击“保存设置”生效。
-        </p>
-        <dl class="settings-path-list">
+        <dl class="settings-path-list" style="margin-top:12px;">
           <div>
-            <dt>翻译模型（Hy-MT2）</dt>
-            <dd class="settings-model-select-row">
-              <n-select
-                :value="selectedTranslationValue"
-                :options="translationModelOptionsWithCurrent"
-                :placeholder="catalogLoaded ? '选择模型' : '加载模型列表…'"
-                size="small"
-                class="settings-model-select"
-                @update:value="selectTranslationModel"
-                aria-label="翻译模型"
-              />
-              <n-button secondary size="small" @click="openModelDialog('translation')">配置路径…</n-button>
-              <span class="settings-model-help">{{ modelHyPath || "未选择翻译模型" }}</span>
-            </dd>
-          </div>
-          <div>
-            <dt>OCR 模型（PP-OCR）</dt>
-            <dd class="settings-model-select-row">
-              <n-select
-                :value="selectedOcrValue"
-                :options="ocrModelOptions"
-                :placeholder="catalogLoaded ? '选择模型' : '加载模型列表…'"
-                size="small"
-                class="settings-model-select"
-                @update:value="selectOcrModel"
-                aria-label="OCR 模型"
-              />
-              <n-button secondary size="small" @click="openModelDialog('ocr')">配置路径…</n-button>
-              <span class="settings-model-help">
-                det: {{ modelDetectorPath || "未选择" }} · rec: {{ modelRecognizerPath || "未选择" }}
-              </span>
-            </dd>
-          </div>
-          <div>
-            <dt>标注字体</dt>
+            <dt>当前字体</dt>
             <dd class="settings-model-select-row">
               <n-select
                 :value="selectedFontValue"
@@ -1015,14 +1071,18 @@ onBeforeUnmount(() => {
                 @update:value="selectFontModel"
                 aria-label="标注字体"
               />
-              <n-button secondary size="small" @click="openModelDialog('font')">配置路径…</n-button>
-              <span class="settings-model-help">{{ modelFontPath || "系统自动匹配" }}</span>
+              <n-tooltip v-if="modelFontPath" trigger="hover">
+                <template #trigger>
+                  <span class="settings-model-help" :title="modelFontPath" style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block; vertical-align:bottom;">{{ modelFontPath }}</span>
+                </template>
+                {{ modelFontPath }}
+              </n-tooltip>
+              <span v-else class="settings-model-help">系统自动匹配</span>
             </dd>
           </div>
         </dl>
       </n-card>
-
-      <n-card class="settings-card" :bordered="false">
+<n-card class="settings-card" :bordered="false">
         <div class="settings-card-heading">
           <div>
             <p class="panel-kicker">运行资源</p>

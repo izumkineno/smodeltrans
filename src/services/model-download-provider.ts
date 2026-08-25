@@ -550,6 +550,47 @@ export function listenDownloadProgress(
   );
 }
 
+export interface DownloadedModelInfo {
+  modelId: string;
+  downloaded: boolean;
+  baseDir: string;
+}
+
+export async function listDownloadedModels(
+  invokeFn: InvokeFn = invoke,
+): Promise<DownloadedModelInfo[]> {
+  if (!isDesktopRuntime()) return [];
+  try {
+    return await invokeFn<DownloadedModelInfo[]>("list_downloaded_models");
+  } catch {
+    return [];
+  }
+}
+
+export async function activateDownloadedModel(
+  modelId: string,
+  invokeFn: InvokeFn = invoke,
+): Promise<unknown> {
+  if (!isDesktopRuntime()) {
+    throw new Error("桌面端功能");
+  }
+  return await invokeFn("activate_downloaded_model", {
+    request: { modelId },
+  });
+}
+
+export async function deleteDownloadedModel(
+  modelId: string,
+  invokeFn: InvokeFn = invoke,
+): Promise<void> {
+  if (!isDesktopRuntime()) {
+    throw new Error("桌面端功能");
+  }
+  await invokeFn("delete_downloaded_model", {
+    request: { modelId },
+  });
+}
+
 /** 工具：ModelScope resolve URL（供后端或文档展示） */
 export function modelscopeResolveUrl(repoId: string, file: string): string {
   return `https://www.modelscope.cn/models/${repoId}/resolve/master/${file}`;

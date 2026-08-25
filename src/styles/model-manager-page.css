@@ -168,18 +168,99 @@
   }
 }
 
-@media (max-width: 720px) {
-  .model-manager-header {
-    flex-direction: column;
-  }
+/* 平铺列表：翻译/OCR 双列表，所有模型平铺，下载与切换合并；统一限高，超长滚动 */
+.model-flat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+  height: 360px;
+  max-height: 360px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--divider) transparent;
+}
+.model-flat-list::-webkit-scrollbar {
+  width: 6px;
+}
+.model-flat-list::-webkit-scrollbar-thumb {
+  background: var(--divider);
+  border-radius: 3px;
+}
+.model-flat-list::-webkit-scrollbar-track {
+  background: transparent;
+}
 
-  .model-download-item,
-  .model-download-family-header {
+.model-flat-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px;
+  border: 1px solid var(--divider);
+  border-radius: 4px;
+  background: var(--surface-soft);
+}
+
+.model-flat-main {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.model-flat-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.model-flat-title strong {
+  font-weight: 600;
+}
+
+.model-flat-desc {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.model-flat-files {
+  color: var(--text-soft);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.model-flat-path {
+  color: var(--text-soft);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-flat-actions {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 6px;
+}
+
+@media (max-width: 720px) {
+  .model-flat-item {
     flex-direction: column;
     align-items: flex-start;
   }
 
-  .model-download-actions {
+  .model-flat-actions {
     width: 100%;
     justify-content: flex-end;
   }
