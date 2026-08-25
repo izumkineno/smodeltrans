@@ -1,16 +1,30 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
+use simple_downloader::{DownloadInfo, Downloader};
 use tauri::{AppHandle, Emitter, State};
+use tokio::task::JoinHandle;
 
 use crate::backend::BackendState;
 
 const MODELSCOPE_BASE: &str = "https://www.modelscope.cn/models";
+const HUGGINGFACE_BASE: &str = "https://huggingface.co";
+/// ModelScope CDN 会拦截空或异常 UA，显式使用浏览器 UA 避免 403 `denied by UA ACL = blacklist`
+const BROWSER_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 smodeltrans/0.1.0";
+const MAX_RETRIES: usize = 3;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DownloadFileSpec {
+    pub repo_id: String,
+    pub file: String,
+    pub dest: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +34,8 @@ pub struct DownloadableModel {
     pub description: String,
     pub repo_id: String,
     pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_specs: Vec<DownloadFileSpec>,
     pub size_text: String,
     pub kind: String,
     pub ocr_variant: Option<String>,
@@ -84,6 +100,8 @@ type TaskMap = Arc<Mutex<HashMap<String, DownloadTaskState>>>;
 static TASK_MAP: LazyLock<TaskMap> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 static CANCEL_FLAGS: LazyLock<Arc<Mutex<HashMap<String, bool>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+static DOWNLOAD_HANDLES: LazyLock<Arc<Mutex<HashMap<String, JoinHandle<()>>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 fn task_map() -> TaskMap {
     TASK_MAP.clone()
@@ -93,14 +111,23 @@ fn cancel_flags() -> Arc<Mutex<HashMap<String, bool>>> {
     CANCEL_FLAGS.clone()
 }
 
+fn download_handles() -> Arc<Mutex<HashMap<String, JoinHandle<()>>>> {
+    DOWNLOAD_HANDLES.clone()
+}
+
 fn downloadable_models() -> Vec<DownloadableModel> {
     vec![
         DownloadableModel {
             id: "hy-mt2-1.8b-q4".to_owned(),
             name: "Hy-MT2 1.8B Q4_K_M".to_owned(),
-            description: "多语言翻译核心，ModelScope: LLM-Research/Hy-MT2".to_owned(),
-            repo_id: "LLM-Research/Hy-MT2-1.8B".to_owned(),
+            description: "多语言翻译核心，ModelScope: Tencent-Hunyuan/Hy-MT2-1.8B-GGUF".to_owned(),
+            repo_id: "Tencent-Hunyuan/Hy-MT2-1.8B-GGUF".to_owned(),
             files: vec!["Hy-MT2-1.8B-Q4_K_M.gguf".to_owned()],
+            file_specs: vec![DownloadFileSpec {
+                repo_id: "Tencent-Hunyuan/Hy-MT2-1.8B-GGUF".to_owned(),
+                file: "Hy-MT2-1.8B-Q4_K_M.gguf".to_owned(),
+                dest: "Hy-MT2-1.8B-Q4_K_M.gguf".to_owned(),
+            }],
             size_text: "~1.1 GB".to_owned(),
             kind: "translation".to_owned(),
             ocr_variant: None,
@@ -109,9 +136,14 @@ fn downloadable_models() -> Vec<DownloadableModel> {
         DownloadableModel {
             id: "hy-mt2-1.8b-q6k".to_owned(),
             name: "Hy-MT2 1.8B Q6_K".to_owned(),
-            description: "多语言翻译核心，ModelScope: LLM-Research/Hy-MT2".to_owned(),
-            repo_id: "LLM-Research/Hy-MT2-1.8B".to_owned(),
+            description: "多语言翻译核心，ModelScope: Tencent-Hunyuan/Hy-MT2-1.8B-GGUF".to_owned(),
+            repo_id: "Tencent-Hunyuan/Hy-MT2-1.8B-GGUF".to_owned(),
             files: vec!["Hy-MT2-1.8B-Q6_K.gguf".to_owned()],
+            file_specs: vec![DownloadFileSpec {
+                repo_id: "Tencent-Hunyuan/Hy-MT2-1.8B-GGUF".to_owned(),
+                file: "Hy-MT2-1.8B-Q6_K.gguf".to_owned(),
+                dest: "Hy-MT2-1.8B-Q6_K.gguf".to_owned(),
+            }],
             size_text: "~1.5 GB".to_owned(),
             kind: "translation".to_owned(),
             ocr_variant: None,
@@ -120,9 +152,14 @@ fn downloadable_models() -> Vec<DownloadableModel> {
         DownloadableModel {
             id: "hy-mt2-1.8b-q8".to_owned(),
             name: "Hy-MT2 1.8B Q8_0".to_owned(),
-            description: "多语言翻译核心，ModelScope: LLM-Research/Hy-MT2".to_owned(),
-            repo_id: "LLM-Research/Hy-MT2-1.8B".to_owned(),
+            description: "多语言翻译核心，ModelScope: Tencent-Hunyuan/Hy-MT2-1.8B-GGUF".to_owned(),
+            repo_id: "Tencent-Hunyuan/Hy-MT2-1.8B-GGUF".to_owned(),
             files: vec!["Hy-MT2-1.8B-Q8_0.gguf".to_owned()],
+            file_specs: vec![DownloadFileSpec {
+                repo_id: "Tencent-Hunyuan/Hy-MT2-1.8B-GGUF".to_owned(),
+                file: "Hy-MT2-1.8B-Q8_0.gguf".to_owned(),
+                dest: "Hy-MT2-1.8B-Q8_0.gguf".to_owned(),
+            }],
             size_text: "~1.9 GB".to_owned(),
             kind: "translation".to_owned(),
             ocr_variant: None,
@@ -131,9 +168,28 @@ fn downloadable_models() -> Vec<DownloadableModel> {
         DownloadableModel {
             id: "ppocr-v5-mobile".to_owned(),
             name: "PP-OCR v5 mobile".to_owned(),
-            description: "轻量检测+识别，适合实时字幕".to_owned(),
-            repo_id: "damo/PPOCR-v5-mobile".to_owned(),
-            files: vec!["det.onnx".to_owned(), "rec.onnx".to_owned()],
+            description: "轻量检测+识别，适合实时字幕，ModelScope: PaddlePaddle/PP-OCRv5".to_owned(),
+            repo_id: "PaddlePaddle/PP-OCRv5_mobile_det_safetensors".to_owned(),
+            files: vec![
+                "mobile_det/model.safetensors".to_owned(),
+                "mobile_det/config.json".to_owned(),
+                "mobile_det/preprocessor_config.json".to_owned(),
+                "mobile_det/inference.yml".to_owned(),
+                "mobile_rec/model.safetensors".to_owned(),
+                "mobile_rec/config.json".to_owned(),
+                "mobile_rec/preprocessor_config.json".to_owned(),
+                "mobile_rec/inference.yml".to_owned(),
+            ],
+            file_specs: vec![
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_mobile_det_safetensors".to_owned(), file: "model.safetensors".to_owned(), dest: "mobile_det/model.safetensors".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_mobile_det_safetensors".to_owned(), file: "config.json".to_owned(), dest: "mobile_det/config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_mobile_det_safetensors".to_owned(), file: "preprocessor_config.json".to_owned(), dest: "mobile_det/preprocessor_config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_mobile_det_safetensors".to_owned(), file: "inference.yml".to_owned(), dest: "mobile_det/inference.yml".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_mobile_rec_safetensors".to_owned(), file: "model.safetensors".to_owned(), dest: "mobile_rec/model.safetensors".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_mobile_rec_safetensors".to_owned(), file: "config.json".to_owned(), dest: "mobile_rec/config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_mobile_rec_safetensors".to_owned(), file: "preprocessor_config.json".to_owned(), dest: "mobile_rec/preprocessor_config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_mobile_rec_safetensors".to_owned(), file: "inference.yml".to_owned(), dest: "mobile_rec/inference.yml".to_owned() },
+            ],
             size_text: "~18 MB".to_owned(),
             kind: "ocr".to_owned(),
             ocr_variant: Some("v5-mobile".to_owned()),
@@ -142,9 +198,28 @@ fn downloadable_models() -> Vec<DownloadableModel> {
         DownloadableModel {
             id: "ppocr-v5-server".to_owned(),
             name: "PP-OCR v5 server".to_owned(),
-            description: "高精度检测+识别".to_owned(),
-            repo_id: "damo/PPOCR-v5-server".to_owned(),
-            files: vec!["det.onnx".to_owned(), "rec.onnx".to_owned()],
+            description: "高精度检测+识别，ModelScope: PaddlePaddle/PP-OCRv5".to_owned(),
+            repo_id: "PaddlePaddle/PP-OCRv5_server_det_safetensors".to_owned(),
+            files: vec![
+                "server_det/model.safetensors".to_owned(),
+                "server_det/config.json".to_owned(),
+                "server_det/preprocessor_config.json".to_owned(),
+                "server_det/inference.yml".to_owned(),
+                "server_rec/model.safetensors".to_owned(),
+                "server_rec/config.json".to_owned(),
+                "server_rec/preprocessor_config.json".to_owned(),
+                "server_rec/inference.yml".to_owned(),
+            ],
+            file_specs: vec![
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_server_det_safetensors".to_owned(), file: "model.safetensors".to_owned(), dest: "server_det/model.safetensors".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_server_det_safetensors".to_owned(), file: "config.json".to_owned(), dest: "server_det/config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_server_det_safetensors".to_owned(), file: "preprocessor_config.json".to_owned(), dest: "server_det/preprocessor_config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_server_det_safetensors".to_owned(), file: "inference.yml".to_owned(), dest: "server_det/inference.yml".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_server_rec_safetensors".to_owned(), file: "model.safetensors".to_owned(), dest: "server_rec/model.safetensors".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_server_rec_safetensors".to_owned(), file: "config.json".to_owned(), dest: "server_rec/config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_server_rec_safetensors".to_owned(), file: "preprocessor_config.json".to_owned(), dest: "server_rec/preprocessor_config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv5_server_rec_safetensors".to_owned(), file: "inference.yml".to_owned(), dest: "server_rec/inference.yml".to_owned() },
+            ],
             size_text: "~55 MB".to_owned(),
             kind: "ocr".to_owned(),
             ocr_variant: Some("v5-server".to_owned()),
@@ -153,9 +228,30 @@ fn downloadable_models() -> Vec<DownloadableModel> {
         DownloadableModel {
             id: "ppocr-v6-tiny".to_owned(),
             name: "PP-OCR v6 tiny".to_owned(),
-            description: "超轻量，速度最快".to_owned(),
-            repo_id: "damo/PPOCR-v6-tiny".to_owned(),
-            files: vec!["det.onnx".to_owned(), "rec.onnx".to_owned()],
+            description: "超轻量，速度最快，ModelScope: PaddlePaddle/PP-OCRv6".to_owned(),
+            repo_id: "PaddlePaddle/PP-OCRv6_tiny_det_safetensors".to_owned(),
+            files: vec![
+                "tiny_det/model.safetensors".to_owned(),
+                "tiny_det/config.json".to_owned(),
+                "tiny_det/preprocessor_config.json".to_owned(),
+                "tiny_det/inference.yml".to_owned(),
+                "tiny_det/configuration.json".to_owned(),
+                "tiny_rec/model.safetensors".to_owned(),
+                "tiny_rec/config.json".to_owned(),
+                "tiny_rec/preprocessor_config.json".to_owned(),
+                "tiny_rec/inference.yml".to_owned(),
+            ],
+            file_specs: vec![
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_tiny_det_safetensors".to_owned(), file: "model.safetensors".to_owned(), dest: "tiny_det/model.safetensors".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_tiny_det_safetensors".to_owned(), file: "config.json".to_owned(), dest: "tiny_det/config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_tiny_det_safetensors".to_owned(), file: "preprocessor_config.json".to_owned(), dest: "tiny_det/preprocessor_config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_tiny_det_safetensors".to_owned(), file: "inference.yml".to_owned(), dest: "tiny_det/inference.yml".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_tiny_det_safetensors".to_owned(), file: "configuration.json".to_owned(), dest: "tiny_det/configuration.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_tiny_rec_safetensors".to_owned(), file: "model.safetensors".to_owned(), dest: "tiny_rec/model.safetensors".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_tiny_rec_safetensors".to_owned(), file: "config.json".to_owned(), dest: "tiny_rec/config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_tiny_rec_safetensors".to_owned(), file: "preprocessor_config.json".to_owned(), dest: "tiny_rec/preprocessor_config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_tiny_rec_safetensors".to_owned(), file: "inference.yml".to_owned(), dest: "tiny_rec/inference.yml".to_owned() },
+            ],
             size_text: "~8 MB".to_owned(),
             kind: "ocr".to_owned(),
             ocr_variant: Some("v6-tiny".to_owned()),
@@ -164,9 +260,30 @@ fn downloadable_models() -> Vec<DownloadableModel> {
         DownloadableModel {
             id: "ppocr-v6-small".to_owned(),
             name: "PP-OCR v6 small".to_owned(),
-            description: "均衡精度与速度".to_owned(),
-            repo_id: "damo/PPOCR-v6-small".to_owned(),
-            files: vec!["det.onnx".to_owned(), "rec.onnx".to_owned()],
+            description: "均衡精度与速度，ModelScope: PaddlePaddle/PP-OCRv6".to_owned(),
+            repo_id: "PaddlePaddle/PP-OCRv6_small_det_safetensors".to_owned(),
+            files: vec![
+                "small_det/model.safetensors".to_owned(),
+                "small_det/config.json".to_owned(),
+                "small_det/preprocessor_config.json".to_owned(),
+                "small_det/inference.yml".to_owned(),
+                "small_det/configuration.json".to_owned(),
+                "small_rec/model.safetensors".to_owned(),
+                "small_rec/config.json".to_owned(),
+                "small_rec/preprocessor_config.json".to_owned(),
+                "small_rec/inference.yml".to_owned(),
+            ],
+            file_specs: vec![
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_small_det_safetensors".to_owned(), file: "model.safetensors".to_owned(), dest: "small_det/model.safetensors".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_small_det_safetensors".to_owned(), file: "config.json".to_owned(), dest: "small_det/config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_small_det_safetensors".to_owned(), file: "preprocessor_config.json".to_owned(), dest: "small_det/preprocessor_config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_small_det_safetensors".to_owned(), file: "inference.yml".to_owned(), dest: "small_det/inference.yml".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_small_det_safetensors".to_owned(), file: "configuration.json".to_owned(), dest: "small_det/configuration.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_small_rec_safetensors".to_owned(), file: "model.safetensors".to_owned(), dest: "small_rec/model.safetensors".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_small_rec_safetensors".to_owned(), file: "config.json".to_owned(), dest: "small_rec/config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_small_rec_safetensors".to_owned(), file: "preprocessor_config.json".to_owned(), dest: "small_rec/preprocessor_config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_small_rec_safetensors".to_owned(), file: "inference.yml".to_owned(), dest: "small_rec/inference.yml".to_owned() },
+            ],
             size_text: "~22 MB".to_owned(),
             kind: "ocr".to_owned(),
             ocr_variant: Some("v6-small".to_owned()),
@@ -175,9 +292,30 @@ fn downloadable_models() -> Vec<DownloadableModel> {
         DownloadableModel {
             id: "ppocr-v6-medium".to_owned(),
             name: "PP-OCR v6 medium".to_owned(),
-            description: "高精度，适合离线批量".to_owned(),
-            repo_id: "damo/PPOCR-v6-medium".to_owned(),
-            files: vec!["det.onnx".to_owned(), "rec.onnx".to_owned()],
+            description: "高精度，适合离线批量，ModelScope: PaddlePaddle/PP-OCRv6".to_owned(),
+            repo_id: "PaddlePaddle/PP-OCRv6_medium_det_safetensors".to_owned(),
+            files: vec![
+                "medium_det/model.safetensors".to_owned(),
+                "medium_det/config.json".to_owned(),
+                "medium_det/preprocessor_config.json".to_owned(),
+                "medium_det/inference.yml".to_owned(),
+                "medium_det/configuration.json".to_owned(),
+                "medium_rec/model.safetensors".to_owned(),
+                "medium_rec/config.json".to_owned(),
+                "medium_rec/preprocessor_config.json".to_owned(),
+                "medium_rec/inference.yml".to_owned(),
+            ],
+            file_specs: vec![
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_medium_det_safetensors".to_owned(), file: "model.safetensors".to_owned(), dest: "medium_det/model.safetensors".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_medium_det_safetensors".to_owned(), file: "config.json".to_owned(), dest: "medium_det/config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_medium_det_safetensors".to_owned(), file: "preprocessor_config.json".to_owned(), dest: "medium_det/preprocessor_config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_medium_det_safetensors".to_owned(), file: "inference.yml".to_owned(), dest: "medium_det/inference.yml".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_medium_det_safetensors".to_owned(), file: "configuration.json".to_owned(), dest: "medium_det/configuration.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_medium_rec_safetensors".to_owned(), file: "model.safetensors".to_owned(), dest: "medium_rec/model.safetensors".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_medium_rec_safetensors".to_owned(), file: "config.json".to_owned(), dest: "medium_rec/config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_medium_rec_safetensors".to_owned(), file: "preprocessor_config.json".to_owned(), dest: "medium_rec/preprocessor_config.json".to_owned() },
+                DownloadFileSpec { repo_id: "PaddlePaddle/PP-OCRv6_medium_rec_safetensors".to_owned(), file: "inference.yml".to_owned(), dest: "medium_rec/inference.yml".to_owned() },
+            ],
             size_text: "~158 MB".to_owned(),
             kind: "ocr".to_owned(),
             ocr_variant: Some("v6-medium".to_owned()),
@@ -188,6 +326,18 @@ fn downloadable_models() -> Vec<DownloadableModel> {
 
 pub fn modelscope_resolve_url(repo_id: &str, file: &str) -> String {
     format!("{MODELSCOPE_BASE}/{repo_id}/resolve/master/{file}")
+}
+
+pub fn huggingface_resolve_url(repo_id: &str, file: &str) -> String {
+    format!("{HUGGINGFACE_BASE}/{repo_id}/resolve/main/{file}")
+}
+
+fn resolve_download_url(repo_id: &str, file: &str, source: &str) -> String {
+    if source == "huggingface" {
+        huggingface_resolve_url(repo_id, file)
+    } else {
+        modelscope_resolve_url(repo_id, file)
+    }
 }
 
 fn emit_progress(app: &AppHandle, state: &DownloadTaskState) {
@@ -202,6 +352,44 @@ fn emit_progress(app: &AppHandle, state: &DownloadTaskState) {
     };
     let _ = app.emit("model-download-progress", event);
 }
+
+fn is_retryable_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    // 网络抖动 / 超时 / 连接重置 / 403 CDN 限流 / 5xx 均可重试
+    lower.contains("403")
+        || lower.contains("forbidden")
+        || lower.contains("429")
+        || lower.contains("too many requests")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("connection")
+        || lower.contains("reset")
+        || lower.contains("broken pipe")
+        || lower.contains("50")
+        || lower.contains("denied by ua")
+        || lower.contains("blacklist")
+}
+
+fn friendly_download_error(spec: &DownloadFileSpec, url: &str, err: &str, source: &str, dest: &Path) -> String {
+    let lower = err.to_ascii_lowercase();
+    let base = format!("下载失败 {}: {err}", spec.dest);
+    if lower.contains("403") || lower.contains("forbidden") || lower.contains("denied by ua") || lower.contains("blacklist") {
+        format!(
+            "{base}；ModelScope CDN 拒绝访问 (403)，通常为网络连接问题或 UA 被拦截。已自动使用浏览器标识重试仍失败，请：1) 点击“重试” 2) 检查网络/系统代理后重试 3) 手动在浏览器打开 {url} 下载后放到 {}。源: {source}",
+            dest.display()
+        )
+    } else if lower.contains("timed out") || lower.contains("timeout") || lower.contains("connection") {
+        format!(
+            "{base}；网络连接超时或中断，请检查网络/代理后重试，或手动下载 {url} 到 {}。源: {source}",
+            dest.display()
+        )
+    } else if lower.contains("404") || lower.contains("not found") {
+        format!("{base}；文件在 {source} 未找到 (404)，请确认链接 {url} 是否有效")
+    } else {
+        format!("{base}；{err}；可尝试重试或手动下载 {url} 到 {}", dest.display())
+    }
+}
+
 
 #[tauri::command]
 pub fn list_downloadable_models() -> Vec<DownloadableModel> {
@@ -274,7 +462,7 @@ pub async fn start_model_download(
     }
     emit_progress(&app, &initial);
 
-    // 读取模型根目录用于占位文件落盘（不实际下载网络，仅模拟进度）
+    // 读取模型根目录
     let model_root: PathBuf = {
         let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
         let settings = guard.as_ref().map_err(|err| err.clone())?;
@@ -284,84 +472,345 @@ pub async fn start_model_download(
     let app_clone = app.clone();
     let model_id_clone = model_id.clone();
     let source_clone = source.clone();
+    let model_clone = model.clone();
 
-    // 使用 modelscope resolve URL 拼接示例（日志用途，展示默认源）
-    for file in &model.files {
-        let url = modelscope_resolve_url(&model.repo_id, file);
-        // 仅作为日志/注释：实际下载会请求此 URL
-        let _ = url;
-    }
-
-    tokio::spawn(async move {
-        let total_steps: u8 = 100;
-        for step in 1..=total_steps {
-            tokio::time::sleep(Duration::from_millis(35)).await;
-
-            let cancelled = {
-                cancel_flags()
-                    .lock()
-                    .ok()
-                    .and_then(|m| m.get(&model_id_clone).copied())
-                    .unwrap_or(false)
+    // 使用 simple_downloader 进行真实下载
+    let handle = tokio::spawn(async move {
+        let file_specs: Vec<DownloadFileSpec> = if !model_clone.file_specs.is_empty() {
+            model_clone.file_specs.clone()
+        } else {
+            model_clone
+                .files
+                .iter()
+                .map(|f| DownloadFileSpec {
+                    repo_id: model_clone.repo_id.clone(),
+                    file: f.clone(),
+                    dest: f.clone(),
+                })
+                .collect()
+        };
+        let total_files = file_specs.len() as u64;
+        if total_files == 0 {
+            let error_state = DownloadTaskState {
+                model_id: model_id_clone.clone(),
+                source: source_clone.clone(),
+                status: DownloadStatus::Error,
+                progress: 0,
+                downloaded_bytes: 0,
+                total_bytes: 100,
+                message: Some("模型文件列表为空".to_owned()),
             };
+            if let Ok(mut map) = task_map().lock() {
+                map.insert(model_id_clone.clone(), error_state.clone());
+            }
+            emit_progress(&app_clone, &error_state);
+            return;
+        }
+
+        let base_dir = model_root.join("downloads").join(&model_id_clone);
+        if let Err(err) = tokio::fs::create_dir_all(&base_dir).await {
+            let error_state = DownloadTaskState {
+                model_id: model_id_clone.clone(),
+                source: source_clone.clone(),
+                status: DownloadStatus::Error,
+                progress: 0,
+                downloaded_bytes: 0,
+                total_bytes: 100,
+                message: Some(format!("创建目录失败: {err}")),
+            };
+            if let Ok(mut map) = task_map().lock() {
+                map.insert(model_id_clone.clone(), error_state.clone());
+            }
+            emit_progress(&app_clone, &error_state);
+            return;
+        }
+
+        for (idx, spec) in file_specs.iter().enumerate() {
+            // 检查取消
+            let cancelled = cancel_flags()
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&model_id_clone).copied())
+                .unwrap_or(false);
             if cancelled {
                 let cancelled_state = DownloadTaskState {
                     model_id: model_id_clone.clone(),
                     source: source_clone.clone(),
                     status: DownloadStatus::Cancelled,
-                    progress: step.saturating_sub(1),
-                    downloaded_bytes: u64::from(step.saturating_sub(1)),
-                    total_bytes: u64::from(total_steps),
+                    progress: ((idx as f64 / total_files as f64) * 100.0) as u8,
+                    downloaded_bytes: idx as u64,
+                    total_bytes: total_files,
                     message: Some("已取消".to_owned()),
                 };
-                {
-                    let map_arc = task_map();
-                    if let Ok(mut map) = map_arc.lock() {
-                        map.insert(model_id_clone.clone(), cancelled_state.clone());
-                    }
+                if let Ok(mut map) = task_map().lock() {
+                    map.insert(model_id_clone.clone(), cancelled_state.clone());
                 }
                 emit_progress(&app_clone, &cancelled_state);
                 return;
             }
 
-            let progress_state = DownloadTaskState {
-                model_id: model_id_clone.clone(),
-                source: source_clone.clone(),
-                status: if step == total_steps {
-                    DownloadStatus::Completed
-                } else {
-                    DownloadStatus::Downloading
-                },
-                progress: step,
-                downloaded_bytes: u64::from(step),
-                total_bytes: u64::from(total_steps),
-                message: if step == total_steps {
-                    Some("下载完成，已注册到本地".to_owned())
-                } else {
-                    None
-                },
-            };
+            let url = resolve_download_url(&spec.repo_id, &spec.file, &source_clone);
+            let dest_path = base_dir.join(&spec.dest);
+            if let Some(parent) = dest_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
 
-            {
-                let map_arc = task_map();
-                if let Ok(mut map) = map_arc.lock() {
-                    map.insert(model_id_clone.clone(), progress_state.clone());
+            // 带重试的下载：首试 8 线程，失败自动降级为单线程，并使用浏览器 UA 避免 403 `denied by UA ACL = blacklist`
+            let mut last_err: Option<String> = None;
+            let mut succeeded = false;
+            let mut was_cancelled = false;
+            for attempt in 0..MAX_RETRIES {
+                // 重试前检查取消
+                let cancelled_before = cancel_flags()
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&model_id_clone).copied())
+                    .unwrap_or(false);
+                if cancelled_before {
+                    was_cancelled = true;
+                    break;
+                }
+                if attempt > 0 {
+                    let delay_ms = 500u64 * (1u64 << (attempt - 1));
+                    let retry_msg = format!(
+                        "下载 {} 遇到网络问题，正在重试 {}/{}（{}）...",
+                        spec.dest,
+                        attempt + 1,
+                        MAX_RETRIES,
+                        last_err.clone().unwrap_or_default()
+                    );
+                    let retry_state = DownloadTaskState {
+                        model_id: model_id_clone.clone(),
+                        source: source_clone.clone(),
+                        status: DownloadStatus::Downloading,
+                        progress: ((idx as f64 / total_files as f64) * 100.0) as u8,
+                        downloaded_bytes: idx as u64,
+                        total_bytes: total_files,
+                        message: Some(retry_msg),
+                    };
+                    if let Ok(mut map) = task_map().lock() {
+                        map.insert(model_id_clone.clone(), retry_state.clone());
+                    }
+                    emit_progress(&app_clone, &retry_state);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    // 再次检查取消
+                    let cancelled_during_wait = cancel_flags()
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&model_id_clone).copied())
+                        .unwrap_or(false);
+                    if cancelled_during_wait {
+                        was_cancelled = true;
+                        break;
+                    }
+                }
+                let workers = if attempt == 0 { 8 } else { 1 };
+                let url_clone = url.clone();
+                let dest_str = dest_path.to_string_lossy().to_string();
+                let app_for_file = app_clone.clone();
+                let model_id_for_file = model_id_clone.clone();
+                let source_for_file = source_clone.clone();
+                let file_idx = idx as u64;
+                let file_name = spec.dest.clone();
+
+                let download_result = {
+                    let cancel_flags_for_select = cancel_flags();
+                    let model_id_for_select = model_id_clone.clone();
+                    let download_fut = async move {
+                        let builder = Downloader::builder(url_clone.clone(), dest_str.clone())
+                            .workers(workers)
+                            .update_interval(0.5)
+                            .client_builder(|| {
+                                simple_downloader::reqwest::ClientBuilder::new()
+                                    .user_agent(BROWSER_UA)
+                                    .timeout(Duration::from_secs(180))
+                                    .connect_timeout(Duration::from_secs(15))
+                                    .pool_max_idle_per_host(8)
+                            });
+                        #[cfg(feature = "resume")]
+                        let builder = builder.resume(true);
+                        let res = builder
+                            .run(move |total_size, mut info_rx| {
+                                let app_inner = app_for_file.clone();
+                                let model_id_inner = model_id_for_file.clone();
+                                let file_name_inner = file_name.clone();
+                                let source_inner = source_for_file.clone();
+                                async move {
+                                    while let Ok(info) = info_rx.recv().await {
+                                        if let DownloadInfo::MonitorUpdate {
+                                            total_downloaded,
+                                            total_size: _,
+                                            ..
+                                        } = &info
+                                        {
+                                            let file_progress = if total_size > 0 {
+                                                *total_downloaded as f64 / total_size as f64
+                                            } else {
+                                                0.0
+                                            };
+                                            let overall_progress = ((file_idx as f64 + file_progress)
+                                                / total_files as f64
+                                                * 100.0) as u8;
+                                            let overall_progress = overall_progress.min(100);
+                                            let speed_msg = format!("{:.2} MB/s", info.speed_mbps());
+                                            let msg = if file_progress < 1.0 {
+                                                Some(format!(
+                                                    "下载 {file_name_inner} {overall_progress}% {speed_msg}"
+                                                ))
+                                            } else {
+                                                None
+                                            };
+                                            let state = DownloadTaskState {
+                                                model_id: model_id_inner.clone(),
+                                                source: source_inner.clone(),
+                                                status: DownloadStatus::Downloading,
+                                                progress: overall_progress,
+                                                downloaded_bytes: *total_downloaded,
+                                                total_bytes: total_size,
+                                                message: msg,
+                                            };
+                                            if let Ok(mut map) = task_map().lock() {
+                                                map.insert(model_id_inner.clone(), state.clone());
+                                            }
+                                            emit_progress(&app_inner, &state);
+                                            if info.is_complete() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            })
+                            .await;
+                        res
+                    };
+                    let model_id_for_cancel = model_id_for_select.clone();
+                    let cancel_fut = async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            let is_cancelled = cancel_flags_for_select
+                                .lock()
+                                .ok()
+                                .and_then(|m| m.get(&model_id_for_cancel).copied())
+                                .unwrap_or(false);
+                            if is_cancelled {
+                                break;
+                            }
+                        }
+                    };
+                    tokio::select! {
+                        res = download_fut => Some(res),
+                        _ = cancel_fut => None,
+                    }
+                };
+
+                match download_result {
+                    Some(Ok(())) => {
+                        succeeded = true;
+                        break;
+                    }
+                    Some(Err(err)) => {
+                        let err_str = format!("{err}");
+                        last_err = Some(err_str.clone());
+                        // 非重试错误或已达最大重试直接退出
+                        if !is_retryable_error(&err_str) || attempt + 1 == MAX_RETRIES {
+                            break;
+                        }
+                        // 可重试则进入下一轮
+                    }
+                    None => {
+                        was_cancelled = true;
+                        break;
+                    }
                 }
             }
-            emit_progress(&app_clone, &progress_state);
 
-            if step == total_steps {
-                // 模拟落盘：创建占位文件，避免空目录
-                let dir = model_root.join("downloads").join(&model_id_clone);
-                let _ = std::fs::create_dir_all(&dir);
-                let placeholder = dir.join(".download_complete");
-                let _ = std::fs::write(placeholder, format!("source={source_clone}"));
+            if was_cancelled {
+                let cancelled_state = DownloadTaskState {
+                    model_id: model_id_clone.clone(),
+                    source: source_clone.clone(),
+                    status: DownloadStatus::Cancelled,
+                    progress: ((idx as f64 / total_files as f64) * 100.0) as u8,
+                    downloaded_bytes: idx as u64,
+                    total_bytes: total_files,
+                    message: Some("已取消".to_owned()),
+                };
+                if let Ok(mut map) = task_map().lock() {
+                    map.insert(model_id_clone.clone(), cancelled_state.clone());
+                }
+                emit_progress(&app_clone, &cancelled_state);
+                if let Ok(mut handles) = download_handles().lock() {
+                    handles.remove(&model_id_clone);
+                }
+                return;
             }
+            if succeeded {
+                let overall_progress = (((idx + 1) as f64 / total_files as f64) * 100.0) as u8;
+                let state = DownloadTaskState {
+                    model_id: model_id_clone.clone(),
+                    source: source_clone.clone(),
+                    status: if (idx + 1) as u64 == total_files {
+                        DownloadStatus::Completed
+                    } else {
+                        DownloadStatus::Downloading
+                    },
+                    progress: overall_progress,
+                    downloaded_bytes: (idx + 1) as u64,
+                    total_bytes: total_files,
+                    message: if (idx + 1) as u64 == total_files {
+                        Some("下载完成，已落盘".to_owned())
+                    } else {
+                        Some(format!("已完成 {}/{} 文件", idx + 1, total_files))
+                    },
+                };
+                if let Ok(mut map) = task_map().lock() {
+                    map.insert(model_id_clone.clone(), state.clone());
+                }
+                emit_progress(&app_clone, &state);
+                if (idx + 1) as u64 == total_files {
+                    let placeholder = base_dir.join(".download_complete");
+                    let _ = tokio::fs::write(&placeholder, format!("source={source_clone}")).await;
+                    if let Ok(mut handles) = download_handles().lock() {
+                        handles.remove(&model_id_clone);
+                    }
+                    return;
+                }
+            } else {
+                let err_str = last_err.unwrap_or_else(|| "未知错误".to_owned());
+                let friendly = friendly_download_error(&spec, &url, &err_str, &source_clone, &dest_path);
+                let error_state = DownloadTaskState {
+                    model_id: model_id_clone.clone(),
+                    source: source_clone.clone(),
+                    status: DownloadStatus::Error,
+                    progress: ((idx as f64 / total_files as f64) * 100.0) as u8,
+                    downloaded_bytes: idx as u64,
+                    total_bytes: total_files,
+                    message: Some(friendly),
+                };
+                if let Ok(mut map) = task_map().lock() {
+                    map.insert(model_id_clone.clone(), error_state.clone());
+                }
+                emit_progress(&app_clone, &error_state);
+                if let Ok(mut handles) = download_handles().lock() {
+                    handles.remove(&model_id_clone);
+                }
+                return;
+            }
+        }
+
+        // 清理句柄（正常完成分支已清理，此处兜底）
+        if let Ok(mut handles) = download_handles().lock() {
+            handles.remove(&model_id_clone);
         }
     });
 
+    // 保存句柄以支持取消
+    if let Ok(mut handles) = download_handles().lock() {
+        handles.insert(model_id.clone(), handle);
+    }
+
     Ok(initial)
 }
+
 #[tauri::command]
 pub fn cancel_model_download(request: CancelDownloadRequest) -> Result<(), String> {
     let model_id = request.model_id.trim().to_owned();
@@ -371,6 +820,13 @@ pub fn cancel_model_download(request: CancelDownloadRequest) -> Result<(), Strin
     let flags_arc = cancel_flags();
     let mut flags = flags_arc.lock().map_err(|_| "锁失败".to_owned())?;
     flags.insert(model_id.clone(), true);
+
+    // 中止对应的下载任务
+    if let Ok(mut handles) = download_handles().lock() {
+        if let Some(handle) = handles.remove(&model_id) {
+            handle.abort();
+        }
+    }
 
     {
         let map_arc = task_map();

@@ -8,19 +8,31 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
  */
 export type DownloadSource = "modelscope" | "huggingface";
 
+export interface DownloadFileSpec {
+  repoId: string;
+  file: string;
+  dest: string;
+}
+
 export interface DownloadableModel {
   id: string;
   name: string;
   description: string;
   repoId: string;
   files: string[];
+  fileSpecs?: DownloadFileSpec[];
   sizeText: string;
   kind: "translation" | "ocr" | "font";
   ocrVariant?: string;
   recommended?: boolean;
 }
 
-export type DownloadStatus = "idle" | "downloading" | "completed" | "error" | "cancelled";
+export type DownloadStatus =
+  | "idle"
+  | "downloading"
+  | "completed"
+  | "error"
+  | "cancelled";
 
 export interface DownloadTaskState {
   modelId: string;
@@ -42,15 +54,18 @@ export interface ModelDownloadProgressEvent {
   message?: string;
 }
 
-type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+type InvokeFn = <T>(
+  command: string,
+  args?: Record<string, unknown>,
+) => Promise<T>;
 
 /** ModelScope 默认源的推荐清单 */
 export const MODELSCOPE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
   {
     id: "hy-mt2-1.8b-q4",
     name: "Hy-MT2 1.8B Q4_K_M",
-    description: "多语言翻译核心，ModelScope: LLM-Research/Hy-MT2",
-    repoId: "LLM-Research/Hy-MT2-1.8B",
+    description: "多语言翻译核心，ModelScope: Tencent-Hunyuan/Hy-MT2-1.8B-GGUF",
+    repoId: "Tencent-Hunyuan/Hy-MT2-1.8B-GGUF",
     files: ["Hy-MT2-1.8B-Q4_K_M.gguf"],
     sizeText: "~1.1 GB",
     kind: "translation",
@@ -59,8 +74,8 @@ export const MODELSCOPE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
   {
     id: "hy-mt2-1.8b-q6k",
     name: "Hy-MT2 1.8B Q6_K",
-    description: "多语言翻译核心，ModelScope: LLM-Research/Hy-MT2",
-    repoId: "LLM-Research/Hy-MT2-1.8B",
+    description: "多语言翻译核心，ModelScope: Tencent-Hunyuan/Hy-MT2-1.8B-GGUF",
+    repoId: "Tencent-Hunyuan/Hy-MT2-1.8B-GGUF",
     files: ["Hy-MT2-1.8B-Q6_K.gguf"],
     sizeText: "~1.5 GB",
     kind: "translation",
@@ -68,8 +83,8 @@ export const MODELSCOPE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
   {
     id: "hy-mt2-1.8b-q8",
     name: "Hy-MT2 1.8B Q8_0",
-    description: "多语言翻译核心，ModelScope: LLM-Research/Hy-MT2",
-    repoId: "LLM-Research/Hy-MT2-1.8B",
+    description: "多语言翻译核心，ModelScope: Tencent-Hunyuan/Hy-MT2-1.8B-GGUF",
+    repoId: "Tencent-Hunyuan/Hy-MT2-1.8B-GGUF",
     files: ["Hy-MT2-1.8B-Q8_0.gguf"],
     sizeText: "~1.9 GB",
     kind: "translation",
@@ -77,20 +92,122 @@ export const MODELSCOPE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
   {
     id: "ppocr-v5-mobile",
     name: "PP-OCR v5 mobile",
-    description: "轻量检测+识别，适合实时字幕",
-    repoId: "damo/PPOCR-v5-mobile",
-    files: ["det.onnx", "rec.onnx", "inference.yml"],
+    description:
+      "轻量检测+识别，适合实时字幕，ModelScope: PaddlePaddle/PP-OCRv5",
+    repoId: "PaddlePaddle/PP-OCRv5_mobile_det_safetensors",
+    files: [
+      "mobile_det/model.safetensors",
+      "mobile_det/config.json",
+      "mobile_det/preprocessor_config.json",
+      "mobile_det/inference.yml",
+      "mobile_rec/model.safetensors",
+      "mobile_rec/config.json",
+      "mobile_rec/preprocessor_config.json",
+      "mobile_rec/inference.yml",
+    ],
+    fileSpecs: [
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_mobile_det_safetensors",
+        file: "model.safetensors",
+        dest: "mobile_det/model.safetensors",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_mobile_det_safetensors",
+        file: "config.json",
+        dest: "mobile_det/config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_mobile_det_safetensors",
+        file: "preprocessor_config.json",
+        dest: "mobile_det/preprocessor_config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_mobile_det_safetensors",
+        file: "inference.yml",
+        dest: "mobile_det/inference.yml",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_mobile_rec_safetensors",
+        file: "model.safetensors",
+        dest: "mobile_rec/model.safetensors",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_mobile_rec_safetensors",
+        file: "config.json",
+        dest: "mobile_rec/config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_mobile_rec_safetensors",
+        file: "preprocessor_config.json",
+        dest: "mobile_rec/preprocessor_config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_mobile_rec_safetensors",
+        file: "inference.yml",
+        dest: "mobile_rec/inference.yml",
+      },
+    ],
     sizeText: "~18 MB",
     kind: "ocr",
     ocrVariant: "v5-mobile",
-    recommended: true,
   },
   {
     id: "ppocr-v5-server",
     name: "PP-OCR v5 server",
-    description: "高精度检测+识别，适合批量图片",
-    repoId: "damo/PPOCR-v5-server",
-    files: ["det.onnx", "rec.onnx", "inference.yml"],
+    description: "高精度检测+识别，ModelScope: PaddlePaddle/PP-OCRv5",
+    repoId: "PaddlePaddle/PP-OCRv5_server_det_safetensors",
+    files: [
+      "server_det/model.safetensors",
+      "server_det/config.json",
+      "server_det/preprocessor_config.json",
+      "server_det/inference.yml",
+      "server_rec/model.safetensors",
+      "server_rec/config.json",
+      "server_rec/preprocessor_config.json",
+      "server_rec/inference.yml",
+    ],
+    fileSpecs: [
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_server_det_safetensors",
+        file: "model.safetensors",
+        dest: "server_det/model.safetensors",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_server_det_safetensors",
+        file: "config.json",
+        dest: "server_det/config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_server_det_safetensors",
+        file: "preprocessor_config.json",
+        dest: "server_det/preprocessor_config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_server_det_safetensors",
+        file: "inference.yml",
+        dest: "server_det/inference.yml",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_server_rec_safetensors",
+        file: "model.safetensors",
+        dest: "server_rec/model.safetensors",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_server_rec_safetensors",
+        file: "config.json",
+        dest: "server_rec/config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_server_rec_safetensors",
+        file: "preprocessor_config.json",
+        dest: "server_rec/preprocessor_config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv5_server_rec_safetensors",
+        file: "inference.yml",
+        dest: "server_rec/inference.yml",
+      },
+    ],
     sizeText: "~55 MB",
     kind: "ocr",
     ocrVariant: "v5-server",
@@ -98,9 +215,66 @@ export const MODELSCOPE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
   {
     id: "ppocr-v6-tiny",
     name: "PP-OCR v6 tiny",
-    description: "超轻量，速度最快",
-    repoId: "damo/PPOCR-v6-tiny",
-    files: ["det.onnx", "rec.onnx"],
+    description: "超轻量，速度最快，ModelScope: PaddlePaddle/PP-OCRv6",
+    repoId: "PaddlePaddle/PP-OCRv6_tiny_det_safetensors",
+    files: [
+      "tiny_det/model.safetensors",
+      "tiny_det/config.json",
+      "tiny_det/preprocessor_config.json",
+      "tiny_det/inference.yml",
+      "tiny_det/configuration.json",
+      "tiny_rec/model.safetensors",
+      "tiny_rec/config.json",
+      "tiny_rec/preprocessor_config.json",
+      "tiny_rec/inference.yml",
+    ],
+    fileSpecs: [
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_tiny_det_safetensors",
+        file: "model.safetensors",
+        dest: "tiny_det/model.safetensors",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_tiny_det_safetensors",
+        file: "config.json",
+        dest: "tiny_det/config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_tiny_det_safetensors",
+        file: "preprocessor_config.json",
+        dest: "tiny_det/preprocessor_config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_tiny_det_safetensors",
+        file: "inference.yml",
+        dest: "tiny_det/inference.yml",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_tiny_det_safetensors",
+        file: "configuration.json",
+        dest: "tiny_det/configuration.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_tiny_rec_safetensors",
+        file: "model.safetensors",
+        dest: "tiny_rec/model.safetensors",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_tiny_rec_safetensors",
+        file: "config.json",
+        dest: "tiny_rec/config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_tiny_rec_safetensors",
+        file: "preprocessor_config.json",
+        dest: "tiny_rec/preprocessor_config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_tiny_rec_safetensors",
+        file: "inference.yml",
+        dest: "tiny_rec/inference.yml",
+      },
+    ],
     sizeText: "~8 MB",
     kind: "ocr",
     ocrVariant: "v6-tiny",
@@ -108,19 +282,134 @@ export const MODELSCOPE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
   {
     id: "ppocr-v6-small",
     name: "PP-OCR v6 small",
-    description: "均衡精度与速度",
-    repoId: "damo/PPOCR-v6-small",
-    files: ["det.onnx", "rec.onnx"],
+    description: "均衡精度与速度，ModelScope: PaddlePaddle/PP-OCRv6",
+    repoId: "PaddlePaddle/PP-OCRv6_small_det_safetensors",
+    files: [
+      "small_det/model.safetensors",
+      "small_det/config.json",
+      "small_det/preprocessor_config.json",
+      "small_det/inference.yml",
+      "small_det/configuration.json",
+      "small_rec/model.safetensors",
+      "small_rec/config.json",
+      "small_rec/preprocessor_config.json",
+      "small_rec/inference.yml",
+    ],
+    fileSpecs: [
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_small_det_safetensors",
+        file: "model.safetensors",
+        dest: "small_det/model.safetensors",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_small_det_safetensors",
+        file: "config.json",
+        dest: "small_det/config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_small_det_safetensors",
+        file: "preprocessor_config.json",
+        dest: "small_det/preprocessor_config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_small_det_safetensors",
+        file: "inference.yml",
+        dest: "small_det/inference.yml",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_small_det_safetensors",
+        file: "configuration.json",
+        dest: "small_det/configuration.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_small_rec_safetensors",
+        file: "model.safetensors",
+        dest: "small_rec/model.safetensors",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_small_rec_safetensors",
+        file: "config.json",
+        dest: "small_rec/config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_small_rec_safetensors",
+        file: "preprocessor_config.json",
+        dest: "small_rec/preprocessor_config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_small_rec_safetensors",
+        file: "inference.yml",
+        dest: "small_rec/inference.yml",
+      },
+    ],
     sizeText: "~22 MB",
     kind: "ocr",
     ocrVariant: "v6-small",
+    recommended: true,
   },
   {
     id: "ppocr-v6-medium",
     name: "PP-OCR v6 medium",
-    description: "高精度，适合离线批量",
-    repoId: "damo/PPOCR-v6-medium",
-    files: ["det.onnx", "rec.onnx"],
+    description: "高精度，适合离线批量，ModelScope: PaddlePaddle/PP-OCRv6",
+    repoId: "PaddlePaddle/PP-OCRv6_medium_det_safetensors",
+    files: [
+      "medium_det/model.safetensors",
+      "medium_det/config.json",
+      "medium_det/preprocessor_config.json",
+      "medium_det/inference.yml",
+      "medium_det/configuration.json",
+      "medium_rec/model.safetensors",
+      "medium_rec/config.json",
+      "medium_rec/preprocessor_config.json",
+      "medium_rec/inference.yml",
+    ],
+    fileSpecs: [
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_medium_det_safetensors",
+        file: "model.safetensors",
+        dest: "medium_det/model.safetensors",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_medium_det_safetensors",
+        file: "config.json",
+        dest: "medium_det/config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_medium_det_safetensors",
+        file: "preprocessor_config.json",
+        dest: "medium_det/preprocessor_config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_medium_det_safetensors",
+        file: "inference.yml",
+        dest: "medium_det/inference.yml",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_medium_det_safetensors",
+        file: "configuration.json",
+        dest: "medium_det/configuration.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_medium_rec_safetensors",
+        file: "model.safetensors",
+        dest: "medium_rec/model.safetensors",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_medium_rec_safetensors",
+        file: "config.json",
+        dest: "medium_rec/config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_medium_rec_safetensors",
+        file: "preprocessor_config.json",
+        dest: "medium_rec/preprocessor_config.json",
+      },
+      {
+        repoId: "PaddlePaddle/PP-OCRv6_medium_rec_safetensors",
+        file: "inference.yml",
+        dest: "medium_rec/inference.yml",
+      },
+    ],
     sizeText: "~158 MB",
     kind: "ocr",
     ocrVariant: "v6-medium",
@@ -138,8 +427,12 @@ export const HUGGINGFACE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
     recommended: true,
   },
 ];
-export function listDownloadableModels(source: DownloadSource): DownloadableModel[] {
-  return source === "modelscope" ? MODELSCOPE_DOWNLOADABLE_MODELS : HUGGINGFACE_DOWNLOADABLE_MODELS;
+export function listDownloadableModels(
+  source: DownloadSource,
+): DownloadableModel[] {
+  return source === "modelscope"
+    ? MODELSCOPE_DOWNLOADABLE_MODELS
+    : HUGGINGFACE_DOWNLOADABLE_MODELS;
 }
 
 export interface DownloadFamily {
@@ -231,9 +524,12 @@ export async function getDownloadTask(
 ): Promise<DownloadTaskState | null> {
   if (!isDesktopRuntime()) return null;
   try {
-    return await invokeFn<DownloadTaskState | null>("get_model_download_status", {
-      request: { modelId },
-    });
+    return await invokeFn<DownloadTaskState | null>(
+      "get_model_download_status",
+      {
+        request: { modelId },
+      },
+    );
   } catch {
     return null;
   }
@@ -246,9 +542,12 @@ export function listenDownloadProgress(
     // 浏览器预览不监听真实事件
     return Promise.resolve(() => {});
   }
-  return listen<ModelDownloadProgressEvent>("model-download-progress", (event) => {
-    handler(event.payload);
-  });
+  return listen<ModelDownloadProgressEvent>(
+    "model-download-progress",
+    (event) => {
+      handler(event.payload);
+    },
+  );
 }
 
 /** 工具：ModelScope resolve URL（供后端或文档展示） */

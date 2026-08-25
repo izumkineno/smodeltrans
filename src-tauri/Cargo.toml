@@ -16,8 +16,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = ["cuda", "flash-attn"]
-cuda = ["candle-core/cuda", "candle-transformers/cuda"]
-flash-attn = ["cuda", "candle-flash-attn"]
+cuda = ["candle-core/cuda"]
+flash-attn = ["cuda", "candle-flash-attn", "candle-transformers/cuda"]
 
 [dependencies]
 candle-core = { git = "https://github.com/huggingface/candle.git", rev = "31f35b147389700ed2a178ee66a91c3cc25cc80d", version = "=0.11.0" }
@@ -42,7 +42,8 @@ tauri-plugin-mcp-bridge = "0.10"
 rayon = "1.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "time", "sync", "macros", "fs", "io-util"] }
+simple_downloader = { version = "0.3.1", features = ["resume", "progress"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = "=2.0.1"
@@ -52,10 +53,20 @@ windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gd
 tauri-build = { version = "2", features = [] }
 
 [profile.dev]
+opt-level = 0
+debug = 1
+codegen-units = 256
+incremental = true
+lto = false
+panic = "unwind"
+
+[profile.dev.package.candle-flash-attn]
+opt-level = 2
+
+[profile.dev.package.candle-kernels]
 opt-level = 2
 
 [profile.release]
 codegen-units = 1
 lto = "thin"
-
 

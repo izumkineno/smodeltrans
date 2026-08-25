@@ -876,8 +876,8 @@ onBeforeUnmount(() => {
     </n-alert>
 
     <div class="model-manager-grid">
-      <!-- 下载管理（ModelScope 默认） -->
-      <n-card class="settings-card" :bordered="false">
+      <!-- 下载管理（ModelScope 默认） - 占满整行，避免右侧空白 -->
+      <n-card class="settings-card settings-card-wide" :bordered="false">
         <div class="settings-card-heading">
           <div>
             <p class="panel-kicker">Download · ModelScope</p>
@@ -937,7 +937,7 @@ onBeforeUnmount(() => {
                   size="small"
                   @click="handleDownload(selectedModelForFamily(family.id)?.id ?? '')"
                 >
-                  下载
+                  {{ downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'error' ? '重试' : '下载' }}
                 </n-button>
                 <n-button
                   v-else-if="downloadTaskFor(selectedModelForFamily(family.id)?.id ?? '')?.status === 'downloading'"
@@ -1022,7 +1022,7 @@ onBeforeUnmount(() => {
         </dl>
       </n-card>
 
-      <n-card class="settings-card settings-card-wide" :bordered="false">
+      <n-card class="settings-card" :bordered="false">
         <div class="settings-card-heading">
           <div>
             <p class="panel-kicker">运行资源</p>
