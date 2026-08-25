@@ -18,6 +18,7 @@ pub(crate) struct SelectedText {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SelectionReadError {
     NoTextSelection,
+    #[cfg(not(target_os = "windows"))]
     UnsupportedPlatform,
     System(String),
 }
@@ -26,6 +27,7 @@ impl Display for SelectionReadError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoTextSelection => formatter.write_str("未检测到可访问的文字选区。"),
+            #[cfg(not(target_os = "windows"))]
             Self::UnsupportedPlatform => {
                 formatter.write_str("当前平台暂不支持读取其他应用的文字选区。")
             }
