@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onActivated, onBeforeUnmount, onDeactivated, ref } from "vue";
+import { computed, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -124,6 +124,12 @@ const canStart = computed(
     workflowState.value !== "processing",
 );
 
+watch(targetLanguage, (next, prev) => {
+  if (next !== prev) {
+    console.info("[TextTranslationPage] targetLanguage changed", { previous: prev, next });
+  }
+});
+
 function clearProgressListener() {
   progressUnlisten?.();
   progressUnlisten = undefined;
@@ -159,16 +165,21 @@ function validateRequest(): { text: string; language: string } | null {
 }
 
 async function startTranslation() {
+  console.info("[TextTranslationPage] startTranslation: user triggered", { hasText: !!sourceText.value.trim(), targetLanguage: targetLanguage.value, workflowState: workflowState.value });
   const request = validateRequest();
+  console.debug("[TextTranslationPage] startTranslation: validated", { request, textLen: request?.text.length, language: request?.language });
   if (!request) {
+    console.warn("[TextTranslationPage] startTranslation: validation failed", { errorMessage: errorMessage.value });
     setErrorState(errorMessage.value || "请检查文本翻译请求。");
     return;
   }
   if (!isDesktopRuntime) {
+    console.warn("[TextTranslationPage] startTranslation: not in desktop runtime");
     setErrorState("文本翻译后端只在 Tauri 桌面端可用。");
     return;
   }
   if (workflowState.value === "processing") {
+    console.debug("[TextTranslationPage] startTranslation: already processing, ignored");
     return;
   }
 
@@ -179,6 +190,9 @@ async function startTranslation() {
   progress.value = 0;
   statusMessage.value = "正在准备文本翻译。";
   const requestId = createTranslationRequestId();
+  console.info("[TextTranslationPage] startTranslation: request created", { requestId, targetLanguage: request.language, textBytes: new TextEncoder().encode(request.text).length, textLen: request.text.length });
+  console.debug("[TextTranslationPage] startTranslation: request params", { requestId, language: request.language, preview: request.text.slice(0, 100) });
+  const t0 = Date.now();
   clearProgressListener();
 
   try {
@@ -204,9 +218,13 @@ async function startTranslation() {
     );
 
     if (controller.signal.aborted || activeController.value !== controller) {
+      console.warn("[TextTranslationPage] startTranslation: aborted after translate", { requestId, aborted: controller.signal.aborted });
       return;
     }
 
+    const duration = Date.now() - t0;
+    console.info("[TextTranslationPage] startTranslation: success", { requestId, durationMs: duration, backendDurationMs: result.durationMs, providerLabel: result.providerLabel, resultLen: result.text.length });
+    console.debug("[TextTranslationPage] startTranslation: result preview", { requestId, preview: result.text.slice(0, 120) });
     translatedText.value = result.text;
     providerLabel.value = result.providerLabel;
     durationMs.value = result.durationMs;
@@ -215,7 +233,9 @@ async function startTranslation() {
     statusMessage.value = "文本翻译结果已准备好。";
     notify("success", "文本翻译完成。");
   } catch (error) {
+    const duration = Date.now() - t0;
     if (controller.signal.aborted || isTranslationCancellation(error)) {
+      console.info("[TextTranslationPage] startTranslation: cancelled", { requestId, durationMs: duration });
       if (activeController.value === controller) {
         workflowState.value = "cancelled";
         statusMessage.value = "翻译已取消，可以重新开始。";
@@ -223,8 +243,10 @@ async function startTranslation() {
       return;
     }
     if (activeController.value !== controller) {
+      console.debug("[TextTranslationPage] startTranslation: stale controller, ignoring error", { requestId });
       return;
     }
+    console.error("[TextTranslationPage] startTranslation: failed", { requestId, durationMs: duration, error: error instanceof Error ? error.message : String(error) });
     setErrorState(error instanceof Error ? error.message : "文本翻译未完成，请检查模型配置后重试。");
   } finally {
     if (activeController.value === controller) {
@@ -238,7 +260,9 @@ async function startTranslation() {
 }
 
 function cancelTranslation() {
+  console.info("[TextTranslationPage] cancelTranslation: user triggered cancel", { hasController: !!activeController.value, workflowState: workflowState.value });
   if (!activeController.value) {
+    console.debug("[TextTranslationPage] cancelTranslation: no active controller, ignored");
     return;
   }
   activeController.value.abort();
@@ -246,10 +270,12 @@ function cancelTranslation() {
   progress.value = 0;
   workflowState.value = "cancelled";
   statusMessage.value = "翻译已取消，可以重新开始。";
+  console.info("[TextTranslationPage] cancelTranslation: cancelled successfully");
   notify("warning", "翻译已取消。");
 }
 
 function clearText() {
+  console.info("[TextTranslationPage] clearText: user cleared text", { hadText: !!sourceText.value, hadResult: !!translatedText.value });
   activeController.value?.abort();
   activeController.value = null;
   clearProgressListener();
@@ -262,42 +288,58 @@ function clearText() {
 }
 
 async function copyResult() {
+  console.info("[TextTranslationPage] copyResult: user triggered copy", { hasResult: !!translatedText.value, resultLen: translatedText.value?.length ?? 0 });
   if (!translatedText.value) {
+    console.debug("[TextTranslationPage] copyResult: no result to copy");
     return;
   }
   try {
     await copyTranslationText(translatedText.value);
+    console.info("[TextTranslationPage] copyResult: success", { len: translatedText.value.length });
     setActionFeedback("success", "译文已复制到剪贴板。");
-  } catch {
+  } catch (error) {
+    console.error("[TextTranslationPage] copyResult: failed", { error: error instanceof Error ? error.message : String(error) });
     setActionFeedback("error", "剪贴板不可用，请手动选择文本进行复制。");
   }
 }
 
 function saveResult() {
+  console.info("[TextTranslationPage] saveResult: user triggered save", { hasResult: !!translatedText.value, len: translatedText.value?.length ?? 0 });
   if (!translatedText.value) {
+    console.debug("[TextTranslationPage] saveResult: no result to save");
     return;
   }
   try {
     saveTranslationText(translatedText.value, "text-translation.txt");
+    console.info("[TextTranslationPage] saveResult: saved successfully", { len: translatedText.value.length, filename: "text-translation.txt" });
     setActionFeedback("success", "译文已保存为文本文件。");
-  } catch {
+  } catch (error) {
+    console.error("[TextTranslationPage] saveResult: failed", { error: error instanceof Error ? error.message : String(error) });
     setActionFeedback("error", "译文无法保存，请重试。");
   }
 }
 async function saveQuickTranslationConfiguration(): Promise<void> {
+  console.info("[TextTranslationPage] saveQuickTranslationConfiguration: user triggered save", { enabled: quickTranslationEnabled.value, shortcut: quickTranslationShortcut.value });
   if (isCapturingQuickTranslationShortcut.value) {
+    console.warn("[TextTranslationPage] saveQuickTranslationConfiguration: still capturing, ignored");
     return;
   }
   quickTranslationSettingsSaving.value = true;
+  const t0 = Date.now();
   try {
+    console.debug("[TextTranslationPage] saveQuickTranslationConfiguration: saving", { enabled: quickTranslationEnabled.value, shortcut: quickTranslationShortcut.value });
     const saved = await saveQuickTranslationSettings({
       enabled: quickTranslationEnabled.value,
       shortcut: quickTranslationShortcut.value,
     });
+    const duration = Date.now() - t0;
+    console.info("[TextTranslationPage] saveQuickTranslationConfiguration: success", { enabled: saved.enabled, shortcut: saved.shortcut, durationMs: duration });
     quickTranslationEnabled.value = saved.enabled;
     quickTranslationShortcut.value = saved.shortcut;
     notify("success", "快捷翻译设置已保存并立即生效。");
   } catch (error) {
+    const duration = Date.now() - t0;
+    console.error("[TextTranslationPage] saveQuickTranslationConfiguration: failed", { error: error instanceof Error ? error.message : String(error), durationMs: duration });
     quickTranslationEnabled.value = quickTranslationSettings.value.enabled;
     quickTranslationShortcut.value = quickTranslationSettings.value.shortcut;
     notify(
@@ -375,7 +417,9 @@ function toggleQuickTranslationShortcutCapture(): void {
 
 
 function handleSourceInput() {
+  console.debug("[TextTranslationPage] handleSourceInput: input changed", { workflowState: workflowState.value, textLen: sourceText.value.length });
   if (workflowState.value === "result" || workflowState.value === "error") {
+    console.info("[TextTranslationPage] handleSourceInput: resetting result due to input change");
     workflowState.value = sourceText.value.trim() ? "idle" : "idle";
     resetResult();
     statusMessage.value = "输入已更新，可以重新翻译。";
@@ -386,6 +430,7 @@ function handleTranslationShortcut(event: KeyboardEvent) {
   if (isCapturingQuickTranslationShortcut.value) {
     return;
   }
+  // Log shortcut trigger for observability (only when it actually triggers)
   const isShortcut =
     event.key === "Enter" &&
     (event.ctrlKey || event.metaKey) &&
@@ -403,6 +448,7 @@ function handleTranslationShortcut(event: KeyboardEvent) {
     return;
   }
   event.preventDefault();
+  console.info("[TextTranslationPage] handleTranslationShortcut: Ctrl+Enter triggered translation", { canStart: canStart.value });
   void startTranslation();
 }
 
@@ -414,13 +460,18 @@ function unbindTranslationShortcut() {
   window.removeEventListener("keydown", handleTranslationShortcut, true);
 }
 
-onActivated(bindTranslationShortcut);
+onActivated(() => {
+  console.info("[TextTranslationPage] onActivated: page activated", { isDesktopRuntime });
+  bindTranslationShortcut();
+});
 onDeactivated(() => {
+  console.debug("[TextTranslationPage] onDeactivated: page deactivated");
   stopQuickTranslationShortcutCapture();
   unbindTranslationShortcut();
 });
 
 onBeforeUnmount(() => {
+  console.debug("[TextTranslationPage] onBeforeUnmount: unmounting", { hasController: !!activeController.value });
   stopQuickTranslationShortcutCapture();
   unbindTranslationShortcut();
   activeController.value?.abort();

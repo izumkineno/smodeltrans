@@ -147,8 +147,12 @@ static HY_TRANSFER_TRACE_ENABLED: LazyLock<bool> =
 
 fn trace_hy_transfer(direction: &str, operation: &str, bytes: usize) {
     if *HY_TRANSFER_TRACE_ENABLED {
-        eprintln!(
-            "[hy-transfer] direction={direction} bytes={bytes} count=1 operation={operation}"
+        tracing::trace!(
+            target: "hy::transfer",
+            direction = %direction,
+            operation = %operation,
+            bytes = bytes,
+            "hy transfer"
         );
     }
 }
@@ -195,14 +199,25 @@ impl HySelectionProfile {
 
     fn print(&self) {
         if self.enabled {
-            eprintln!(
-                "[profile] hy-select: flatten={} penalty_math={} greedy_argmax={} sample_top_k={} sample_math={} sample_select={}",
-                format_duration(self.flatten),
-                format_duration(self.penalty_math),
-                format_duration(self.greedy_argmax),
-                format_duration(self.sample_top_k),
-                format_duration(self.sample_math),
-                format_duration(self.sample_select),
+            tracing::info!(
+                target: "hy::profile",
+                flatten = ?self.flatten,
+                penalty_math = ?self.penalty_math,
+                greedy_argmax = ?self.greedy_argmax,
+                sample_top_k = ?self.sample_top_k,
+                sample_math = ?self.sample_math,
+                sample_select = ?self.sample_select,
+                "hy-select"
+            );
+            tracing::debug!(
+                target: "hy::profile",
+                flatten = %format_duration(self.flatten),
+                penalty_math = %format_duration(self.penalty_math),
+                greedy_argmax = %format_duration(self.greedy_argmax),
+                sample_top_k = %format_duration(self.sample_top_k),
+                sample_math = %format_duration(self.sample_math),
+                sample_select = %format_duration(self.sample_select),
+                "[profile] hy-select"
             );
         }
     }
@@ -268,17 +283,18 @@ impl HyLayerProfile {
             return Ok(());
         }
         device.synchronize()?;
-        eprintln!(
-            "[profile] hy-layers: count={} attention={} projection={} preprocess={} cache={} flash={} output={} feed_forward={} total={}",
-            layer_count,
-            format_duration(self.attention),
-            format_duration(self.attention_projection),
-            format_duration(self.attention_preprocess),
-            format_duration(self.attention_cache),
-            format_duration(self.attention_flash),
-            format_duration(self.attention_output),
-            format_duration(self.feed_forward),
-            format_duration(self.attention + self.feed_forward),
+        tracing::info!(
+            target: "hy::profile",
+            layer_count = layer_count,
+            attention = ?self.attention,
+            projection = ?self.attention_projection,
+            preprocess = ?self.attention_preprocess,
+            cache = ?self.attention_cache,
+            flash = ?self.attention_flash,
+            output = ?self.attention_output,
+            feed_forward = ?self.feed_forward,
+            total = ?(self.attention + self.feed_forward),
+            "hy-layers"
         );
         Ok(())
     }
@@ -927,9 +943,11 @@ impl ModelWeights {
         let hidden = self.output_norm.forward(&hidden)?;
         if let Some(started) = output_norm_started {
             hidden.device().synchronize()?;
-            eprintln!(
-                "[profile] hy-output: norm={}",
-                format_duration(started.elapsed())
+            tracing::info!(
+                target: "hy::profile",
+                elapsed = ?started.elapsed(),
+                elapsed_fmt = %format_duration(started.elapsed()),
+                "hy-output norm"
             );
         }
         let hidden = hidden.i((.., seq_len - 1, ..))?.contiguous()?;
@@ -942,9 +960,11 @@ impl ModelWeights {
         let logits = self.output.forward(&hidden)?;
         if let Some(started) = output_started {
             logits.device().synchronize()?;
-            eprintln!(
-                "[profile] hy-output: projection={}",
-                format_duration(started.elapsed())
+            tracing::info!(
+                target: "hy::profile",
+                elapsed = ?started.elapsed(),
+                elapsed_fmt = %format_duration(started.elapsed()),
+                "hy-output projection"
             );
         }
         Ok(logits)

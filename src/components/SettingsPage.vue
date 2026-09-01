@@ -68,13 +68,23 @@ const fontModelOptions = computed(() => [
 const selectedFontValue = computed(() => modelFontPath.value ?? SYSTEM_FONT_VALUE);
 
 async function loadModelCatalog(): Promise<void> {
+  console.debug("[SettingsPage] loadModelCatalog: loading catalog", { isDesktopRuntime });
   if (!isDesktopRuntime) {
     catalogLoaded.value = true;
+    console.info("[SettingsPage] loadModelCatalog: skipped (browser preview)");
     return;
   }
   try {
     modelCatalog.value = await getModelCatalog();
-  } catch {
+    console.info("[SettingsPage] loadModelCatalog: loaded", {
+      translation: modelCatalog.value.translation.length,
+      ocr: modelCatalog.value.ocr.length,
+      fonts: modelCatalog.value.fonts.length,
+    });
+  } catch (error) {
+    console.warn("[SettingsPage] loadModelCatalog: failed, fallback to empty", {
+      error: error instanceof Error ? error.message : String(error),
+    });
     modelCatalog.value = { translation: [], ocr: [], fonts: [] };
   } finally {
     catalogLoaded.value = true;
@@ -82,21 +92,27 @@ async function loadModelCatalog(): Promise<void> {
 }
 
 function selectFontModel(value: string): void {
+  console.info("[SettingsPage] selectFontModel: user selected font", { value });
+  console.debug("[SettingsPage] selectFontModel: params", { value, systemValue: SYSTEM_FONT_VALUE });
   modelFontPath.value = value === SYSTEM_FONT_VALUE ? null : value;
   setSettingsFeedback("info", "已选择标注字体，点击“保存设置”生效。");
 }
 
 function openFontDialog(): void {
+  console.info("[SettingsPage] openFontDialog: user opened font dialog");
   dialogName.value = "";
   dialogFontPath.value = "";
   fontDialogOpen.value = true;
 }
 
 function closeFontDialog(): void {
+  console.debug("[SettingsPage] closeFontDialog: closing dialog", { wasOpen: fontDialogOpen.value });
   fontDialogOpen.value = false;
 }
 
 async function pickDialogFontPath(): Promise<void> {
+  console.info("[SettingsPage] pickDialogFontPath: user triggered file picker");
+  console.debug("[SettingsPage] pickDialogFontPath: currentFontPath", { current: dialogFontPath.value });
   const selected = await openNativeDialog({
     title: "选择标注字体",
     defaultPath: dialogFontPath.value || undefined,
@@ -104,24 +120,35 @@ async function pickDialogFontPath(): Promise<void> {
     filters: [{ name: "字体文件", extensions: ["ttf", "otf"] }],
   });
   if (typeof selected === "string" && selected.trim()) {
+    console.info("[SettingsPage] pickDialogFontPath: selected", { path: selected });
     dialogFontPath.value = selected;
+  } else {
+    console.debug("[SettingsPage] pickDialogFontPath: no selection or cancelled");
   }
 }
 
 async function saveFontDialog(): Promise<void> {
+  console.info("[SettingsPage] saveFontDialog: user triggered save font entry", {
+    fontName: dialogName.value.trim(),
+    fontPath: dialogFontPath.value.trim(),
+  });
   if (dialogSaving.value) {
+    console.warn("[SettingsPage] saveFontDialog: already saving, ignored");
     return;
   }
   if (!catalogLoaded.value) {
+    console.debug("[SettingsPage] saveFontDialog: catalog not loaded, loading first");
     await loadModelCatalog();
   }
   const entryName = dialogName.value.trim();
   if (!entryName) {
+    console.warn("[SettingsPage] saveFontDialog: validation failed - missing font name");
     setSettingsFeedback("error", "请输入字体名称。");
     return;
   }
   const path = dialogFontPath.value.trim();
   if (!path) {
+    console.warn("[SettingsPage] saveFontDialog: validation failed - missing font path");
     setSettingsFeedback("error", "请选择字体文件。");
     return;
   }
@@ -148,14 +175,17 @@ async function saveFontDialog(): Promise<void> {
       e.path.replace(/\\/g, "/").toLowerCase() === normalized ? { name: entryName, path } : e,
     );
   }
+  console.debug("[SettingsPage] saveFontDialog: saving catalog", { entryName, path, exists: exists ? "update" : "create", fontsCount: next.fonts.length });
   dialogSaving.value = true;
   try {
     await saveModelCatalog(next);
     await loadModelCatalog();
     selectFontModel(dialogFontPath.value);
     closeFontDialog();
+    console.info("[SettingsPage] saveFontDialog: saved successfully", { entryName, path });
     setSettingsFeedback("success", `已配置「${entryName}」并选中，点击“保存设置”生效。`);
   } catch (error) {
+    console.error("[SettingsPage] saveFontDialog: failed", { error: error instanceof Error ? error.message : String(error), entryName, path });
     setSettingsFeedback("error", error instanceof Error ? error.message : "无法保存模型条目。");
   } finally {
     dialogSaving.value = false;
@@ -174,19 +204,31 @@ function setSettingsFeedback(
 }
 
 function handleThemeModeChange(nextMode: ThemeMode | null): void {
+  console.info("[SettingsPage] handleThemeModeChange: user requested theme change", { nextMode, current: themeMode.value });
   if (!nextMode) {
+    console.warn("[SettingsPage] handleThemeModeChange: ignored null mode");
     return;
   }
   const persistError = setThemeMode(nextMode);
   if (persistError) {
+    console.error("[SettingsPage] handleThemeModeChange: persist failed", { nextMode, error: persistError });
     setSettingsFeedback("error", persistError);
     return;
   }
+  console.info("[SettingsPage] handleThemeModeChange: theme changed successfully", { nextMode, label: themeModeLabels[nextMode] });
   setSettingsFeedback("success", `界面主题已切换为${themeModeLabels[nextMode]}。`, false);
 }
 
 
 function applyBackendStatus(status: BackendStatus) {
+  console.debug("[SettingsPage] applyBackendStatus: applying", {
+    ready: status.ready,
+    targetLanguage: status.targetLanguage,
+    device: status.device,
+    fontPath: status.fontPath,
+    detectorModelDir: status.detectorModelDir,
+    hyModel: status.hyModel,
+  });
   applySharedBackendStatus(status);
   modelFontPath.value = status.fontPath ?? null;
   // targetLanguage is global ref, keep in sync
@@ -198,25 +240,37 @@ function applyBackendStatus(status: BackendStatus) {
   promptTemplate.value = p.template ?? p.prompt ?? [p.system, p.user].filter(Boolean).join("\n\n") ?? "";
 }
 async function refreshBackendStatus(notify = true) {
+  console.info("[SettingsPage] refreshBackendStatus: user triggered refresh", { notify, isDesktopRuntime });
   if (!isDesktopRuntime) {
+    console.warn("[SettingsPage] refreshBackendStatus: not in Tauri desktop runtime");
     setSettingsFeedback("warning", "设置状态仅在 Tauri 桌面端可读取。", notify);
     return;
   }
+  console.debug("[SettingsPage] refreshBackendStatus: fetching backend status");
+  const t0 = Date.now();
   settingsLoading.value = true;
   try {
     const status = await fetchSharedBackendStatus();
+    const duration = Date.now() - t0;
+    console.info("[SettingsPage] refreshBackendStatus: success", { ready: status.ready, message: status.message, durationMs: duration });
     applyBackendStatus(status);
     void loadModelCatalog();
     setSettingsFeedback(status.ready ? "success" : "warning", status.message, notify);
   } catch (error) {
+    const duration = Date.now() - t0;
+    console.error("[SettingsPage] refreshBackendStatus: failed", { error: error instanceof Error ? error.message : String(error), durationMs: duration });
     setSettingsFeedback("error", error instanceof Error ? error.message : "无法读取后端状态。", notify);
   } finally {
     settingsLoading.value = false;
   }
 }
 async function saveSettings() {
+  console.info("[SettingsPage] saveSettings: user triggered save", { targetLanguage: targetLanguage.value, fontPath: modelFontPath.value });
+  const t0 = Date.now();
   const nextLanguage = targetLanguage.value.trim();
+  console.debug("[SettingsPage] saveSettings: params", { nextLanguage, promptLen: promptTemplate.value.length, fontPath: modelFontPath.value });
   if (!isSupportedTargetLanguage(nextLanguage)) {
+    console.warn("[SettingsPage] saveSettings: validation failed - unsupported language", { nextLanguage });
     setSettingsFeedback("error", "目标语言不在 Hy-MT2 支持列表内，请从下拉选择（38 种）。");
     return;
   }
@@ -224,23 +278,28 @@ async function saveSettings() {
 
   const trimmedPromptTemplate = promptTemplate.value.trim();
   if (Array.from(trimmedPromptTemplate).length > 8192) {
+    console.warn("[SettingsPage] saveSettings: validation failed - prompt too long", { promptLen: Array.from(trimmedPromptTemplate).length });
     setSettingsFeedback("error", "提示词模板最多 8192 个字符。");
     return;
   }
 
   if (!isDesktopRuntime) {
+    console.debug("[SettingsPage] saveSettings: browser preview path, saving locally");
     targetLanguage.value = nextLanguage;
     const persistError = savePersistedTargetLanguage();
     if (persistError) {
+      console.error("[SettingsPage] saveSettings: persist failed (browser)", { error: persistError });
       setSettingsFeedback("error", persistError);
       return;
     }
+    console.info("[SettingsPage] saveSettings: saved locally (browser preview)", { nextLanguage, durationMs: Date.now() - t0 });
     setSettingsFeedback("success", "目标语言已保存（浏览器预览）。");
     return;
   }
 
   const status = backendStatus.value;
   if (!status) {
+    console.error("[SettingsPage] saveSettings: backend status not ready");
     setSettingsFeedback("error", "后端状态未就绪，请先刷新。");
     return;
   }
@@ -262,29 +321,38 @@ async function saveSettings() {
     },
   };
 
+  console.debug("[SettingsPage] saveSettings: sending to backend", { settings });
   settingsLoading.value = true;
   try {
     const nextStatus = await updateBackendSettings(settings);
+    const duration = Date.now() - t0;
+    console.info("[SettingsPage] saveSettings: backend update success", { nextLanguage, fontPath: settings.fontPath, durationMs: duration, ready: nextStatus.ready });
     applyBackendStatus(nextStatus);
     targetLanguage.value = nextLanguage;
     const persistError = savePersistedTargetLanguage();
     if (persistError) {
+      console.warn("[SettingsPage] saveSettings: backend saved but local persist failed", { error: persistError });
       setSettingsFeedback("warning", `后端已保存，但本地语言持久化失败：${persistError}`);
       return;
     }
     setSettingsFeedback("success", "翻译偏好已保存，下一次翻译会使用新的提示词与目标语言。");
   } catch (error) {
+    const duration = Date.now() - t0;
+    console.error("[SettingsPage] saveSettings: backend update failed", { error: error instanceof Error ? error.message : String(error), durationMs: duration });
     setSettingsFeedback("error", error instanceof Error ? error.message : "无法保存设置。");
   } finally {
     settingsLoading.value = false;
   }
 }
 onMounted(() => {
+  console.info("[SettingsPage] onMounted: initializing settings page", { hasBackendStatus: !!backendStatus.value, isDesktopRuntime });
   if (backendStatus.value) {
+    console.debug("[SettingsPage] onMounted: applying existing backend status");
     applyBackendStatus(backendStatus.value);
   }
   void loadModelCatalog();
   void refreshBackendStatus(false);
+  console.debug("[SettingsPage] onMounted: triggered loadModelCatalog + refreshBackendStatus");
 });
 </script>
 

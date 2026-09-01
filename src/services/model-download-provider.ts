@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+const DL_LOG_PREFIX = " [model-download-provider]";
+
 /**
  * ModelScope 作为默认下载源。
  * 前端通过此服务屏蔽底层的 ModelScope HTTP / SDK 细节，
@@ -430,9 +432,13 @@ export const HUGGINGFACE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
 export function listDownloadableModels(
   source: DownloadSource,
 ): DownloadableModel[] {
-  return source === "modelscope"
+  console.info(`${DL_LOG_PREFIX} listDownloadableModels start`, { source });
+  const models = source === "modelscope"
     ? MODELSCOPE_DOWNLOADABLE_MODELS
     : HUGGINGFACE_DOWNLOADABLE_MODELS;
+  console.info(`${DL_LOG_PREFIX} listDownloadableModels success`, { source, count: models.length });
+  console.debug(`${DL_LOG_PREFIX} listDownloadableModels detail`, { modelIds: models.map(m=>m.id) });
+  return models;
 }
 
 export interface DownloadFamily {
@@ -444,6 +450,7 @@ export interface DownloadFamily {
 }
 
 export function listDownloadFamilies(source: DownloadSource): DownloadFamily[] {
+  console.info(`${DL_LOG_PREFIX} listDownloadFamilies start`, { source });
   const models = listDownloadableModels(source);
   const translation = models.filter((model) => model.kind === "translation");
   const ocr = models.filter((model) => model.kind === "ocr");
@@ -466,6 +473,7 @@ export function listDownloadFamilies(source: DownloadSource): DownloadFamily[] {
       models: ocr,
     });
   }
+  console.info(`${DL_LOG_PREFIX} listDownloadFamilies success`, { source, families: families.length, translationCount: translation.length, ocrCount: ocr.length });
   return families;
 }
 
@@ -478,8 +486,9 @@ export async function startModelDownload(
   source: DownloadSource = "modelscope",
   invokeFn: InvokeFn = invoke,
 ): Promise<DownloadTaskState> {
+  console.info(`${DL_LOG_PREFIX} startModelDownload start`, { modelId, source });
   if (!isDesktopRuntime()) {
-    // 浏览器预览：直接返回模拟的 downloading 状态，由前端定时器驱动
+    console.warn(`${DL_LOG_PREFIX} startModelDownload not desktop, returning simulated state`, { modelId, source });
     return {
       modelId,
       source,
@@ -489,11 +498,16 @@ export async function startModelDownload(
       totalBytes: 100,
     };
   }
+  const start = Date.now();
   try {
-    return await invokeFn<DownloadTaskState>("start_model_download", {
+    const task = await invokeFn<DownloadTaskState>("start_model_download", {
       request: { modelId, source },
     });
-  } catch {
+    console.info(`${DL_LOG_PREFIX} startModelDownload success`, { modelId, source, status: task.status, progress: task.progress, durationMs: Date.now() - start });
+    console.debug(`${DL_LOG_PREFIX} startModelDownload task`, { downloadedBytes: task.downloadedBytes, totalBytes: task.totalBytes });
+    return task;
+  } catch (error) {
+    console.error(`${DL_LOG_PREFIX} startModelDownload invoke failed, falling back to simulated`, { modelId, source, error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - start });
     // 后端尚未实现新命令时，回退为前端模拟，避免界面阻塞
     return {
       modelId,
@@ -510,11 +524,17 @@ export async function cancelModelDownload(
   modelId: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<void> {
-  if (!isDesktopRuntime()) return;
+  console.info(`${DL_LOG_PREFIX} cancelModelDownload start`, { modelId });
+  if (!isDesktopRuntime()) {
+    console.warn(`${DL_LOG_PREFIX} cancelModelDownload not desktop, skip`, { modelId });
+    return;
+  }
+  const start = Date.now();
   try {
     await invokeFn("cancel_model_download", { request: { modelId } });
-  } catch {
-    // 忽略未实现
+    console.info(`${DL_LOG_PREFIX} cancelModelDownload success`, { modelId, durationMs: Date.now() - start });
+  } catch (error) {
+    console.warn(`${DL_LOG_PREFIX} cancelModelDownload failed or not implemented`, { modelId, error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - start });
   }
 }
 
@@ -522,15 +542,22 @@ export async function getDownloadTask(
   modelId: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<DownloadTaskState | null> {
-  if (!isDesktopRuntime()) return null;
+  console.debug(`${DL_LOG_PREFIX} getDownloadTask start`, { modelId });
+  if (!isDesktopRuntime()) {
+    console.debug(`${DL_LOG_PREFIX} getDownloadTask not desktop`, { modelId });
+    return null;
+  }
   try {
-    return await invokeFn<DownloadTaskState | null>(
+    const task = await invokeFn<DownloadTaskState | null>(
       "get_model_download_status",
       {
         request: { modelId },
       },
     );
-  } catch {
+    console.debug(`${DL_LOG_PREFIX} getDownloadTask result`, { modelId, status: task?.status, progress: task?.progress });
+    return task;
+  } catch (error) {
+    console.warn(`${DL_LOG_PREFIX} getDownloadTask failed`, { modelId, error: error instanceof Error ? error.message : String(error) });
     return null;
   }
 }
@@ -538,13 +565,23 @@ export async function getDownloadTask(
 export function listenDownloadProgress(
   handler: (event: ModelDownloadProgressEvent) => void,
 ): Promise<UnlistenFn> {
+  console.info(`${DL_LOG_PREFIX} listenDownloadProgress registering`);
   if (!isDesktopRuntime()) {
+    console.warn(`${DL_LOG_PREFIX} listenDownloadProgress not desktop, returning no-op`);
     // 浏览器预览不监听真实事件
     return Promise.resolve(() => {});
   }
   return listen<ModelDownloadProgressEvent>(
     "model-download-progress",
     (event) => {
+      const payload = event.payload;
+      if (payload.status === "completed") {
+        console.info(`${DL_LOG_PREFIX} download progress completed`, { modelId: payload.modelId, progress: payload.progress, downloadedBytes: payload.downloadedBytes, totalBytes: payload.totalBytes });
+      } else if (payload.status === "error" || payload.status === "cancelled") {
+        console.warn(`${DL_LOG_PREFIX} download progress status`, { modelId: payload.modelId, status: payload.status, message: payload.message, progress: payload.progress });
+      } else {
+        console.debug(`${DL_LOG_PREFIX} download progress`, { modelId: payload.modelId, status: payload.status, progress: payload.progress, downloadedBytes: payload.downloadedBytes, totalBytes: payload.totalBytes });
+      }
       handler(event.payload);
     },
   );
@@ -559,10 +596,19 @@ export interface DownloadedModelInfo {
 export async function listDownloadedModels(
   invokeFn: InvokeFn = invoke,
 ): Promise<DownloadedModelInfo[]> {
-  if (!isDesktopRuntime()) return [];
+  console.info(`${DL_LOG_PREFIX} listDownloadedModels start`);
+  if (!isDesktopRuntime()) {
+    console.debug(`${DL_LOG_PREFIX} listDownloadedModels not desktop`);
+    return [];
+  }
+  const start = Date.now();
   try {
-    return await invokeFn<DownloadedModelInfo[]>("list_downloaded_models");
-  } catch {
+    const models = await invokeFn<DownloadedModelInfo[]>("list_downloaded_models");
+    console.info(`${DL_LOG_PREFIX} listDownloadedModels success`, { count: models.length, durationMs: Date.now() - start });
+    console.debug(`${DL_LOG_PREFIX} listDownloadedModels detail`, { modelIds: models.map(m=>m.modelId) });
+    return models;
+  } catch (error) {
+    console.warn(`${DL_LOG_PREFIX} listDownloadedModels failed`, { error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - start });
     return [];
   }
 }
@@ -571,24 +617,43 @@ export async function activateDownloadedModel(
   modelId: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<unknown> {
+  console.info(`${DL_LOG_PREFIX} activateDownloadedModel start`, { modelId });
   if (!isDesktopRuntime()) {
+    console.warn(`${DL_LOG_PREFIX} activateDownloadedModel not desktop`, { modelId });
     throw new Error("桌面端功能");
   }
-  return await invokeFn("activate_downloaded_model", {
-    request: { modelId },
-  });
+  const start = Date.now();
+  try {
+    const result = await invokeFn("activate_downloaded_model", {
+      request: { modelId },
+    });
+    console.info(`${DL_LOG_PREFIX} activateDownloadedModel success`, { modelId, durationMs: Date.now() - start });
+    return result;
+  } catch (error) {
+    console.error(`${DL_LOG_PREFIX} activateDownloadedModel failed`, { modelId, error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - start });
+    throw error;
+  }
 }
 
 export async function deleteDownloadedModel(
   modelId: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<void> {
+  console.info(`${DL_LOG_PREFIX} deleteDownloadedModel start`, { modelId });
   if (!isDesktopRuntime()) {
+    console.warn(`${DL_LOG_PREFIX} deleteDownloadedModel not desktop`, { modelId });
     throw new Error("桌面端功能");
   }
-  await invokeFn("delete_downloaded_model", {
-    request: { modelId },
-  });
+  const start = Date.now();
+  try {
+    await invokeFn("delete_downloaded_model", {
+      request: { modelId },
+    });
+    console.info(`${DL_LOG_PREFIX} deleteDownloadedModel success`, { modelId, durationMs: Date.now() - start });
+  } catch (error) {
+    console.error(`${DL_LOG_PREFIX} deleteDownloadedModel failed`, { modelId, error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - start });
+    throw error;
+  }
 }
 
 /** 工具：ModelScope resolve URL（供后端或文档展示） */

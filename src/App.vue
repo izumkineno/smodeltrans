@@ -560,11 +560,32 @@ const activeMenu = computed<WorkspaceRouteName>(() =>
   isWorkspaceRouteName(route.name) ? route.name : "ocr-translate",
 );
 
+watch(() => route.name, (next, prev) => {
+  if (next !== prev) {
+    console.info("[App] route watcher: navigated", { from: prev, to: next });
+    console.debug("[App] route watcher: page metadata", { title: pageMetadata.value.title, statusLabel: pageMetadata.value.statusLabel });
+  }
+});
+
+watch(resolvedTheme, (next, prev) => {
+  if (next !== prev) {
+    console.info("[App] theme changed", { previous: prev, next, palette: activeThemePalette.value.primary });
+    console.debug("[App] theme overrides", { palette: activeThemePalette.value });
+  }
+});
+
 function handleMenuUpdate(value: string) {
+  console.info("[App] handleMenuUpdate: user requested route change", { requested: value, current: activeMenu.value, isWorkspace: isWorkspaceRouteName(value) });
   if (!isWorkspaceRouteName(value) || value === activeMenu.value) {
+    console.debug("[App] handleMenuUpdate: ignored", { value, active: activeMenu.value });
     return;
   }
-  void router.push({ name: value });
+  console.debug("[App] handleMenuUpdate: pushing route", { value });
+  void router.push({ name: value }).then(() => {
+    console.info("[App] route changed", { to: value, current: route.name });
+  }).catch((error) => {
+    console.error("[App] route change failed", { to: value, error: error instanceof Error ? error.message : String(error) });
+  });
 }
 
 const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -595,15 +616,18 @@ function loadSidebarCollapsed(): boolean {
 const sidebarCollapsed = ref(loadSidebarCollapsed());
 
 watch(sidebarCollapsed, (value) => {
+  console.debug("[App] sidebarCollapsed watcher: changed", { value });
   try {
     window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, value ? "1" : "0");
-  } catch {
-    // ignore storage errors
+  } catch (error) {
+    console.warn("[App] sidebarCollapsed persist failed", { error: error instanceof Error ? error.message : String(error) });
   }
 });
 
 function toggleSidebarCollapsed(): void {
-  sidebarCollapsed.value = !sidebarCollapsed.value;
+  const next = !sidebarCollapsed.value;
+  console.info("[App] toggleSidebarCollapsed: user toggled sidebar", { previous: sidebarCollapsed.value, next });
+  sidebarCollapsed.value = next;
 }
 
 const sidebarSiderWidth = 208;
@@ -613,6 +637,7 @@ const SIDEBAR_AUTO_COLLAPSE_BREAKPOINT = 720;
 function syncSidebarAutoCollapse(): void {
   if (typeof window === "undefined") return;
   if (window.innerWidth <= SIDEBAR_AUTO_COLLAPSE_BREAKPOINT && !sidebarCollapsed.value) {
+    console.info("[App] syncSidebarAutoCollapse: auto-collapsing sidebar", { innerWidth: window.innerWidth, breakpoint: SIDEBAR_AUTO_COLLAPSE_BREAKPOINT });
     sidebarCollapsed.value = true;
   }
 }
@@ -747,14 +772,20 @@ const pageMetadata = computed<PageMetadata>(() => {
 });
 
 async function syncWindowState() {
+  console.debug("[App] syncWindowState: syncing", { windowLabel, isDesktopRuntime });
   if (!appWindow) {
     isWindowMaximized.value = typeof document !== "undefined" && document.fullscreenElement !== null;
+    console.debug("[App] syncWindowState: browser fallback", { isMaximized: isWindowMaximized.value });
     return;
   }
   try {
-    isWindowMaximized.value = await appWindow.isMaximized();
-  } catch {
-    // Window state is optional in the browser preview.
+    const maximized = await appWindow.isMaximized();
+    if (isWindowMaximized.value !== maximized) {
+      console.info("[App] syncWindowState: maximized changed", { previous: isWindowMaximized.value, next: maximized });
+    }
+    isWindowMaximized.value = maximized;
+  } catch (error) {
+    console.warn("[App] syncWindowState: failed", { error: error instanceof Error ? error.message : String(error) });
   }
 }
 
@@ -822,12 +853,18 @@ async function bindMainWindowCloseListener(): Promise<void> {
 }
 
 function minimizeWindow() {
+  console.info("[App] minimizeWindow: user requested minimize", { windowLabel });
   if (appWindow) {
-    void appWindow.minimize().catch(() => undefined);
+    void appWindow.minimize().then(() => {
+      console.debug("[App] minimizeWindow: success");
+    }).catch((error) => {
+      console.error("[App] minimizeWindow: failed", { error: error instanceof Error ? error.message : String(error) });
+    });
   }
 }
 
 async function toggleWindowMaximize() {
+  console.info("[App] toggleWindowMaximize: user requested toggle maximize", { isMaximized: isWindowMaximized.value, windowLabel });
   if (!appWindow) {
     if (typeof document === "undefined") {
       return;
@@ -855,14 +892,22 @@ async function toggleWindowMaximize() {
 }
 
 function closeWindow() {
+  console.info("[App] closeWindow: user requested close", { windowLabel });
   if (appWindow) {
-    void appWindow.close().catch(() => undefined);
+    void appWindow.close().then(() => {
+      console.debug("[App] closeWindow: close requested");
+    }).catch((error) => {
+      console.error("[App] closeWindow: failed", { error: error instanceof Error ? error.message : String(error) });
+    });
   }
 }
 
 function openModelMonitor() {
+  console.info("[App] openModelMonitor: user requested open monitor", { activeMenu: activeMenu.value });
   if (activeMenu.value !== "model-monitor") {
-    void router.push({ name: "model-monitor" });
+    void router.push({ name: "model-monitor" }).then(() => {
+      console.debug("[App] openModelMonitor: navigated to monitor");
+    });
   }
 }
 
@@ -885,26 +930,53 @@ function handleTitlebarDoubleClick(event: MouseEvent) {
 }
 
 onMounted(() => {
+  console.info("[App] onMounted: app mounted", { windowLabel, isMainWorkspaceWindow, isDesktopRuntime, activeMenu: activeMenu.value, theme: resolvedTheme.value });
   if (!isMainWorkspaceWindow) {
+    console.debug("[App] onMounted: not main workspace window, skipping init", { windowLabel });
     return;
   }
+  console.debug("[App] onMounted: loading persisted targetLanguage");
   loadPersistedTargetLanguage();
   if (isDesktopRuntime) {
-    void initializeQuickTranslationSettings().catch((error) => {
+    const t0 = Date.now();
+    console.info("[App] onMounted: initializing quick translation settings");
+    void initializeQuickTranslationSettings().then(() => {
+      console.info("[App] quickTranslation init success", { durationMs: Date.now() - t0 });
+    }).catch((error) => {
+      console.error("[App] quickTranslation init failed", { error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - t0 });
       console.error("初始化快捷翻译设置失败", error);
     });
+  } else {
+    console.debug("[App] onMounted: skipping quickTranslation init (browser preview)");
   }
-  void syncWindowState();
-  void bindWindowStateListener();
-  void bindMainWindowCloseListener();
+  void syncWindowState().then(() => {
+    console.debug("[App] syncWindowState completed", { isMaximized: isWindowMaximized.value });
+  });
+  void bindWindowStateListener().then(() => {
+    console.debug("[App] bindWindowStateListener completed");
+  });
+  void bindMainWindowCloseListener().then(() => {
+    console.debug("[App] bindMainWindowCloseListener completed");
+  });
   bindSidebarAutoCollapse();
+  console.debug("[App] onMounted: sidebar auto-collapse bound");
   if (isDesktopRuntime) {
-    void fetchSharedBackendStatus().catch(() => undefined);
-    void fetchSharedModelRuntimeStatus().catch(() => undefined);
+    const t0 = Date.now();
+    void fetchSharedBackendStatus().then((status) => {
+      console.info("[App] fetchSharedBackendStatus: success", { ready: status?.ready, durationMs: Date.now() - t0 });
+    }).catch((error) => {
+      console.warn("[App] fetchSharedBackendStatus: failed", { error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - t0 });
+    });
+    void fetchSharedModelRuntimeStatus().then((status) => {
+      console.info("[App] fetchSharedModelRuntimeStatus: success", { busy: status?.busy, durationMs: Date.now() - t0 });
+    }).catch(() => {
+      console.debug("[App] fetchSharedModelRuntimeStatus: failed or no-op");
+    });
   }
 });
 
 onBeforeUnmount(() => {
+  console.debug("[App] onBeforeUnmount: cleaning up", { windowLabel });
   windowStateListenerActive = false;
   windowStateUnlisten?.();
   windowStateUnlisten = undefined;

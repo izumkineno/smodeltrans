@@ -475,7 +475,17 @@ impl BackendSettings {
         resource_root: Option<PathBuf>,
         config_path: Option<&Path>,
     ) -> Result<Self, String> {
-        let persisted = config_path.and_then(read_persisted_settings);
+        tracing::info!(target: "backend::settings", config_path = ?config_path.map(|p| p.display().to_string()), has_resource_root = resource_root.is_some(), "loading backend settings");
+        let persisted = config_path.and_then(|path| {
+            tracing::debug!(target: "backend::settings", path = %path.display(), "attempting to load persisted settings");
+            let result = read_persisted_settings(path);
+            if result.is_some() {
+                tracing::info!(target: "backend::settings", path = %path.display(), "persisted settings loaded");
+            } else {
+                tracing::info!(target: "backend::settings", path = %path.display(), "no persisted settings, using environment defaults");
+            }
+            result
+        });
         let manifest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = env::var_os("SMODELTRANS_WORKSPACE_ROOT")
             .map(|path| resolve_path(Some(PathBuf::from(path)), Path::new(".")))
@@ -489,6 +499,7 @@ impl BackendSettings {
             .map(|path| resolve_path(Some(PathBuf::from(path)), &workspace_root))
             .or(packaged_model_root)
             .unwrap_or_else(|| workspace_root.join("models"));
+        tracing::debug!(target: "backend::settings", model_root = %model_root.display(), workspace_root = %workspace_root.display(), "resolved model and workspace roots");
         let detector_default = model_root.join("ppocrv5").join("server_det");
         let recognizer_default = model_root.join("ppocrv5").join("server_rec");
         let hy_default = model_root.join("hy").join(DEFAULT_HY_FILE);
@@ -499,7 +510,14 @@ impl BackendSettings {
             .unwrap_or_else(|| {
                 env::var("SMODELTRANS_DEVICE").unwrap_or_else(|_| "cuda".to_owned())
             });
-        let device_kind = parse_device(&device_text)?;
+        tracing::debug!(target: "backend::settings", device_text = %device_text, has_persisted = persisted.is_some(), "resolved device text");
+        let device_kind = match parse_device(&device_text) {
+            Ok(kind) => kind,
+            Err(error) => {
+                tracing::warn!(target: "backend::settings", device_text = %device_text, error = %error, "failed to parse device");
+                return Err(error);
+            }
+        };
 
         let target_language = persisted
             .as_ref()
@@ -508,7 +526,17 @@ impl BackendSettings {
                 env::var("SMODELTRANS_TARGET_LANGUAGE")
                     .unwrap_or_else(|_| DEFAULT_TARGET_LANGUAGE.to_owned())
             });
-        let target_language = validate_target_language(&target_language)?;
+        tracing::debug!(target: "backend::settings", target_language_input = %target_language, "resolved target language input");
+        let target_language = match validate_target_language(&target_language) {
+            Ok(lang) => {
+                tracing::debug!(target: "backend::settings", target_language = %lang, "validated target language");
+                lang
+            }
+            Err(error) => {
+                tracing::warn!(target: "backend::settings", input = %target_language, error = %error, "validate_target_language failed");
+                return Err(error);
+            }
+        };
 
         let font_path_from_env = env::var_os("SMODELTRANS_FONT_PATH")
             .map(|path| resolve_path(Some(path), &workspace_root));
@@ -541,6 +569,7 @@ impl BackendSettings {
             .as_ref()
             .and_then(|settings| settings.hy_model.clone())
             .unwrap_or_else(|| env_path("SMODELTRANS_HY_MODEL", hy_default, &workspace_root));
+        tracing::debug!(target: "backend::settings", detector_model_dir = %detector_model_dir.display(), recognizer_model_dir = %recognizer_model_dir.display(), hy_model = %hy_model.display(), font_path = ?font_path.as_ref().map(|p| p.display().to_string()), model_root = %model_root.display(), "resolved model paths");
         let idle_unload_seconds = persisted
             .as_ref()
             .and_then(|settings| settings.idle_unload_seconds)
@@ -550,43 +579,76 @@ impl BackendSettings {
                     .and_then(|settings| settings.idle_unload_minutes)
                     .and_then(|minutes| minutes.checked_mul(60))
             })
-            .unwrap_or(idle_unload_seconds_from_environment()?);
-        validate_idle_unload_seconds(idle_unload_seconds)?;
+            .unwrap_or({
+                let seconds = idle_unload_seconds_from_environment()?;
+                tracing::debug!(target: "backend::settings", idle_unload_seconds = seconds, "resolved idle_unload_seconds from environment");
+                seconds
+            });
+        if let Err(error) = validate_idle_unload_seconds(idle_unload_seconds) {
+            tracing::warn!(target: "backend::settings", value = idle_unload_seconds, error = %error, "validate_idle_unload_seconds failed");
+            return Err(error);
+        }
         let region_parallelism = persisted
             .as_ref()
             .and_then(|settings| settings.region_parallelism)
-            .unwrap_or(bounded_env(
-                "SMODELTRANS_REGION_PARALLELISM",
-                DEFAULT_REGION_PARALLELISM,
-                1,
-                DEFAULT_REGION_PARALLELISM,
-            )?);
-        validate_region_parallelism(region_parallelism)?;
+            .unwrap_or({
+                let v = bounded_env(
+                    "SMODELTRANS_REGION_PARALLELISM",
+                    DEFAULT_REGION_PARALLELISM,
+                    1,
+                    DEFAULT_REGION_PARALLELISM,
+                )?;
+                tracing::debug!(target: "backend::settings", region_parallelism = v, "resolved region_parallelism from env");
+                v
+            });
+        if let Err(error) = validate_region_parallelism(region_parallelism) {
+            tracing::warn!(target: "backend::settings", value = region_parallelism, error = %error, "validate_region_parallelism failed");
+            return Err(error);
+        }
         let translation_batch_size = persisted
             .as_ref()
             .and_then(|settings| settings.translation_batch_size)
-            .unwrap_or(bounded_env(
-                "SMODELTRANS_TRANSLATION_BATCH_SIZE",
-                DEFAULT_TRANSLATION_BATCH_SIZE,
-                1,
-                DEFAULT_TRANSLATION_BATCH_SIZE,
-            )?);
-        validate_translation_batch_size(translation_batch_size)?;
+            .unwrap_or({
+                let v = bounded_env(
+                    "SMODELTRANS_TRANSLATION_BATCH_SIZE",
+                    DEFAULT_TRANSLATION_BATCH_SIZE,
+                    1,
+                    DEFAULT_TRANSLATION_BATCH_SIZE,
+                )?;
+                tracing::debug!(target: "backend::settings", translation_batch_size = v, "resolved translation_batch_size from env");
+                v
+            });
+        if let Err(error) = validate_translation_batch_size(translation_batch_size) {
+            tracing::warn!(target: "backend::settings", value = translation_batch_size, error = %error, "validate_translation_batch_size failed");
+            return Err(error);
+        }
         let generation = generation_from_persisted(
             persisted
                 .as_ref()
                 .and_then(|settings| settings.generation.clone()),
-        )?;
+        )
+        .map_err(|error| {
+            tracing::warn!(target: "backend::settings", error = %error, "generation_from_persisted failed");
+            error
+        })?;
         let memory = memory_from_persisted(
             persisted
                 .as_ref()
                 .and_then(|settings| settings.memory.clone()),
-        )?;
+        )
+        .map_err(|error| {
+            tracing::warn!(target: "backend::settings", error = %error, "memory_from_persisted failed");
+            error
+        })?;
         let prompt = prompt_from_persisted(
             persisted
                 .as_ref()
                 .and_then(|settings| settings.prompt.clone()),
-        )?;
+        )
+        .map_err(|error| {
+            tracing::warn!(target: "backend::settings", error = %error, "prompt_from_persisted failed");
+            error
+        })?;
         let catalog = persisted
             .as_ref()
             .and_then(|settings| settings.model_catalog.clone())
@@ -597,9 +659,16 @@ impl BackendSettings {
             .unwrap_or_default();
         // 校验但不阻断启动，非法则回退默认
         let openai_compat = match openai_compat.validate() {
-            Ok(()) => openai_compat,
-            Err(_) => crate::openai_compat::config::OpenAiCompatConfig::default(),
+            Ok(()) => {
+                tracing::debug!(target: "backend::settings", "openai_compat config validated");
+                openai_compat
+            }
+            Err(error) => {
+                tracing::warn!(target: "backend::settings", error = %error, "openai_compat validation failed, falling back to default");
+                crate::openai_compat::config::OpenAiCompatConfig::default()
+            }
         };
+        tracing::info!(target: "backend::settings", device = %device_kind.as_str(), target_language = %target_language, region_parallelism = region_parallelism, translation_batch_size = translation_batch_size, idle_unload_seconds = idle_unload_seconds, model_root = %model_root.display(), detector_model_dir = %detector_model_dir.display(), recognizer_model_dir = %recognizer_model_dir.display(), hy_model = %hy_model.display(), "backend settings loaded successfully");
         Ok(Self {
             detector_model_dir,
             recognizer_model_dir,
@@ -677,7 +746,11 @@ impl BackendSettings {
     }
     /// Replace the persisted model catalog after validating every entry.
     pub(crate) fn save_catalog(&mut self, update: ModelCatalogUpdate) -> Result<(), String> {
-        validate_catalog_update(&update)?;
+        tracing::info!(target: "backend::settings", translation = update.translation.len(), ocr = update.ocr.len(), fonts = update.fonts.len(), "saving model catalog");
+        if let Err(error) = validate_catalog_update(&update) {
+            tracing::warn!(target: "backend::settings", error = %error, "save_catalog validation failed");
+            return Err(error);
+        }
         self.catalog = ModelCatalog {
             translation: update
                 .translation
@@ -704,6 +777,7 @@ impl BackendSettings {
                 })
                 .collect(),
         };
+        tracing::info!(target: "backend::settings", translation = self.catalog.translation.len(), ocr = self.catalog.ocr.len(), fonts = self.catalog.fonts.len(), "model catalog saved");
         Ok(())
     }
 
@@ -861,32 +935,45 @@ impl BackendSettings {
 }
 
 fn validate_catalog_update(update: &ModelCatalogUpdate) -> Result<(), String> {
+    tracing::debug!(target: "backend::settings", translation = update.translation.len(), fonts = update.fonts.len(), ocr = update.ocr.len(), "validating model catalog update");
     for entry in &update.translation {
-        validate_named_entry("翻译", &entry.name, &entry.path)?;
+        if let Err(error) = validate_named_entry("翻译", &entry.name, &entry.path) {
+            tracing::warn!(target: "backend::settings", kind = "翻译", name = %entry.name, path = %entry.path.display(), error = %error, "validate_catalog_update failed for translation entry");
+            return Err(error);
+        }
     }
     for entry in &update.fonts {
-        validate_named_entry("字体", &entry.name, &entry.path)?;
+        if let Err(error) = validate_named_entry("字体", &entry.name, &entry.path) {
+            tracing::warn!(target: "backend::settings", kind = "字体", name = %entry.name, path = %entry.path.display(), error = %error, "validate_catalog_update failed for font entry");
+            return Err(error);
+        }
     }
     for entry in &update.ocr {
         let name = entry.name.trim();
         if name.is_empty() || name.chars().count() > 64 {
+            tracing::warn!(target: "backend::settings", name = %entry.name, detector_dir = %entry.detector_dir.display(), recognizer_dir = %entry.recognizer_dir.display(), "validate_catalog_update failed: invalid OCR name");
             return Err("OCR 模型名称必须为 1 到 64 个字符".to_owned());
         }
         if !entry.detector_dir.is_absolute() || !entry.recognizer_dir.is_absolute() {
+            tracing::warn!(target: "backend::settings", name = %entry.name, detector_dir = %entry.detector_dir.display(), recognizer_dir = %entry.recognizer_dir.display(), "validate_catalog_update failed: OCR path not absolute");
             return Err("OCR 模型目录必须是绝对路径".to_owned());
         }
     }
+    tracing::info!(target: "backend::settings", translation = update.translation.len(), fonts = update.fonts.len(), ocr = update.ocr.len(), "model catalog validation succeeded");
     Ok(())
 }
 
 fn validate_named_entry(kind: &str, name: &str, path: &Path) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 64 {
+        tracing::warn!(target: "backend::settings", kind = %kind, name = %name, len = name.chars().count(), path = %path.display(), "validate_named_entry failed: invalid name");
         return Err(format!("{kind}模型名称必须为 1 到 64 个字符"));
     }
     if !path.is_absolute() {
+        tracing::warn!(target: "backend::settings", kind = %kind, name = %name, path = %path.display(), "validate_named_entry failed: path not absolute");
         return Err(format!("{kind}模型路径必须是绝对路径"));
     }
+    tracing::debug!(target: "backend::settings", kind = %kind, name = %name, path = %path.display(), "validate_named_entry succeeded");
     Ok(())
 }
 
@@ -1173,11 +1260,13 @@ fn validate_target_language(value: &str) -> Result<String, String> {
     let value = value.trim();
     let target_length = value.chars().count();
     if !(1..=MAX_TARGET_LANGUAGE_CHARS).contains(&target_length) {
+        tracing::warn!(target: "backend::settings", value = %value, len = target_length, max = MAX_TARGET_LANGUAGE_CHARS, "validate_target_language failed: length out of range");
         return Err(format!(
             "targetLanguage must contain 1..={MAX_TARGET_LANGUAGE_CHARS} characters"
         ));
     }
     if let Some(canonical) = normalize_target_language(value) {
+        tracing::debug!(target: "backend::settings", input = %value, canonical = %canonical, "validate_target_language normalized");
         return Ok(canonical);
     }
     let supported = SUPPORTED_TARGET_LANGUAGES
@@ -1185,6 +1274,7 @@ fn validate_target_language(value: &str) -> Result<String, String> {
         .map(|(en, _, _)| *en)
         .collect::<Vec<_>>()
         .join(", ");
+    tracing::warn!(target: "backend::settings", value = %value, "validate_target_language failed: unsupported language");
     Err(format!(
         "targetLanguage '{}' 不在 Hy-MT2 支持列表内，支持：{supported}",
         value
@@ -1192,41 +1282,70 @@ fn validate_target_language(value: &str) -> Result<String, String> {
 }
 
 fn parse_device(value: &str) -> Result<DeviceKind, String> {
-    value
-        .parse()
-        .map_err(|_| "device must be cpu or cuda".to_owned())
+    match value.parse() {
+        Ok(device) => {
+            tracing::debug!(target: "backend::settings", value = %value, device = ?device, "parse_device succeeded");
+            Ok(device)
+        }
+        Err(_) => {
+            tracing::warn!(target: "backend::settings", value = %value, "parse_device failed: invalid device");
+            Err("device must be cpu or cuda".to_owned())
+        }
+    }
 }
 
 fn validate_region_parallelism(value: usize) -> Result<(), String> {
     if !(1..=DEFAULT_REGION_PARALLELISM).contains(&value) {
+        tracing::warn!(target: "backend::settings", value = value, max = DEFAULT_REGION_PARALLELISM, "validate_region_parallelism failed");
         return Err(format!(
             "regionParallelism must be in 1..={DEFAULT_REGION_PARALLELISM}"
         ));
     }
+    tracing::debug!(target: "backend::settings", value = value, "validate_region_parallelism succeeded");
     Ok(())
 }
 
 fn validate_translation_batch_size(value: usize) -> Result<(), String> {
     if !(1..=DEFAULT_TRANSLATION_BATCH_SIZE).contains(&value) {
+        tracing::warn!(target: "backend::settings", value = value, max = DEFAULT_TRANSLATION_BATCH_SIZE, "validate_translation_batch_size failed");
         return Err(format!(
             "translationBatchSize must be in 1..={DEFAULT_TRANSLATION_BATCH_SIZE}"
         ));
     }
+    tracing::debug!(target: "backend::settings", value = value, "validate_translation_batch_size succeeded");
     Ok(())
 }
 
 fn validate_idle_unload_seconds(value: u32) -> Result<(), String> {
     if value > MAX_IDLE_UNLOAD_SECONDS {
+        tracing::warn!(target: "backend::settings", value = value, max = MAX_IDLE_UNLOAD_SECONDS, "validate_idle_unload_seconds failed");
         return Err(format!(
             "idle_unload_seconds must be in 0..={MAX_IDLE_UNLOAD_SECONDS}"
         ));
     }
+    tracing::debug!(target: "backend::settings", value = value, "validate_idle_unload_seconds succeeded");
     Ok(())
 }
 
 fn read_persisted_settings(path: &Path) -> Option<PersistedBackendSettings> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    tracing::debug!(target: "backend::settings", path = %path.display(), "reading persisted settings");
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) => {
+            tracing::info!(target: "backend::settings", path = %path.display(), error = %error, "persisted settings not found or unreadable, falling back to defaults/env");
+            return None;
+        }
+    };
+    match serde_json::from_str::<PersistedBackendSettings>(&content) {
+        Ok(settings) => {
+            tracing::info!(target: "backend::settings", path = %path.display(), bytes = content.len(), "persisted settings loaded successfully");
+            Some(settings)
+        }
+        Err(error) => {
+            tracing::warn!(target: "backend::settings", path = %path.display(), error = %error, "failed to parse persisted settings, falling back to defaults/env");
+            None
+        }
+    }
 }
 
 fn selected_path(name: &str, value: &str) -> Result<PathBuf, String> {

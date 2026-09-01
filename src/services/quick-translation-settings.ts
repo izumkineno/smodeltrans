@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ref } from "vue";
 
+const QT_LOG_PREFIX = " [quick-translation-settings]";
+
 const QUICK_TRANSLATION_STORAGE_KEY = "smodeltrans.quickTranslationSettings";
 const QUICK_TRANSLATION_MODIFIER_ALIASES: Record<string, string> = {
   ALT: "Alt",
@@ -162,22 +164,29 @@ function normalizeSettings(value: unknown): QuickTranslationSettings | null {
 }
 
 export function loadPersistedQuickTranslationSettings(): string | null {
+  console.info(`${QT_LOG_PREFIX} loadPersistedQuickTranslationSettings start`, { alreadyLoaded: persistedSettingsLoaded });
   if (persistedSettingsLoaded || typeof window === "undefined") {
+    console.debug(`${QT_LOG_PREFIX} loadPersistedQuickTranslationSettings skip`, { alreadyLoaded: persistedSettingsLoaded, hasWindow: typeof window !== "undefined" });
     return null;
   }
   persistedSettingsLoaded = true;
   try {
     const raw = window.localStorage.getItem(QUICK_TRANSLATION_STORAGE_KEY);
+    console.debug(`${QT_LOG_PREFIX} loadPersistedQuickTranslationSettings raw`, { raw });
     if (!raw) {
+      console.info(`${QT_LOG_PREFIX} loadPersistedQuickTranslationSettings no persisted value, using default`, { defaultShortcut: defaultSettings.shortcut });
       return null;
     }
     const settings = normalizeSettings(JSON.parse(raw));
     if (!settings) {
+      console.warn(`${QT_LOG_PREFIX} loadPersistedQuickTranslationSettings invalid, fallback to default`, { raw });
       return "快捷翻译设置无效，已恢复默认值。";
     }
     quickTranslationSettings.value = settings;
+    console.info(`${QT_LOG_PREFIX} loadPersistedQuickTranslationSettings success`, { enabled: settings.enabled, shortcut: settings.shortcut });
     return null;
-  } catch {
+  } catch (error) {
+    console.warn(`${QT_LOG_PREFIX} loadPersistedQuickTranslationSettings failed`, { error: error instanceof Error ? error.message : String(error) });
     return "无法读取快捷翻译设置，已使用默认值。";
   }
 }
@@ -209,39 +218,70 @@ export function quickTranslationShortcutLabel(shortcut: string): string {
 }
 
 async function applyShortcutSettings(settings: QuickTranslationSettings): Promise<void> {
+  console.debug(`${QT_LOG_PREFIX} applyShortcutSettings start`, { enabled: settings.enabled, shortcut: settings.shortcut });
   if (!(typeof window !== "undefined" && "__TAURI_INTERNALS__" in window)) {
+    console.debug(`${QT_LOG_PREFIX} applyShortcutSettings skip not Tauri`, { enabled: settings.enabled, shortcut: settings.shortcut });
     return;
   }
-  await invoke("configure_quick_translation", {
-    settings: {
-      enabled: settings.enabled,
-      shortcut: settings.shortcut,
-    },
-  });
+  try {
+    await invoke("configure_quick_translation", {
+      settings: {
+        enabled: settings.enabled,
+        shortcut: settings.shortcut,
+      },
+    });
+    console.info(`${QT_LOG_PREFIX} applyShortcutSettings success`, { enabled: settings.enabled, shortcut: settings.shortcut });
+  } catch (error) {
+    console.error(`${QT_LOG_PREFIX} applyShortcutSettings failed`, { enabled: settings.enabled, shortcut: settings.shortcut, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
 export async function initializeQuickTranslationSettings(): Promise<string | null> {
+  console.info(`${QT_LOG_PREFIX} initializeQuickTranslationSettings start`);
   const loadMessage = loadPersistedQuickTranslationSettings();
-  await applyShortcutSettings(quickTranslationSettings.value);
+  if (loadMessage) {
+    console.warn(`${QT_LOG_PREFIX} initializeQuickTranslationSettings loadMessage`, { loadMessage });
+  }
+  console.debug(`${QT_LOG_PREFIX} initializeQuickTranslationSettings applying`, { enabled: quickTranslationSettings.value.enabled, shortcut: quickTranslationSettings.value.shortcut });
+  try {
+    await applyShortcutSettings(quickTranslationSettings.value);
+    console.info(`${QT_LOG_PREFIX} initializeQuickTranslationSettings success`, { enabled: quickTranslationSettings.value.enabled, shortcut: quickTranslationSettings.value.shortcut });
+  } catch (error) {
+    console.error(`${QT_LOG_PREFIX} initializeQuickTranslationSettings apply failed`, { error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
   return loadMessage;
 }
 
 export async function saveQuickTranslationSettings(
   value: QuickTranslationSettings,
 ): Promise<QuickTranslationSettings> {
+  console.info(`${QT_LOG_PREFIX} saveQuickTranslationSettings start`, { enabled: value.enabled, shortcut: value.shortcut });
   const settings = normalizeSettings(value);
   if (!settings) {
+    console.error(`${QT_LOG_PREFIX} saveQuickTranslationSettings invalid input`, { enabled: value.enabled, shortcut: value.shortcut });
     throw new Error("快捷翻译设置不完整。");
   }
 
   const previousSettings = { ...quickTranslationSettings.value };
-  await applyShortcutSettings(settings);
+  console.debug(`${QT_LOG_PREFIX} saveQuickTranslationSettings normalized`, { enabled: settings.enabled, shortcut: settings.shortcut });
+  try {
+    await applyShortcutSettings(settings);
+    console.debug(`${QT_LOG_PREFIX} saveQuickTranslationSettings applied to backend`, { enabled: settings.enabled, shortcut: settings.shortcut });
+  } catch (error) {
+    console.error(`${QT_LOG_PREFIX} saveQuickTranslationSettings backend apply failed`, { error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
   try {
     window.localStorage.setItem(QUICK_TRANSLATION_STORAGE_KEY, JSON.stringify(settings));
-  } catch {
+    console.info(`${QT_LOG_PREFIX} saveQuickTranslationSettings persisted success`, { enabled: settings.enabled, shortcut: settings.shortcut });
+  } catch (error) {
+    console.warn(`${QT_LOG_PREFIX} saveQuickTranslationSettings localStorage failed, rolling back`, { error: error instanceof Error ? error.message : String(error) });
     await applyShortcutSettings(previousSettings).catch(() => undefined);
     throw new Error("无法保存快捷翻译设置，请检查应用存储权限。");
   }
   quickTranslationSettings.value = settings;
+  console.info(`${QT_LOG_PREFIX} saveQuickTranslationSettings success`, { enabled: settings.enabled, shortcut: settings.shortcut });
   return settings;
 }

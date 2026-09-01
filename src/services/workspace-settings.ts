@@ -1,6 +1,7 @@
 import { ref } from "vue";
 import { getBackendStatus, getModelRuntimeStatus } from "./translation-provider";
 import type { BackendStatus, ModelRuntimeStatus } from "./translation-provider";
+
 import type {
   LiveOverlaySettings,
   LiveRecognitionSettings,
@@ -17,6 +18,8 @@ import {
   LIVE_MEMORY_TURNS_MIN,
   LIVE_SUPPLEMENTAL_PROMPT_MAX_CHARS,
 } from "./live-translation-provider";
+
+const WS_LOG_PREFIX = " [workspace-settings]";
 
 const TARGET_LANGUAGE_STORAGE_KEY = "smodeltrans.targetLanguage";
 const LIVE_OVERLAY_SETTINGS_STORAGE_KEY = "smodeltrans.liveOverlaySettings";
@@ -137,51 +140,82 @@ export const liveTranslationSettings = ref<LiveTranslationSettings>({
 let persistedTargetLanguageLoaded = false;
 
 export function loadPersistedTargetLanguage(): string | null {
+  console.info(`${WS_LOG_PREFIX} loadPersistedTargetLanguage start`, { alreadyLoaded: persistedTargetLanguageLoaded });
   if (persistedTargetLanguageLoaded || typeof window === "undefined") {
+    console.debug(`${WS_LOG_PREFIX} loadPersistedTargetLanguage skip`, { alreadyLoaded: persistedTargetLanguageLoaded, hasWindow: typeof window !== "undefined" });
     return null;
   }
   persistedTargetLanguageLoaded = true;
 
   try {
     const persistedLanguage = window.localStorage.getItem(TARGET_LANGUAGE_STORAGE_KEY);
+    console.debug(`${WS_LOG_PREFIX} loadPersistedTargetLanguage raw`, { persistedLanguage });
     if (persistedLanguage?.trim()) {
       targetLanguage.value = persistedLanguage.trim();
+      console.info(`${WS_LOG_PREFIX} loadPersistedTargetLanguage success`, { targetLanguage: targetLanguage.value });
+    } else {
+      console.info(`${WS_LOG_PREFIX} loadPersistedTargetLanguage no persisted value, using default`, { targetLanguage: targetLanguage.value });
     }
     return null;
-  } catch {
+  } catch (error) {
+    console.warn(`${WS_LOG_PREFIX} loadPersistedTargetLanguage failed`, { error: error instanceof Error ? error.message : String(error) });
     return "无法读取本地设置，将使用默认目标语言。";
   }
 }
 
 export function savePersistedTargetLanguage(): string | null {
+  console.info(`${WS_LOG_PREFIX} savePersistedTargetLanguage start`, { targetLanguage: targetLanguage.value });
   try {
     window.localStorage.setItem(TARGET_LANGUAGE_STORAGE_KEY, targetLanguage.value);
+    console.info(`${WS_LOG_PREFIX} savePersistedTargetLanguage success`, { targetLanguage: targetLanguage.value });
     return null;
-  } catch {
+  } catch (error) {
+    console.warn(`${WS_LOG_PREFIX} savePersistedTargetLanguage failed`, { targetLanguage: targetLanguage.value, error: error instanceof Error ? error.message : String(error) });
     return "无法写入本地设置，请检查应用存储权限。";
   }
 }
 
 export function applySharedBackendStatus(status: BackendStatus) {
+  console.info(`${WS_LOG_PREFIX} applySharedBackendStatus`, { targetLanguage: status.targetLanguage, ready: status.ready, device: status.device, translatorLoaded: status.translatorLoaded, message: status.message });
+  console.debug(`${WS_LOG_PREFIX} applySharedBackendStatus detail`, { detectorModelDir: status.detectorModelDir, recognizerModelDir: status.recognizerModelDir, hyModel: status.hyModel });
   backendStatus.value = status;
   targetLanguage.value = status.targetLanguage;
 }
 
 export function applySharedModelRuntimeStatus(status: ModelRuntimeStatus) {
+  console.info(`${WS_LOG_PREFIX} applySharedModelRuntimeStatus`, { ocrLoaded: status.ocrLoaded, translatorLoaded: status.translatorLoaded, busy: status.busy });
+  console.debug(`${WS_LOG_PREFIX} applySharedModelRuntimeStatus backend`, { ready: status.backend.ready, targetLanguage: status.backend.targetLanguage });
   modelRuntimeStatus.value = status;
   applySharedBackendStatus(status.backend);
 }
 
 export async function fetchSharedBackendStatus(): Promise<BackendStatus> {
-  const status = await getBackendStatus();
-  applySharedBackendStatus(status);
-  return status;
+  console.info(`${WS_LOG_PREFIX} fetchSharedBackendStatus start`);
+  const start = Date.now();
+  try {
+    const status = await getBackendStatus();
+    console.info(`${WS_LOG_PREFIX} fetchSharedBackendStatus success`, { ready: status.ready, device: status.device, targetLanguage: status.targetLanguage, durationMs: Date.now() - start });
+    applySharedBackendStatus(status);
+    return status;
+  } catch (error) {
+    console.warn(`${WS_LOG_PREFIX} fetchSharedBackendStatus failed`, { error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - start });
+    throw error;
+  }
 }
 
 export async function fetchSharedModelRuntimeStatus(): Promise<ModelRuntimeStatus> {
-  const status = await getModelRuntimeStatus();
-  applySharedModelRuntimeStatus(status);
-  return status;
+  console.info(`${WS_LOG_PREFIX} fetchSharedModelRuntimeStatus start`);
+  const start = Date.now();
+  try {
+    const status = await getModelRuntimeStatus();
+    console.info(`${WS_LOG_PREFIX} fetchSharedModelRuntimeStatus success`, { ocrLoaded: status.ocrLoaded, translatorLoaded: status.translatorLoaded, busy: status.busy, durationMs: Date.now() - start });
+    console.debug(`${WS_LOG_PREFIX} fetchSharedModelRuntimeStatus backend`, { ready: status.backend.ready, device: status.backend.device });
+    applySharedModelRuntimeStatus(status);
+    return status;
+  } catch (error) {
+    console.warn(`${WS_LOG_PREFIX} fetchSharedModelRuntimeStatus failed`, { error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - start });
+    throw error;
+  }
 }
 
 let persistedLiveOverlaySettingsLoaded = false;

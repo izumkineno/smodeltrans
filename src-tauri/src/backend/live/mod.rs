@@ -48,8 +48,11 @@ const DEBUG_TEXT_MAX_CHARS: usize = 2_000;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 fn trace_live(message: std::fmt::Arguments<'_>) {
+    // 兼容旧 env 条件，同时输出到 tracing
     if cfg!(debug_assertions) || std::env::var_os("SMODELTRANS_TRACE_LIVE").is_some() {
-        eprintln!("[live] {message}");
+        tracing::debug!(target: "live", "{}", message);
+    } else {
+        tracing::trace!(target: "live", "{}", message);
     }
 }
 
@@ -164,6 +167,8 @@ impl LiveSessionManager {
         recognition_settings: LiveRecognitionSettings,
         translation_settings: LiveTranslationSettings,
     ) -> Result<LiveSessionStatus, BackendFailure> {
+        let _span = tracing::info_span!(target: "live::manager", "start_session", target_id = %target_id, target_language = %target_language).entered();
+        tracing::info!(target: "live::manager", target_id = %target_id, target_language = %target_language, "live session start requested");
         self.collect_finished()?;
         let target_language = validate_target_language(&target_language)?;
         let overlay_settings = overlay_settings
@@ -218,6 +223,7 @@ impl LiveSessionManager {
             std::process::id(),
             NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
         );
+        tracing::info!(target: "live::manager", session_id = %session_id, target_id = %target_id, language = %target_language, "live session id allocated");
         {
             let mut inner = self
                 .inner
@@ -259,6 +265,8 @@ impl LiveSessionManager {
         sizing: LiveOverlaySizing,
         content_size: LiveOverlayContentSize,
     ) -> Result<(), BackendFailure> {
+        let _span = tracing::debug_span!(target: "live::manager", "update_overlay_layout", session_id = %session_id).entered();
+        tracing::debug!(target: "live::manager", session_id = %session_id, sizing = ?sizing, content_width = content_size.width, content_height = content_size.height, "update overlay layout requested");
         let sizing = sizing.validate().map_err(BackendFailure::arguments)?;
         let content_size = content_size.validate().map_err(BackendFailure::arguments)?;
         let current = self.current_status()?;
@@ -318,6 +326,8 @@ impl LiveSessionManager {
     }
     fn begin_overlay_drag(&self, session_id: &str) -> Result<(), BackendFailure> {
         let current = self.current_status()?;
+        let _span = tracing::debug_span!(target: "live::manager", "begin_overlay_drag", session_id = %session_id).entered();
+        tracing::info!(target: "live::manager", session_id = %session_id, "begin overlay drag");
         require_session(&current, session_id)?;
         let mut inner = self
             .inner
@@ -344,6 +354,8 @@ impl LiveSessionManager {
         session_id: &str,
         position: LiveOverlayPosition,
     ) -> Result<(), BackendFailure> {
+        let _span = tracing::debug_span!(target: "live::manager", "update_overlay_position", session_id = %session_id, x = position.x, y = position.y).entered();
+        tracing::debug!(target: "live::manager", session_id = %session_id, x = position.x, y = position.y, "update overlay position requested");
         let current = self.current_status()?;
         require_session(&current, session_id)?;
         let target_id = current
@@ -380,6 +392,8 @@ impl LiveSessionManager {
         Ok(())
     }
     fn begin_overlay_resize(&self, session_id: &str) -> Result<(), BackendFailure> {
+        let _span = tracing::debug_span!(target: "live::manager", "begin_overlay_resize", session_id = %session_id).entered();
+        tracing::info!(target: "live::manager", session_id = %session_id, "begin overlay resize");
         let current = self.current_status()?;
         require_session(&current, session_id)?;
         let mut inner = self
@@ -407,6 +421,8 @@ impl LiveSessionManager {
         session_id: &str,
     ) -> Result<(), BackendFailure> {
         let current = self.current_status()?;
+        let _span = tracing::debug_span!(target: "live::manager", "finish_overlay_resize", session_id = %session_id).entered();
+        tracing::info!(target: "live::manager", session_id = %session_id, "finish overlay resize");
         require_session(&current, session_id)?;
         let target_id = current
             .target
@@ -456,6 +472,8 @@ impl LiveSessionManager {
         session_id: &str,
         roi: LiveRoi,
     ) -> Result<LiveSessionStatus, BackendFailure> {
+        let _span = tracing::info_span!(target: "live::manager", "confirm_selection", session_id = %session_id).entered();
+        tracing::info!(target: "live::manager", session_id = %session_id, roi = ?roi, "confirm selection requested");
         let roi = roi.validate().map_err(BackendFailure::arguments)?;
         let normalized = roi.normalized().map_err(BackendFailure::arguments)?;
         let current = self.current_status()?;
@@ -682,6 +700,8 @@ impl LiveSessionManager {
         app: &tauri::AppHandle,
         session_id: &str,
     ) -> Result<LiveSessionStatus, BackendFailure> {
+        let _span = tracing::info_span!(target: "live::manager", "begin_roi_update", session_id = %session_id).entered();
+        tracing::info!(target: "live::manager", session_id = %session_id, "begin roi update requested");
         let current = self.current_status()?;
         require_session(&current, session_id)?;
         if !matches!(
@@ -729,6 +749,8 @@ impl LiveSessionManager {
         app: &tauri::AppHandle,
         session_id: &str,
     ) -> Result<LiveSessionStatus, BackendFailure> {
+        let _span = tracing::info_span!(target: "live::manager", "cancel_selection", session_id = %session_id).entered();
+        tracing::info!(target: "live::manager", session_id = %session_id, "cancel selection requested");
         let current = self.current_status()?;
         require_session(&current, session_id)?;
         if current.state != LiveSessionState::Selecting {
@@ -770,6 +792,8 @@ impl LiveSessionManager {
         session_id: &str,
         paused: bool,
     ) -> Result<LiveSessionStatus, BackendFailure> {
+        let _span = tracing::info_span!(target: "live::manager", "set_paused", session_id = %session_id, paused = paused).entered();
+        tracing::info!(target: "live::manager", session_id = %session_id, paused = paused, "set paused requested");
         let current = self.current_status()?;
         require_session(&current, session_id)?;
         let target_id = current
@@ -829,6 +853,8 @@ impl LiveSessionManager {
         app: &tauri::AppHandle,
         session_id: &str,
     ) -> Result<LiveSessionStatus, BackendFailure> {
+        let _span = tracing::info_span!(target: "live::manager", "interrupt_translation", session_id = %session_id).entered();
+        tracing::info!(target: "live::manager", session_id = %session_id, "interrupt translation requested");
         let current = self.current_status()?;
         require_session(&current, session_id)?;
         let mut interrupted = false;
@@ -868,6 +894,8 @@ impl LiveSessionManager {
         app: &tauri::AppHandle,
         session_id: Option<&str>,
     ) -> Result<LiveSessionStatus, BackendFailure> {
+        let _span = tracing::info_span!(target: "live::manager", "stop_session", session_id = ?session_id).entered();
+        tracing::info!(target: "live::manager", session_id = ?session_id, "stop session requested");
         let current = self.current_status()?;
         if current.state == LiveSessionState::Idle {
             return Ok(self.reset(app));
@@ -972,6 +1000,8 @@ struct SessionLoop {
 
 impl SessionLoop {
     fn run(self) {
+        let _lifecycle_span = tracing::info_span!(target: "live::manager", "session_lifecycle", session_id = %self.session_id, target_id = %self.target_id).entered();
+        tracing::info!(target: "live::manager", session_id = %self.session_id, target_id = %self.target_id, "session loop started");
         if let Err(error) = self.prepare_models() {
             self.finish(None, Some(error.message().to_owned()));
             return;
@@ -998,6 +1028,8 @@ impl SessionLoop {
     }
 
     fn prepare_models(&self) -> Result<(), BackendFailure> {
+        let _span = tracing::info_span!(target: "live::manager", "prepare_models", session_id = %self.session_id, target_language = %self.config.lock().map(|c| c.target_language.clone()).unwrap_or_default()).entered();
+        tracing::info!(target: "live::manager", session_id = %self.session_id, "preparing live pipeline models");
         self.cancellation.check()?;
         let settings = self
             .backend
@@ -1053,6 +1085,7 @@ impl SessionLoop {
     }
 
     fn await_capture_start(&self) -> Result<Option<platform::CaptureWorker>, BackendFailure> {
+        tracing::debug!(target: "live::manager", session_id = %self.session_id, target_id = %self.target_id, "awaiting capture start");
         let (sender, receiver) =
             mpsc::sync_channel::<Result<platform::CaptureWorker, BackendFailure>>(1);
         let target_id = self.target_id.clone();
@@ -1085,6 +1118,8 @@ impl SessionLoop {
     }
 
     fn run_capture(&self, capture: platform::CaptureWorker) {
+        let _capture_span = tracing::info_span!(target: "live::manager", "capture_loop", session_id = %self.session_id).entered();
+        tracing::info!(target: "live::manager", session_id = %self.session_id, target_id = %self.target_id, "capture loop entered");
         let mut stability = StabilityScheduler::default();
         let mut configured_stability_wait_ms = None;
 
@@ -1249,6 +1284,7 @@ impl SessionLoop {
                 last_frame = None;
             }
             let received = self.latest.wait_take(Duration::from_millis(100));
+            tracing::trace!(target: "live::scheduler", session_id = %self.session_id, has_frame = received.is_some(), roi_version = roi_version, "frame capture tick");
             let now_ms = epoch_millis();
             let triggered_probe = config.recognition_settings.mode
                 == LiveRecognitionMode::KeyTrigger
@@ -1272,6 +1308,7 @@ impl SessionLoop {
                 last_frame.is_some(),
                 trigger_timeout,
             );
+            tracing::debug!(target: "live::scheduler", session_id = %self.session_id, should_probe = should_probe, forced_by_timeout = forced_by_timeout, has_frame = last_frame.is_some(), "stability tick result");
             if !should_probe && !forced_by_timeout {
                 continue;
             }
@@ -1294,6 +1331,7 @@ impl SessionLoop {
             let frame_version = frame.roi_version;
             let observed_at_epoch_ms = frame.observed_at_epoch_ms;
             let ocr_started = Instant::now();
+            tracing::info!(target: "live::manager", session_id = %self.session_id, roi_version = frame_version, "ocr group planning starting");
             let mut recognized = match self.recognize(frame, &config.target_language) {
                 Ok(result) => result,
                 Err(error) if error.code() == BackendFailureCode::Cancelled => break,
@@ -1318,6 +1356,7 @@ impl SessionLoop {
                 }
             };
             let ocr_ms = elapsed_millis(ocr_started.elapsed());
+            tracing::debug!(target: "live::manager", session_id = %self.session_id, ocr_ms = ocr_ms, region_count = recognized.region_count, text_len = recognized.source_text.chars().count(), "ocr completed");
             self.update_metrics(|metrics| {
                 metrics.ocr_runs = metrics.ocr_runs.saturating_add(1);
                 metrics.last_ocr_ms = ocr_ms;
@@ -1360,6 +1399,7 @@ impl SessionLoop {
                 None
             };
             let revision = self.next_revision();
+            tracing::info!(target: "live::manager", session_id = %self.session_id, revision = revision, needs_translation = needs_translation, overlay_mode = ?config.overlay_settings.mode, "translation dispatch");
             let (translated_text, translation_ms, outcome) = match config.overlay_settings.mode {
                 LiveOverlayMode::Subtitle if !needs_translation => {
                     (String::new(), 0, LiveDebugOutcome::SkippedEmptySource)
@@ -2394,6 +2434,7 @@ pub(crate) async fn start_live_session(
     trace_live(format_args!(
         "start_live_session received target={target_id} language={target_language}"
     ));
+    tracing::info!(target: "live::manager", target_id = %target_id, target_language = %target_language, "start_live_session command received");
     let manager = manager.inner().clone();
     run_live_operation(move || {
         manager.start_session(
@@ -2539,16 +2580,33 @@ pub(crate) fn list_capture_windows() -> Result<Vec<CaptureWindowInfo>, BackendEr
 pub(crate) fn get_live_session_status(
     manager: State<'_, LiveSessionManager>,
 ) -> Result<LiveSessionStatus, BackendError> {
-    manager.collect_finished()?;
-    manager.current_status().map_err(Into::into)
+    tracing::debug!(target: "live::manager", "get_live_session_status requested");
+    let result = (|| -> Result<LiveSessionStatus, BackendError> {
+        manager.collect_finished()?;
+        manager.current_status().map_err(Into::into)
+    })();
+    match &result {
+        Ok(status) => tracing::debug!(target: "live::manager", state = ?status.state, session_id = ?status.session_id, "get_live_session_status success"),
+        Err(error) => tracing::warn!(target: "live::manager", error = ?error, "get_live_session_status failed"),
+    }
+    return result;
 }
 
 #[tauri::command]
 pub(crate) fn get_live_subtitle(
     manager: State<'_, LiveSessionManager>,
 ) -> Result<Option<LiveSubtitle>, BackendError> {
-    manager.collect_finished()?;
-    manager.current_subtitle().map_err(Into::into)
+    tracing::debug!(target: "live::manager", "get_live_subtitle requested");
+    let result = (|| -> Result<Option<LiveSubtitle>, BackendError> {
+        manager.collect_finished()?;
+        manager.current_subtitle().map_err(Into::into)
+    })();
+    match &result {
+        Ok(Some(subtitle)) => tracing::debug!(target: "live::manager", session_id = %subtitle.session_id, revision = subtitle.revision, text_len = subtitle.translated_text.chars().count(), "get_live_subtitle success"),
+        Ok(None) => tracing::trace!(target: "live::manager", "get_live_subtitle empty"),
+        Err(error) => tracing::warn!(target: "live::manager", error = ?error, "get_live_subtitle failed"),
+    }
+    return result;
 }
 
 #[cfg(test)]

@@ -31,10 +31,15 @@ pub(crate) struct QuickTranslationShortcutSettings {
 pub(crate) struct QuickTranslationShortcutState(Mutex<Option<String>>);
 
 pub(crate) fn setup(app: &mut tauri::App) {
+    let span = tracing::info_span!(target: "quick_translation", "setup");
+    let _enter = span.enter();
     let registered_shortcut = match register_shortcut(app.handle(), DEFAULT_SHORTCUT) {
-        Ok(()) => Some(DEFAULT_SHORTCUT.to_owned()),
+        Ok(()) => {
+            tracing::info!(target: "quick_translation", shortcut = DEFAULT_SHORTCUT, "快捷翻译快捷键注册成功");
+            Some(DEFAULT_SHORTCUT.to_owned())
+        },
         Err(error) => {
-            eprintln!("注册快捷翻译快捷键失败（{DEFAULT_SHORTCUT}）：{error}");
+            tracing::error!(target: "quick_translation", shortcut = DEFAULT_SHORTCUT, error = %error, "注册快捷翻译快捷键失败");
             None
         }
     };
@@ -44,6 +49,7 @@ pub(crate) fn setup(app: &mut tauri::App) {
 }
 
 fn register_shortcut(app: &tauri::AppHandle, shortcut: &str) -> Result<(), String> {
+    tracing::debug!(target: "quick_translation", shortcut = %shortcut, "注册全局快捷键");
     app.global_shortcut()
         .on_shortcut(shortcut, |app, _shortcut, event| {
             if event.state() == ShortcutState::Pressed {
@@ -54,20 +60,29 @@ fn register_shortcut(app: &tauri::AppHandle, shortcut: &str) -> Result<(), Strin
 }
 
 fn trigger(app: &tauri::AppHandle) {
+    let span = tracing::debug_span!(target: "quick_translation", "trigger");
+    let _enter = span.enter();
     let app = app.clone();
     let spawn_result = std::thread::Builder::new()
         .name("smodeltrans-quick-translation".to_owned())
         .spawn(move || {
+            let _span = tracing::debug_span!(target: "quick_translation", "trigger_thread").entered();
             let event = match selection::read_selected_text() {
-                Ok(selection) => QuickTranslationEvent {
-                    text: Some(selection.text),
-                    error: None,
-                    selection_bounds: selection.bounds,
+                Ok(selection) => {
+                    tracing::debug!(target: "quick_translation", text_len = selection.text.chars().count(), has_bounds = selection.bounds.is_some(), "读取选区成功");
+                    QuickTranslationEvent {
+                        text: Some(selection.text),
+                        error: None,
+                        selection_bounds: selection.bounds,
+                    }
                 },
-                Err(error) => QuickTranslationEvent {
-                    text: None,
-                    error: Some(error.to_string()),
-                    selection_bounds: None,
+                Err(error) => {
+                    tracing::warn!(target: "quick_translation", error = %error, "读取选区失败");
+                    QuickTranslationEvent {
+                        text: None,
+                        error: Some(error.to_string()),
+                        selection_bounds: None,
+                    }
                 },
             };
 
@@ -81,11 +96,11 @@ fn trigger(app: &tauri::AppHandle) {
                 QUICK_TRANSLATION_EVENT,
                 event,
             ) {
-                eprintln!("发送快捷翻译选区事件失败：{error}");
+                tracing::error!(target: "quick_translation", error = %error, "发送快捷翻译选区事件失败");
             }
         });
     if let Err(error) = spawn_result {
-        eprintln!("启动快捷翻译线程失败：{error}");
+        tracing::error!(target: "quick_translation", error = %error, "启动快捷翻译线程失败");
     }
 }
 

@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import type { EventCallback, UnlistenFn } from "@tauri-apps/api/event";
 
+const LIVE_LOG_PREFIX = " [live-translation-provider]";
+
 export const LIVE_STATUS_EVENT = "live-status";
 export const LIVE_SUBTITLE_EVENT = "live-subtitle";
 export const LIVE_DEBUG_RECORD_EVENT = "live-debug-record";
@@ -181,11 +183,21 @@ type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<
 type ListenFn = <T>(event: string, handler: EventCallback<T>) => Promise<UnlistenFn>;
 type EmitFn = <T>(event: string, payload?: T) => Promise<void>;
 
-export function listCaptureWindows(invokeFn: InvokeFn = invoke): Promise<CaptureWindowInfo[]> {
-  return invokeFn<CaptureWindowInfo[]>("list_capture_windows");
+export async function listCaptureWindows(invokeFn: InvokeFn = invoke): Promise<CaptureWindowInfo[]> {
+  console.info(`${LIVE_LOG_PREFIX} listCaptureWindows start`);
+  const start = Date.now();
+  try {
+    const windows = await invokeFn<CaptureWindowInfo[]>("list_capture_windows");
+    console.info(`${LIVE_LOG_PREFIX} listCaptureWindows success`, { count: windows.length, durationMs: Date.now() - start });
+    console.debug(`${LIVE_LOG_PREFIX} listCaptureWindows detail`, { windows: windows.slice(0,3).map(w=>({id: (w as any).id ?? (w as any).windowId, title: (w as any).title})) });
+    return windows;
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} listCaptureWindows failed`, { error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - start });
+    throw error;
+  }
 }
 
-export function startLiveSession(
+export async function startLiveSession(
   targetId: string,
   targetLanguage: string,
   overlaySettings: LiveOverlaySettings,
@@ -193,140 +205,277 @@ export function startLiveSession(
   translationSettings: LiveTranslationSettings,
   invokeFn: InvokeFn = invoke,
 ): Promise<LiveSessionStatus> {
-  return invokeFn<LiveSessionStatus>("start_live_session", {
-    targetId,
-    targetLanguage,
-    overlaySettings,
-    recognitionSettings,
-    translationSettings,
-  });
+  console.info(`${LIVE_LOG_PREFIX} startLiveSession start`, { targetId, targetLanguage });
+  console.debug(`${LIVE_LOG_PREFIX} startLiveSession config`, { overlaySettings, recognitionSettings, translationSettings });
+  const start = Date.now();
+  try {
+    const status = await invokeFn<LiveSessionStatus>("start_live_session", {
+      targetId,
+      targetLanguage,
+      overlaySettings,
+      recognitionSettings,
+      translationSettings,
+    });
+    console.info(`${LIVE_LOG_PREFIX} startLiveSession success`, { targetId, targetLanguage, sessionId: status.sessionId, state: status.state, durationMs: Date.now() - start });
+    return status;
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} startLiveSession failed`, { targetId, targetLanguage, error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - start });
+    throw error;
+  }
 }
 
-export function confirmLiveSelection(
+export async function confirmLiveSelection(
   sessionId: string,
   roi: LiveRoi,
   invokeFn: InvokeFn = invoke,
 ): Promise<LiveSessionStatus> {
-  return invokeFn<LiveSessionStatus>("confirm_live_selection", { sessionId, roi });
+  console.info(`${LIVE_LOG_PREFIX} confirmLiveSelection start`, { sessionId, roi });
+  try {
+    const status = await invokeFn<LiveSessionStatus>("confirm_live_selection", { sessionId, roi });
+    console.info(`${LIVE_LOG_PREFIX} confirmLiveSelection success`, { sessionId, state: status.state });
+    return status;
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} confirmLiveSelection failed`, { sessionId, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
 
-export function beginLiveRoiUpdate(
+export async function beginLiveRoiUpdate(
   sessionId: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<LiveSessionStatus> {
-  return invokeFn<LiveSessionStatus>("begin_live_roi_update", { sessionId });
+  console.info(`${LIVE_LOG_PREFIX} beginLiveRoiUpdate start`, { sessionId });
+  try {
+    const status = await invokeFn<LiveSessionStatus>("begin_live_roi_update", { sessionId });
+    console.info(`${LIVE_LOG_PREFIX} beginLiveRoiUpdate success`, { sessionId, state: status.state });
+    return status;
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} beginLiveRoiUpdate failed`, { sessionId, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
-export function cancelLiveSelection(
+export async function cancelLiveSelection(
   sessionId: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<LiveSessionStatus> {
-  return invokeFn<LiveSessionStatus>("cancel_live_selection", { sessionId });
+  console.info(`${LIVE_LOG_PREFIX} cancelLiveSelection start`, { sessionId });
+  try {
+    const status = await invokeFn<LiveSessionStatus>("cancel_live_selection", { sessionId });
+    console.info(`${LIVE_LOG_PREFIX} cancelLiveSelection success`, { sessionId, state: status.state });
+    return status;
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} cancelLiveSelection failed`, { sessionId, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
-export function pauseLiveSession(
+export async function pauseLiveSession(
   sessionId: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<LiveSessionStatus> {
-  return invokeFn<LiveSessionStatus>("pause_live_session", { sessionId });
+  console.info(`${LIVE_LOG_PREFIX} pauseLiveSession start`, { sessionId });
+  try {
+    const status = await invokeFn<LiveSessionStatus>("pause_live_session", { sessionId });
+    console.info(`${LIVE_LOG_PREFIX} pauseLiveSession success`, { sessionId, state: status.state });
+    return status;
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} pauseLiveSession failed`, { sessionId, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
-export function resumeLiveSession(
+export async function resumeLiveSession(
   sessionId: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<LiveSessionStatus> {
-  return invokeFn<LiveSessionStatus>("resume_live_session", { sessionId });
+  console.info(`${LIVE_LOG_PREFIX} resumeLiveSession start`, { sessionId });
+  try {
+    const status = await invokeFn<LiveSessionStatus>("resume_live_session", { sessionId });
+    console.info(`${LIVE_LOG_PREFIX} resumeLiveSession success`, { sessionId, state: status.state });
+    return status;
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} resumeLiveSession failed`, { sessionId, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
-export function stopLiveSession(
+export async function stopLiveSession(
   sessionId?: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<LiveSessionStatus> {
-  return invokeFn<LiveSessionStatus>(
-    "stop_live_session",
-    sessionId === undefined ? {} : { sessionId },
-  );
+  console.info(`${LIVE_LOG_PREFIX} stopLiveSession start`, { sessionId: sessionId ?? "all" });
+  try {
+    const status = await invokeFn<LiveSessionStatus>(
+      "stop_live_session",
+      sessionId === undefined ? {} : { sessionId },
+    );
+    console.info(`${LIVE_LOG_PREFIX} stopLiveSession success`, { sessionId: sessionId ?? "all", state: status.state });
+    return status;
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} stopLiveSession failed`, { sessionId: sessionId ?? "all", error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
-export function interruptLiveTranslation(
+export async function interruptLiveTranslation(
   sessionId: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<LiveSessionStatus> {
-  return invokeFn<LiveSessionStatus>("interrupt_live_translation", { sessionId });
+  console.info(`${LIVE_LOG_PREFIX} interruptLiveTranslation start`, { sessionId });
+  try {
+    const status = await invokeFn<LiveSessionStatus>("interrupt_live_translation", { sessionId });
+    console.info(`${LIVE_LOG_PREFIX} interruptLiveTranslation success`, { sessionId, state: status.state });
+    return status;
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} interruptLiveTranslation failed`, { sessionId, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
-export function getLiveSessionStatus(invokeFn: InvokeFn = invoke): Promise<LiveSessionStatus> {
-  return invokeFn<LiveSessionStatus>("get_live_session_status");
+export async function getLiveSessionStatus(invokeFn: InvokeFn = invoke): Promise<LiveSessionStatus> {
+  console.debug(`${LIVE_LOG_PREFIX} getLiveSessionStatus start`);
+  try {
+    const status = await invokeFn<LiveSessionStatus>("get_live_session_status");
+    console.info(`${LIVE_LOG_PREFIX} getLiveSessionStatus success`, { sessionId: status.sessionId, state: status.state });
+    console.debug(`${LIVE_LOG_PREFIX} getLiveSessionStatus detail`, { status });
+    return status;
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} getLiveSessionStatus failed`, { error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
-export function getLiveSubtitle(invokeFn: InvokeFn = invoke): Promise<LiveSubtitle | null> {
-  return invokeFn<LiveSubtitle | null>("get_live_subtitle");
+export async function getLiveSubtitle(invokeFn: InvokeFn = invoke): Promise<LiveSubtitle | null> {
+  console.debug(`${LIVE_LOG_PREFIX} getLiveSubtitle start`);
+  try {
+    const subtitle = await invokeFn<LiveSubtitle | null>("get_live_subtitle");
+    console.debug(`${LIVE_LOG_PREFIX} getLiveSubtitle result`, { hasSubtitle: !!subtitle, sessionId: subtitle?.sessionId, revision: subtitle?.revision });
+    return subtitle;
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} getLiveSubtitle failed`, { error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
-export function updateLiveOverlayLayout(
+export async function updateLiveOverlayLayout(
   sessionId: string,
   sizing: LiveOverlaySizing,
   contentSize: LiveOverlayContentSize,
   invokeFn: InvokeFn = invoke,
 ): Promise<void> {
-  return invokeFn<void>("update_live_overlay_layout", { sessionId, sizing, contentSize });
+  console.info(`${LIVE_LOG_PREFIX} updateLiveOverlayLayout start`, { sessionId, sizing, contentSize });
+  try {
+    await invokeFn<void>("update_live_overlay_layout", { sessionId, sizing, contentSize });
+    console.debug(`${LIVE_LOG_PREFIX} updateLiveOverlayLayout success`, { sessionId });
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} updateLiveOverlayLayout failed`, { sessionId, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
-export function beginLiveOverlayDrag(
+export async function beginLiveOverlayDrag(
   sessionId: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<void> {
-  return invokeFn<void>("begin_live_overlay_drag", { sessionId });
+  console.info(`${LIVE_LOG_PREFIX} beginLiveOverlayDrag start`, { sessionId });
+  try {
+    await invokeFn<void>("begin_live_overlay_drag", { sessionId });
+    console.debug(`${LIVE_LOG_PREFIX} beginLiveOverlayDrag success`, { sessionId });
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} beginLiveOverlayDrag failed`, { sessionId, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
-export function beginLiveOverlayResize(
+export async function beginLiveOverlayResize(
   sessionId: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<void> {
-  return invokeFn<void>("begin_live_overlay_resize", { sessionId });
+  console.info(`${LIVE_LOG_PREFIX} beginLiveOverlayResize start`, { sessionId });
+  try {
+    await invokeFn<void>("begin_live_overlay_resize", { sessionId });
+    console.debug(`${LIVE_LOG_PREFIX} beginLiveOverlayResize success`, { sessionId });
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} beginLiveOverlayResize failed`, { sessionId, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
-export function finishLiveOverlayResize(
+export async function finishLiveOverlayResize(
   sessionId: string,
   invokeFn: InvokeFn = invoke,
 ): Promise<void> {
-  return invokeFn<void>("finish_live_overlay_resize", { sessionId });
+  console.info(`${LIVE_LOG_PREFIX} finishLiveOverlayResize start`, { sessionId });
+  try {
+    await invokeFn<void>("finish_live_overlay_resize", { sessionId });
+    console.debug(`${LIVE_LOG_PREFIX} finishLiveOverlayResize success`, { sessionId });
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} finishLiveOverlayResize failed`, { sessionId, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
 
-export function updateLiveOverlayPosition(
+export async function updateLiveOverlayPosition(
   sessionId: string,
   position: LiveOverlayPosition,
   invokeFn: InvokeFn = invoke,
 ): Promise<void> {
-  return invokeFn<void>("update_live_overlay_position", { sessionId, position });
+  console.info(`${LIVE_LOG_PREFIX} updateLiveOverlayPosition start`, { sessionId, position });
+  try {
+    await invokeFn<void>("update_live_overlay_position", { sessionId, position });
+    console.debug(`${LIVE_LOG_PREFIX} updateLiveOverlayPosition success`, { sessionId });
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} updateLiveOverlayPosition failed`, { sessionId, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
 export function listenLiveStatus(
   handler: (status: LiveSessionStatus) => void,
   listenFn: ListenFn = listen,
 ): Promise<UnlistenFn> {
-  return listenFn<LiveSessionStatus>(LIVE_STATUS_EVENT, (event) => handler(event.payload));
+  console.info(`${LIVE_LOG_PREFIX} listenLiveStatus registering`);
+  return listenFn<LiveSessionStatus>(LIVE_STATUS_EVENT, (event) => {
+    console.info(`${LIVE_LOG_PREFIX} live-status event`, { state: event.payload.state, sessionId: event.payload.sessionId, hasError: !!(event.payload as any).error });
+    console.debug(`${LIVE_LOG_PREFIX} live-status payload`, event.payload as unknown as Record<string, unknown>);
+    handler(event.payload);
+  });
 }
 
 export function listenLiveSubtitle(
   handler: (subtitle: LiveSubtitle) => void,
   listenFn: ListenFn = listen,
 ): Promise<UnlistenFn> {
-  return listenFn<LiveSubtitle>(LIVE_SUBTITLE_EVENT, (event) => handler(event.payload));
+  console.info(`${LIVE_LOG_PREFIX} listenLiveSubtitle registering`);
+  return listenFn<LiveSubtitle>(LIVE_SUBTITLE_EVENT, (event) => {
+    console.info(`${LIVE_LOG_PREFIX} live-subtitle event`, { sessionId: event.payload.sessionId, revision: event.payload.revision, isStreaming: event.payload.isStreaming, regions: event.payload.regions.length });
+    console.debug(`${LIVE_LOG_PREFIX} live-subtitle payload`, { translatedTextLength: event.payload.translatedText.length, sourceTextLength: event.payload.sourceText.length });
+    handler(event.payload);
+  });
 }
-export function setLiveRegionBoxesVisible(
+export async function setLiveRegionBoxesVisible(
   visible: boolean,
   emitFn: EmitFn = emit,
 ): Promise<void> {
-  return emitFn<boolean>(LIVE_REGION_BOX_VISIBILITY_EVENT, visible);
+  console.info(`${LIVE_LOG_PREFIX} setLiveRegionBoxesVisible start`, { visible });
+  try {
+    await emitFn<boolean>(LIVE_REGION_BOX_VISIBILITY_EVENT, visible);
+    console.debug(`${LIVE_LOG_PREFIX} setLiveRegionBoxesVisible success`, { visible });
+  } catch (error) {
+    console.error(`${LIVE_LOG_PREFIX} setLiveRegionBoxesVisible failed`, { visible, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
 export function listenLiveRegionBoxesVisible(
   handler: (visible: boolean) => void,
   listenFn: ListenFn = listen,
 ): Promise<UnlistenFn> {
-  return listenFn<boolean>(LIVE_REGION_BOX_VISIBILITY_EVENT, (event) =>
-    handler(event.payload),
-  );
+  console.info(`${LIVE_LOG_PREFIX} listenLiveRegionBoxesVisible registering`);
+  return listenFn<boolean>(LIVE_REGION_BOX_VISIBILITY_EVENT, (event) => {
+    console.info(`${LIVE_LOG_PREFIX} live-region-box-visibility event`, { visible: event.payload });
+    handler(event.payload);
+  });
 }
 
 
@@ -334,7 +483,12 @@ export function listenLiveDebugRecord(
   handler: (record: LiveDebugRecord) => void,
   listenFn: ListenFn = listen,
 ): Promise<UnlistenFn> {
-  return listenFn<LiveDebugRecord>(LIVE_DEBUG_RECORD_EVENT, (event) => handler(event.payload));
+  console.info(`${LIVE_LOG_PREFIX} listenLiveDebugRecord registering`);
+  return listenFn<LiveDebugRecord>(LIVE_DEBUG_RECORD_EVENT, (event) => {
+    console.info(`${LIVE_LOG_PREFIX} live-debug-record event`, { stage: event.payload.stage, outcome: event.payload.outcome, sessionId: event.payload.sessionId });
+    console.debug(`${LIVE_LOG_PREFIX} live-debug-record payload`, event.payload as unknown as Record<string, unknown>);
+    handler(event.payload);
+  });
 }
 
 export function shouldApplyLiveSubtitle(

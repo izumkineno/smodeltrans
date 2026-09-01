@@ -44,6 +44,7 @@ impl Default for GenerationConfig {
 
 impl GenerationConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        tracing::debug!(target: "config", max_new_tokens = self.max_new_tokens, sampling = self.sampling, temperature = self.temperature, top_k = self.top_k, top_p = self.top_p, "GenerationConfig::validate started");
         if !(1..=MAX_NEW_TOKENS).contains(&self.max_new_tokens) {
             bail!("generation.max_new_tokens must be in 1..={MAX_NEW_TOKENS}");
         }
@@ -87,6 +88,7 @@ impl GenerationConfig {
             }
             let _ = seen.insert(trimmed);
         }
+        tracing::info!(target: "config", max_new_tokens = self.max_new_tokens, "GenerationConfig::validate succeeded");
         Ok(())
     }
 }
@@ -110,12 +112,14 @@ impl Default for MemoryConfig {
 
 impl MemoryConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        tracing::debug!(target: "config", enabled = self.enabled, max_tokens = self.max_tokens, max_turns = self.max_turns, "MemoryConfig::validate started");
         if !(1..=MAX_MEMORY_TOKENS).contains(&self.max_tokens) {
             bail!("memory.max_tokens must be in 1..={MAX_MEMORY_TOKENS}");
         }
         if !(1..=MAX_MEMORY_TURNS).contains(&self.max_turns) {
             bail!("memory.max_turns must be in 1..={MAX_MEMORY_TURNS}");
         }
+        tracing::info!(target: "config", enabled = self.enabled, "MemoryConfig::validate succeeded");
         Ok(())
     }
 }
@@ -130,9 +134,11 @@ pub(crate) struct PromptConfig {
 
 impl PromptConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        tracing::debug!(target: "config", template_len = self.template.chars().count(), has_placeholder = self.has_source_text_placeholder(), "PromptConfig::validate started");
         if self.template.trim().chars().count() > MAX_PROMPT_CHARS {
             bail!("prompt.template must contain at most {MAX_PROMPT_CHARS} characters");
         }
+        tracing::info!(target: "config", "PromptConfig::validate succeeded");
         Ok(())
     }
 
@@ -156,6 +162,8 @@ impl ModelConfig {
         generation: GenerationConfig,
         memory: MemoryConfig,
     ) -> Result<Self> {
+        let _span = tracing::info_span!(target: "config", "ModelConfig::from_parts", target_language = %target_language).entered();
+        tracing::info!(target: "config", target_language = %target_language, prompt_len = prompt.template.chars().count(), max_new_tokens = generation.max_new_tokens, memory_enabled = memory.enabled, "ModelConfig::from_parts started");
         let target_language = target_language.trim();
         ensure!(
             !target_language.is_empty(),
@@ -164,6 +172,7 @@ impl ModelConfig {
         prompt.validate()?;
         generation.validate()?;
         memory.validate()?;
+        tracing::info!(target: "config", target_language = %target_language, "ModelConfig::from_parts validation passed");
         Ok(Self {
             target_language: target_language.to_owned(),
             prompt,

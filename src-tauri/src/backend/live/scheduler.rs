@@ -92,6 +92,8 @@ impl StabilityScheduler {
     }
 
     pub(super) fn observe(&mut self, frame: &OwnedFrame, now_ms: u64) -> bool {
+        let _span = tracing::debug_span!(target: "live::scheduler", "observe", now_ms = now_ms, width = frame.width, height = frame.height).entered();
+        tracing::trace!(target: "live::scheduler", width = frame.width, height = frame.height, now_ms = now_ms, "stability observe started");
         let Some(signature) = luminance_signature(frame) else {
             self.reset();
             return false;
@@ -115,6 +117,7 @@ impl StabilityScheduler {
     }
 
     pub(super) fn tick(&mut self, now_ms: u64) -> bool {
+        tracing::trace!(target: "live::scheduler", now_ms = now_ms, settle_ms = self.settle_ms, stable_observations = self.stable_observations, "stability tick");
         self.should_probe(now_ms)
     }
 
@@ -124,20 +127,24 @@ impl StabilityScheduler {
     }
 
     fn should_probe(&mut self, now_ms: u64) -> bool {
-        if self.suppressed_until_change || self.signature.is_none() || self.stable_observations < 2
-        {
+        let is_ready = !(self.suppressed_until_change || self.signature.is_none() || self.stable_observations < 2);
+        if !is_ready {
+            tracing::trace!(target: "live::scheduler", suppressed = self.suppressed_until_change, has_signature = self.signature.is_some(), stable_observations = self.stable_observations, "stability not ready to probe");
             return false;
         }
         let settled = self
             .stable_since_ms
             .is_some_and(|since| now_ms.saturating_sub(since) >= self.settle_ms);
         if settled {
+            tracing::debug!(target: "live::scheduler", now_ms = now_ms, stable_since_ms = ?self.stable_since_ms, settle_ms = self.settle_ms, "stability settled, probing");
             self.suppressed_until_change = true;
-            true
+            return true;
         } else {
-            false
+            tracing::trace!(target: "live::scheduler", now_ms = now_ms, stable_since_ms = ?self.stable_since_ms, settle_ms = self.settle_ms, "stability not yet settled");
+            return false;
         }
     }
+
 }
 
 fn luminance_signature(frame: &OwnedFrame) -> Option<[u8; SIGNATURE_SIZE]> {
@@ -471,6 +478,8 @@ fn group_from_regions(regions: Vec<PreparedRegion>) -> LiveOcrGroup {
 }
 
 pub(super) fn plan_live_ocr_groups(regions: Vec<RegionRecord>) -> Vec<LiveOcrGroup> {
+        let _span = tracing::info_span!(target: "live::scheduler", "plan_live_ocr_groups", input_regions = regions.len()).entered();
+        tracing::info!(target: "live::scheduler", input_regions = regions.len(), "plan live ocr groups started");
     let prepared = regions
         .into_iter()
         .filter_map(|mut record| {
@@ -484,7 +493,9 @@ pub(super) fn plan_live_ocr_groups(regions: Vec<RegionRecord>) -> Vec<LiveOcrGro
             })
         })
         .collect::<Vec<_>>();
+    tracing::debug!(target: "live::scheduler", prepared_before_dedup = prepared.len(), "prepared regions before dedup");
     let mut prepared = deduplicate_regions(prepared);
+    tracing::debug!(target: "live::scheduler", prepared_after_dedup = prepared.len(), "after dedup");
     prepared.sort_by(compare_regions);
 
     let mut lines = Vec::<VisualLine>::new();
@@ -511,6 +522,7 @@ pub(super) fn plan_live_ocr_groups(regions: Vec<RegionRecord>) -> Vec<LiveOcrGro
             .total_cmp(&right.mean_center_y)
             .then_with(|| left.leftmost().cmp(&right.leftmost()))
     });
+    tracing::debug!(target: "live::scheduler", lines = lines.len(), "visual lines built");
 
     let mut groups = Vec::new();
     for mut line in lines {
@@ -544,10 +556,13 @@ pub(super) fn plan_live_ocr_groups(regions: Vec<RegionRecord>) -> Vec<LiveOcrGro
             groups.push(group_from_regions(current));
         }
     }
+    tracing::info!(target: "live::scheduler", groups = groups.len(), "plan live ocr groups completed");
     groups
 }
 
 pub(super) fn finalize_live_regions(regions: &mut Vec<RegionRecord>) {
+    let _span = tracing::debug_span!(target: "live::scheduler", "finalize_live_regions", input_regions = regions.len()).entered();
+    tracing::debug!(target: "live::scheduler", input_regions = regions.len(), "finalize live regions started");
     regions.retain_mut(|region| {
         region.source_text = normalize_text(&region.source_text);
         has_translatable_character(&region.source_text)
@@ -560,6 +575,7 @@ pub(super) fn finalize_live_regions(regions: &mut Vec<RegionRecord>) {
             character.order = u32::try_from(character_index + 1).unwrap_or(u32::MAX);
         }
     }
+    tracing::info!(target: "live::scheduler", output_regions = regions.len(), "finalize live regions completed");
 }
 
 fn ordered_live_regions(regions: &[RegionRecord]) -> Vec<&RegionRecord> {

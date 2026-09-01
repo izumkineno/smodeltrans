@@ -97,6 +97,26 @@ pub struct GetStatusRequest {
     pub model_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteDownloadedModelRequest {
+    pub model_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivateDownloadedModelRequest {
+    pub model_id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadedModelInfo {
+    pub model_id: String,
+    pub downloaded: bool,
+    pub base_dir: String,
+}
+
 type TaskMap = Arc<Mutex<HashMap<String, DownloadTaskState>>>;
 
 static TASK_MAP: LazyLock<TaskMap> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
@@ -343,6 +363,16 @@ fn resolve_download_url(repo_id: &str, file: &str, source: &str) -> String {
 }
 
 fn emit_progress(app: &AppHandle, state: &DownloadTaskState) {
+    tracing::trace!(
+        target: "backend::model_download",
+        model_id = %state.model_id,
+        source = %state.source,
+        progress = state.progress,
+        status = ?state.status,
+        downloaded_bytes = state.downloaded_bytes,
+        total_bytes = state.total_bytes,
+        "emit_progress"
+    );
     let event = ModelDownloadProgressEvent {
         model_id: state.model_id.clone(),
         source: state.source.clone(),
@@ -352,7 +382,15 @@ fn emit_progress(app: &AppHandle, state: &DownloadTaskState) {
         status: state.status.clone(),
         message: state.message.clone(),
     };
-    let _ = app.emit("model-download-progress", event);
+    let emit_result = app.emit("model-download-progress", event);
+    if let Err(err) = emit_result {
+        tracing::warn!(
+            target: "backend::model_download",
+            model_id = %state.model_id,
+            error = %err,
+            "emit_progress failed"
+        );
+    }
 }
 
 fn is_retryable_error(err: &str) -> bool {
@@ -395,12 +433,24 @@ fn friendly_download_error(spec: &DownloadFileSpec, url: &str, err: &str, source
 
 #[tauri::command]
 pub fn list_downloadable_models() -> Vec<DownloadableModel> {
-    downloadable_models()
+    let models = downloadable_models();
+    tracing::debug!(target: "backend::model_download", count = models.len(), "list_downloadable_models");
+    models
 }
 
 #[tauri::command]
 pub fn get_model_download_status(request: GetStatusRequest) -> Option<DownloadTaskState> {
-    task_map().lock().ok()?.get(&request.model_id).cloned()
+    tracing::debug!(target: "backend::model_download", model_id = %request.model_id, "get_model_download_status start");
+    let status = task_map().lock().ok()?.get(&request.model_id).cloned();
+    tracing::debug!(
+        target: "backend::model_download",
+        model_id = %request.model_id,
+        found = status.is_some(),
+        status = ?status.as_ref().map(|s| &s.status),
+        progress = status.as_ref().map(|s| s.progress).unwrap_or(0),
+        "get_model_download_status done"
+    );
+    status
 }
 
 #[tauri::command]
@@ -409,8 +459,17 @@ pub async fn start_model_download(
     state: State<'_, BackendState>,
     request: StartDownloadRequest,
 ) -> Result<DownloadTaskState, String> {
+    let raw_model_id = request.model_id.clone();
+    let raw_source = request.source.clone();
+    tracing::info!(
+        target: "backend::model_download",
+        model_id = %raw_model_id.trim(),
+        source = ?raw_source,
+        "start_model_download request"
+    );
     let model_id = request.model_id.trim().to_owned();
     if model_id.is_empty() {
+        tracing::warn!(target: "backend::model_download", "start_model_download rejected: empty model_id");
         return Err("modelId 不能为空".to_owned());
     }
     let source = request
@@ -425,19 +484,46 @@ pub async fn start_model_download(
     }
     .to_owned();
 
+    // span for download session (outer request)
+    let _session_span = tracing::info_span!(
+        target: "backend::model_download",
+        "download_session",
+        model_id = %model_id,
+        source = %source
+    )
+    .entered();
+
+    tracing::debug!(
+        target: "backend::model_download",
+        model_id = %model_id,
+        source = %source,
+        "resolve downloadable model"
+    );
     let models = downloadable_models();
     let model = models
         .iter()
         .find(|m| m.id == model_id)
         .cloned()
-        .ok_or_else(|| format!("未知模型 {model_id}"))?;
+        .ok_or_else(|| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, "unknown model");
+            format!("未知模型 {model_id}")
+        })?;
 
     // 已在下载中则直接返回当前状态
     {
         let map_arc = task_map();
-        let map = map_arc.lock().map_err(|_| "锁失败".to_owned())?;
+        let map = map_arc.lock().map_err(|_| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, "task_map lock failed");
+            "锁失败".to_owned()
+        })?;
         if let Some(existing) = map.get(&model_id) {
             if existing.status == DownloadStatus::Downloading {
+                tracing::info!(
+                    target: "backend::model_download",
+                    model_id = %model_id,
+                    progress = existing.progress,
+                    "download already in progress, returning existing state"
+                );
                 return Ok(existing.clone());
             }
         }
@@ -455,21 +541,47 @@ pub async fn start_model_download(
     {
         task_map()
             .lock()
-            .map_err(|_| "锁失败".to_owned())?
+            .map_err(|_| {
+                tracing::error!(target: "backend::model_download", model_id = %model_id, "task_map lock failed on init");
+                "锁失败".to_owned()
+            })?
             .insert(model_id.clone(), initial.clone());
         cancel_flags()
             .lock()
-            .map_err(|_| "锁失败".to_owned())?
+            .map_err(|_| {
+                tracing::error!(target: "backend::model_download", model_id = %model_id, "cancel_flags lock failed on init");
+                "锁失败".to_owned()
+            })?
             .insert(model_id.clone(), false);
     }
+    tracing::info!(
+        target: "backend::model_download",
+        model_id = %model_id,
+        source = %source,
+        model_name = %model.name,
+        total_files = model.file_specs.len(),
+        "download session initialized"
+    );
     emit_progress(&app, &initial);
 
     // 读取模型根目录
     let model_root: PathBuf = {
-        let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
-        let settings = guard.as_ref().map_err(|err| err.clone())?;
+        let guard = state.settings.lock().map_err(|_| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, "settings lock failed");
+            "无法读取设置".to_owned()
+        })?;
+        let settings = guard.as_ref().map_err(|err| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, error = %err, "settings error");
+            err.clone()
+        })?;
         settings.model_root.clone()
     };
+    tracing::debug!(
+        target: "backend::model_download",
+        model_id = %model_id,
+        model_root = %model_root.display(),
+        "resolved model_root"
+    );
 
     let app_clone = app.clone();
     let model_id_clone = model_id.clone();
@@ -478,6 +590,18 @@ pub async fn start_model_download(
 
     // 使用 simple_downloader 进行真实下载
     let handle = tokio::spawn(async move {
+        let _bg_span = tracing::info_span!(
+            target: "backend::model_download",
+            "download_session_bg",
+            model_id = %model_id_clone,
+            source = %source_clone
+        );
+        tracing::info!(
+            target: "backend::model_download",
+            model_id = %model_id_clone,
+            source = %source_clone,
+            "download background task started"
+        );
         let file_specs: Vec<DownloadFileSpec> = if !model_clone.file_specs.is_empty() {
             model_clone.file_specs.clone()
         } else {
@@ -493,6 +617,11 @@ pub async fn start_model_download(
         };
         let total_files = file_specs.len() as u64;
         if total_files == 0 {
+            tracing::error!(
+                target: "backend::model_download",
+                model_id = %model_id_clone,
+                "file_specs empty"
+            );
             let error_state = DownloadTaskState {
                 model_id: model_id_clone.clone(),
                 source: source_clone.clone(),
@@ -508,9 +637,22 @@ pub async fn start_model_download(
             emit_progress(&app_clone, &error_state);
             return;
         }
+        tracing::info!(
+            target: "backend::model_download",
+            model_id = %model_id_clone,
+            total_files = total_files,
+            "download file list resolved"
+        );
 
         let base_dir = model_root.join("downloads").join(&model_id_clone);
         if let Err(err) = tokio::fs::create_dir_all(&base_dir).await {
+            tracing::error!(
+                target: "backend::model_download",
+                model_id = %model_id_clone,
+                base_dir = %base_dir.display(),
+                error = %err,
+                "create base_dir failed"
+            );
             let error_state = DownloadTaskState {
                 model_id: model_id_clone.clone(),
                 source: source_clone.clone(),
@@ -526,6 +668,12 @@ pub async fn start_model_download(
             emit_progress(&app_clone, &error_state);
             return;
         }
+        tracing::debug!(
+            target: "backend::model_download",
+            model_id = %model_id_clone,
+            base_dir = %base_dir.display(),
+            "base_dir ready"
+        );
 
         for (idx, spec) in file_specs.iter().enumerate() {
             // 检查取消
@@ -535,6 +683,13 @@ pub async fn start_model_download(
                 .and_then(|m| m.get(&model_id_clone).copied())
                 .unwrap_or(false);
             if cancelled {
+                tracing::info!(
+                    target: "backend::model_download",
+                    model_id = %model_id_clone,
+                    file_idx = idx,
+                    file = %spec.dest,
+                    "download cancelled before file"
+                );
                 let cancelled_state = DownloadTaskState {
                     model_id: model_id_clone.clone(),
                     source: source_clone.clone(),
@@ -552,6 +707,16 @@ pub async fn start_model_download(
             }
 
             let url = resolve_download_url(&spec.repo_id, &spec.file, &source_clone);
+            tracing::info!(
+                target: "backend::model_download",
+                model_id = %model_id_clone,
+                file = %spec.dest,
+                repo_id = %spec.repo_id,
+                url = %url,
+                idx = idx,
+                total_files = total_files,
+                "start file download"
+            );
             let dest_path = base_dir.join(&spec.dest);
             if let Some(parent) = dest_path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
@@ -569,11 +734,28 @@ pub async fn start_model_download(
                     .and_then(|m| m.get(&model_id_clone).copied())
                     .unwrap_or(false);
                 if cancelled_before {
+                    tracing::info!(
+                        target: "backend::model_download",
+                        model_id = %model_id_clone,
+                        file = %spec.dest,
+                        attempt = attempt,
+                        "cancelled before attempt"
+                    );
                     was_cancelled = true;
                     break;
                 }
                 if attempt > 0 {
                     let delay_ms = 500u64 * (1u64 << (attempt - 1));
+                    tracing::warn!(
+                        target: "backend::model_download",
+                        model_id = %model_id_clone,
+                        file = %spec.dest,
+                        attempt = attempt + 1,
+                        max_retries = MAX_RETRIES,
+                        delay_ms = delay_ms,
+                        last_error = ?last_err,
+                        "retrying download"
+                    );
                     let retry_msg = format!(
                         "下载 {} 遇到网络问题，正在重试 {}/{}（{}）...",
                         spec.dest,
@@ -602,11 +784,26 @@ pub async fn start_model_download(
                         .and_then(|m| m.get(&model_id_clone).copied())
                         .unwrap_or(false);
                     if cancelled_during_wait {
+                        tracing::info!(
+                            target: "backend::model_download",
+                            model_id = %model_id_clone,
+                            file = %spec.dest,
+                            "cancelled during retry wait"
+                        );
                         was_cancelled = true;
                         break;
                     }
                 }
                 let workers = if attempt == 0 { 8 } else { 1 };
+                tracing::debug!(
+                    target: "backend::model_download",
+                    model_id = %model_id_clone,
+                    file = %spec.dest,
+                    url = %url,
+                    attempt = attempt + 1,
+                    workers = workers,
+                    "download attempt"
+                );
                 let url_clone = url.clone();
                 let dest_str = dest_path.to_string_lossy().to_string();
                 let app_for_file = app_clone.clone();
@@ -654,6 +851,16 @@ pub async fn start_model_download(
                                                 * 100.0) as u8;
                                             let overall_progress = overall_progress.min(100);
                                             let speed_msg = format!("{:.2} MB/s", info.speed_mbps());
+                                            tracing::trace!(
+                                                target: "backend::model_download",
+                                                model_id = %model_id_inner,
+                                                file = %file_name_inner,
+                                                progress = overall_progress,
+                                                downloaded_bytes = *total_downloaded,
+                                                total_bytes = total_size,
+                                                speed = %speed_msg,
+                                                "download progress"
+                                            );
                                             let msg = if file_progress < 1.0 {
                                                 Some(format!(
                                                     "下载 {file_name_inner} {overall_progress}% {speed_msg}"
@@ -706,19 +913,51 @@ pub async fn start_model_download(
 
                 match download_result {
                     Some(Ok(())) => {
+                        tracing::info!(
+                            target: "backend::model_download",
+                            model_id = %model_id_clone,
+                            file = %spec.dest,
+                            attempt = attempt + 1,
+                            "file download succeeded"
+                        );
                         succeeded = true;
                         break;
                     }
                     Some(Err(err)) => {
                         let err_str = format!("{err}");
+                        tracing::warn!(
+                            target: "backend::model_download",
+                            model_id = %model_id_clone,
+                            file = %spec.dest,
+                            attempt = attempt + 1,
+                            error = %err_str,
+                            url = %url,
+                            "file download attempt failed"
+                        );
                         last_err = Some(err_str.clone());
                         // 非重试错误或已达最大重试直接退出
                         if !is_retryable_error(&err_str) || attempt + 1 == MAX_RETRIES {
+                            tracing::error!(
+                                target: "backend::model_download",
+                                model_id = %model_id_clone,
+                                file = %spec.dest,
+                                error = %err_str,
+                                retryable = is_retryable_error(&err_str),
+                                attempt = attempt + 1,
+                                "non-retryable or max retries reached"
+                            );
                             break;
                         }
                         // 可重试则进入下一轮
                     }
                     None => {
+                        tracing::info!(
+                            target: "backend::model_download",
+                            model_id = %model_id_clone,
+                            file = %spec.dest,
+                            attempt = attempt + 1,
+                            "file download cancelled via select"
+                        );
                         was_cancelled = true;
                         break;
                     }
@@ -726,6 +965,13 @@ pub async fn start_model_download(
             }
 
             if was_cancelled {
+                tracing::info!(
+                    target: "backend::model_download",
+                    model_id = %model_id_clone,
+                    file = %spec.dest,
+                    idx = idx,
+                    "download cancelled for file"
+                );
                 let cancelled_state = DownloadTaskState {
                     model_id: model_id_clone.clone(),
                     source: source_clone.clone(),
@@ -746,6 +992,14 @@ pub async fn start_model_download(
             }
             if succeeded {
                 let overall_progress = (((idx + 1) as f64 / total_files as f64) * 100.0) as u8;
+                tracing::info!(
+                    target: "backend::model_download",
+                    model_id = %model_id_clone,
+                    file = %spec.dest,
+                    overall_progress = overall_progress,
+                    completed = (idx + 1) as u64 == total_files,
+                    "file download completed"
+                );
                 let state = DownloadTaskState {
                     model_id: model_id_clone.clone(),
                     source: source_clone.clone(),
@@ -769,7 +1023,23 @@ pub async fn start_model_download(
                 emit_progress(&app_clone, &state);
                 if (idx + 1) as u64 == total_files {
                     let placeholder = base_dir.join(".download_complete");
-                    let _ = tokio::fs::write(&placeholder, format!("source={source_clone}")).await;
+                    let write_res = tokio::fs::write(&placeholder, format!("source={source_clone}")).await;
+                    if let Err(err) = &write_res {
+                        tracing::warn!(
+                            target: "backend::model_download",
+                            model_id = %model_id_clone,
+                            placeholder = %placeholder.display(),
+                            error = %err,
+                            "write .download_complete failed"
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "backend::model_download",
+                            model_id = %model_id_clone,
+                            base_dir = %base_dir.display(),
+                            "download session completed, marker written"
+                        );
+                    }
                     if let Ok(mut handles) = download_handles().lock() {
                         handles.remove(&model_id_clone);
                     }
@@ -777,6 +1047,14 @@ pub async fn start_model_download(
                 }
             } else {
                 let err_str = last_err.unwrap_or_else(|| "未知错误".to_owned());
+                tracing::error!(
+                    target: "backend::model_download",
+                    model_id = %model_id_clone,
+                    file = %spec.dest,
+                    url = %url,
+                    error = %err_str,
+                    "file download failed permanently"
+                );
                 let friendly = friendly_download_error(&spec, &url, &err_str, &source_clone, &dest_path);
                 let error_state = DownloadTaskState {
                     model_id: model_id_clone.clone(),
@@ -799,6 +1077,11 @@ pub async fn start_model_download(
         }
 
         // 清理句柄（正常完成分支已清理，此处兜底）
+        tracing::debug!(
+            target: "backend::model_download",
+            model_id = %model_id_clone,
+            "download loop ended, cleaning handles"
+        );
         if let Ok(mut handles) = download_handles().lock() {
             handles.remove(&model_id_clone);
         }
@@ -807,39 +1090,94 @@ pub async fn start_model_download(
     // 保存句柄以支持取消
     if let Ok(mut handles) = download_handles().lock() {
         handles.insert(model_id.clone(), handle);
+        tracing::debug!(
+            target: "backend::model_download",
+            model_id = %model_id,
+            "download handle stored"
+        );
+    } else {
+        tracing::warn!(
+            target: "backend::model_download",
+            model_id = %model_id,
+            "failed to store download handle: lock failed"
+        );
     }
 
+    tracing::info!(
+        target: "backend::model_download",
+        model_id = %model_id,
+        source = %source,
+        "start_model_download accepted"
+    );
     Ok(initial)
 }
 
 #[tauri::command]
 pub fn cancel_model_download(request: CancelDownloadRequest) -> Result<(), String> {
     let model_id = request.model_id.trim().to_owned();
+    tracing::info!(target: "backend::model_download", model_id = %model_id, "cancel_model_download request");
     if model_id.is_empty() {
+        tracing::warn!(target: "backend::model_download", "cancel_model_download rejected: empty model_id");
         return Err("modelId 不能为空".to_owned());
     }
     let flags_arc = cancel_flags();
-    let mut flags = flags_arc.lock().map_err(|_| "锁失败".to_owned())?;
+    let mut flags = flags_arc.lock().map_err(|_| {
+        tracing::error!(target: "backend::model_download", model_id = %model_id, "cancel flags lock failed");
+        "锁失败".to_owned()
+    })?;
     flags.insert(model_id.clone(), true);
+    tracing::info!(target: "backend::model_download", model_id = %model_id, "cancel flag set");
 
     // 中止对应的下载任务
-    if let Ok(mut handles) = download_handles().lock() {
+    let had_handle = if let Ok(mut handles) = download_handles().lock() {
         if let Some(handle) = handles.remove(&model_id) {
             handle.abort();
+            tracing::info!(target: "backend::model_download", model_id = %model_id, "download handle aborted");
+            true
+        } else {
+            tracing::debug!(target: "backend::model_download", model_id = %model_id, "no active handle to abort");
+            false
         }
-    }
+    } else {
+        tracing::warn!(target: "backend::model_download", model_id = %model_id, "download_handles lock failed on cancel");
+        false
+    };
 
     {
         let map_arc = task_map();
         if let Ok(mut map) = map_arc.lock() {
             if let Some(state) = map.get_mut(&model_id) {
+                let prev_status = state.status.clone();
                 if state.status == DownloadStatus::Downloading {
                     state.status = DownloadStatus::Cancelled;
                     state.message = Some("已取消".to_owned());
+                    tracing::info!(
+                        target: "backend::model_download",
+                        model_id = %model_id,
+                        prev_status = ?prev_status,
+                        "task status set to Cancelled"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "backend::model_download",
+                        model_id = %model_id,
+                        status = ?state.status,
+                        "cancel requested but task not downloading"
+                    );
                 }
+            } else {
+                tracing::debug!(target: "backend::model_download", model_id = %model_id, "cancel requested but no task entry");
             }
+        } else {
+            tracing::warn!(target: "backend::model_download", model_id = %model_id, "task_map lock failed on cancel");
         }
     }
+    tracing::info!(
+        target: "backend::model_download",
+        model_id = %model_id,
+        had_handle = had_handle,
+        "cancel_model_download done"
+    );
     Ok(())
 }
 
@@ -896,44 +1234,45 @@ fn downloaded_paths_for_model(
     Some((base.join(det), Some(base.join(rec))))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteDownloadedModelRequest {
-    pub model_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActivateDownloadedModelRequest {
-    pub model_id: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DownloadedModelInfo {
-    pub model_id: String,
-    pub downloaded: bool,
-    pub base_dir: String,
-}
-
 #[tauri::command]
 pub fn list_downloaded_models(state: State<'_, BackendState>) -> Result<Vec<DownloadedModelInfo>, String> {
+    tracing::debug!(target: "backend::model_download", "list_downloaded_models start");
     let model_root: PathBuf = {
-        let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
-        let settings = guard.as_ref().map_err(|err| err.clone())?;
+        let guard = state.settings.lock().map_err(|_| {
+            tracing::error!(target: "backend::model_download", "list_downloaded_models: settings lock failed");
+            "无法读取设置".to_owned()
+        })?;
+        let settings = guard.as_ref().map_err(|err| {
+            tracing::error!(target: "backend::model_download", error = %err, "list_downloaded_models: settings error");
+            err.clone()
+        })?;
         settings.model_root.clone()
     };
+    tracing::debug!(target: "backend::model_download", model_root = %model_root.display(), "list_downloaded_models resolved model_root");
     let models = downloadable_models();
     let mut result = Vec::new();
-    for model in models {
-        let downloaded = is_model_downloaded_on_disk(&model_root, &model);
+    for model in &models {
+        let downloaded = is_model_downloaded_on_disk(&model_root, model);
+        tracing::trace!(
+            target: "backend::model_download",
+            model_id = %model.id,
+            downloaded = downloaded,
+            "list_downloaded_models check"
+        );
         let base = download_base_dir(&model_root, &model.id);
         result.push(DownloadedModelInfo {
-            model_id: model.id,
+            model_id: model.id.clone(),
             downloaded,
             base_dir: base.to_string_lossy().to_string(),
         });
     }
+    let downloaded_count = result.iter().filter(|r| r.downloaded).count();
+    tracing::info!(
+        target: "backend::model_download",
+        total = result.len(),
+        downloaded = downloaded_count,
+        "list_downloaded_models done"
+    );
     Ok(result)
 }
 
@@ -943,20 +1282,38 @@ pub fn get_downloaded_model_paths(
     request: GetStatusRequest,
 ) -> Result<Option<DownloadedModelInfo>, String> {
     let model_id = request.model_id.trim().to_owned();
+    tracing::debug!(target: "backend::model_download", model_id = %model_id, "get_downloaded_model_paths start");
     if model_id.is_empty() {
+        tracing::warn!(target: "backend::model_download", "get_downloaded_model_paths rejected: empty model_id");
         return Err("modelId 不能为空".to_owned());
     }
     let model_root: PathBuf = {
-        let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
-        let settings = guard.as_ref().map_err(|err| err.clone())?;
+        let guard = state.settings.lock().map_err(|_| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, "get_downloaded_model_paths: settings lock failed");
+            "无法读取设置".to_owned()
+        })?;
+        let settings = guard.as_ref().map_err(|err| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, error = %err, "get_downloaded_model_paths: settings error");
+            err.clone()
+        })?;
         settings.model_root.clone()
     };
     let model = downloadable_models()
         .into_iter()
         .find(|m| m.id == model_id)
-        .ok_or_else(|| format!("未知模型 {model_id}"))?;
+        .ok_or_else(|| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, "unknown model for get_downloaded_model_paths");
+            format!("未知模型 {model_id}")
+        })?;
     let downloaded = is_model_downloaded_on_disk(&model_root, &model);
     let base = download_base_dir(&model_root, &model.id);
+    tracing::info!(
+        target: "backend::model_download",
+        model_id = %model_id,
+        downloaded = downloaded,
+        base_dir = %base.display(),
+        "get_downloaded_model_paths done"
+    );
     Ok(Some(DownloadedModelInfo {
         model_id,
         downloaded,
@@ -970,11 +1327,15 @@ pub fn activate_downloaded_model(
     request: ActivateDownloadedModelRequest,
 ) -> Result<crate::backend::settings::BackendStatus, String> {
     let model_id = request.model_id.trim().to_owned();
+    let _span = tracing::info_span!(target: "backend::model_download", "activate_model", model_id = %model_id).entered();
+    tracing::info!(target: "backend::model_download", model_id = %model_id, "activate_downloaded_model request");
     if model_id.is_empty() {
+        tracing::warn!(target: "backend::model_download", "activate_downloaded_model rejected: empty model_id");
         return Err("modelId 不能为空".to_owned());
     }
     // 检查实时会话是否活跃
     if state.live_active.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::warn!(target: "backend::model_download", model_id = %model_id, "activate blocked: live session active");
         return Err("实时翻译进行中，请先停止后再切换模型".to_owned());
     }
     let models = downloadable_models();
@@ -982,35 +1343,95 @@ pub fn activate_downloaded_model(
         .iter()
         .find(|m| m.id == model_id)
         .cloned()
-        .ok_or_else(|| format!("未知模型 {model_id}"))?;
+        .ok_or_else(|| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, "unknown model for activate");
+            format!("未知模型 {model_id}")
+        })?;
+    tracing::debug!(
+        target: "backend::model_download",
+        model_id = %model_id,
+        kind = %model.kind,
+        "activate model resolved"
+    );
 
     // 读取当前设置与 model_root
     let (model_root, current) = {
-        let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
-        let settings = guard.as_ref().map_err(|err| err.clone())?.clone();
+        let guard = state.settings.lock().map_err(|_| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, "settings lock failed for activate");
+            "无法读取设置".to_owned()
+        })?;
+        let settings = guard.as_ref().map_err(|err| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, error = %err, "settings error for activate");
+            err.clone()
+        })?.clone();
         (settings.model_root.clone(), settings)
     };
+    tracing::debug!(
+        target: "backend::model_download",
+        model_id = %model_id,
+        model_root = %model_root.display(),
+        "activate resolved model_root"
+    );
 
     if !is_model_downloaded_on_disk(&model_root, &model) {
+        tracing::warn!(
+            target: "backend::model_download",
+            model_id = %model_id,
+            model_root = %model_root.display(),
+            "activate failed: not downloaded"
+        );
         return Err(format!("模型 {model_id} 尚未下载完成，请先下载"));
     }
 
     let mut updated = current.clone();
     if model.kind == "translation" {
         let (hy_path, _) = downloaded_paths_for_model(&model_root, &model)
-            .ok_or_else(|| "无法解析翻译模型路径".to_owned())?;
+            .ok_or_else(|| {
+                tracing::error!(target: "backend::model_download", model_id = %model_id, "failed to resolve translation model path");
+                "无法解析翻译模型路径".to_owned()
+            })?;
         if !hy_path.is_file() {
+            tracing::error!(
+                target: "backend::model_download",
+                model_id = %model_id,
+                hy_path = %hy_path.display(),
+                "translation model file not found"
+            );
             return Err(format!("翻译模型文件不存在: {}", hy_path.display()));
         }
+        tracing::info!(
+            target: "backend::model_download",
+            model_id = %model_id,
+            hy_path = %hy_path.display(),
+            "activate translation model"
+        );
         updated.hy_model = hy_path;
     } else {
         let (det_dir, rec_opt) = downloaded_paths_for_model(&model_root, &model)
-            .ok_or_else(|| "无法解析 OCR 模型路径".to_owned())?;
-        let rec_dir = rec_opt.ok_or_else(|| "无法解析识别模型路径".to_owned())?;
+            .ok_or_else(|| {
+                tracing::error!(target: "backend::model_download", model_id = %model_id, "failed to resolve OCR model paths");
+                "无法解析 OCR 模型路径".to_owned()
+            })?;
+        let rec_dir = rec_opt.ok_or_else(|| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, "rec dir missing");
+            "无法解析识别模型路径".to_owned()
+        })?;
         if !det_dir.is_dir() {
+            tracing::error!(
+                target: "backend::model_download",
+                model_id = %model_id,
+                det_dir = %det_dir.display(),
+                "detector dir not found"
+            );
             return Err(format!("检测模型目录不存在: {}", det_dir.display()));
         }
         if !rec_dir.is_dir() {
+            tracing::error!(
+                target: "backend::model_download",
+                model_id = %model_id,
+                rec_dir = %rec_dir.display(),
+                "recognizer dir not found"
+            );
             return Err(format!("识别模型目录不存在: {}", rec_dir.display()));
         }
         // 校验两侧变体一致
@@ -1021,36 +1442,114 @@ pub fn activate_downloaded_model(
                 PpOcrVariant::probe(GraphRole::Recognizer, &rec_dir),
             ) {
                 (Some(d), Some(r)) if d != r => {
+                    tracing::error!(
+                        target: "backend::model_download",
+                        model_id = %model_id,
+                        det_variant = %d.label(),
+                        rec_variant = %r.label(),
+                        "variant mismatch"
+                    );
                     return Err(format!(
                         "检测模型变体 {} 与识别模型变体 {} 不一致",
                         d.label(),
                         r.label()
                     ));
                 }
-                _ => {}
+                (Some(d), Some(r)) => {
+                    tracing::debug!(
+                        target: "backend::model_download",
+                        model_id = %model_id,
+                        det_variant = %d.label(),
+                        rec_variant = %r.label(),
+                        "variants match"
+                    );
+                }
+                _ => {
+                    tracing::debug!(
+                        target: "backend::model_download",
+                        model_id = %model_id,
+                        det_dir = %det_dir.display(),
+                        rec_dir = %rec_dir.display(),
+                        "variant probe skipped or incomplete"
+                    );
+                }
             }
         }
+        tracing::info!(
+            target: "backend::model_download",
+            model_id = %model_id,
+            det_dir = %det_dir.display(),
+            rec_dir = %rec_dir.display(),
+            "activate OCR model"
+        );
         updated.detector_model_dir = det_dir;
         updated.recognizer_model_dir = rec_dir;
     }
 
     // 持久化
     if let Some(config_path) = state.config_path.as_deref() {
-        let parent = config_path.parent().ok_or_else(|| "模型设置路径无效".to_owned())?;
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建模型设置目录失败: {e}"))?;
+        let parent = config_path.parent().ok_or_else(|| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, config_path = %config_path.display(), "invalid config parent");
+            "模型设置路径无效".to_owned()
+        })?;
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::error!(
+                target: "backend::model_download",
+                model_id = %model_id,
+                parent = %parent.display(),
+                error = %e,
+                "create config parent failed"
+            );
+            return Err(format!("创建模型设置目录失败: {e}"));
+        }
         let content = serde_json::to_vec_pretty(&updated.persisted())
-            .map_err(|e| format!("序列化模型设置失败: {e}"))?;
-        std::fs::write(config_path, content).map_err(|e| format!("保存模型设置失败: {e}"))?;
+            .map_err(|e| {
+                tracing::error!(target: "backend::model_download", model_id = %model_id, error = %e, "serialize settings failed");
+                format!("序列化模型设置失败: {e}")
+            })?;
+        if let Err(e) = std::fs::write(config_path, content) {
+            tracing::error!(
+                target: "backend::model_download",
+                model_id = %model_id,
+                config_path = %config_path.display(),
+                error = %e,
+                "write config failed"
+            );
+            return Err(format!("保存模型设置失败: {e}"));
+        }
+        tracing::info!(
+            target: "backend::model_download",
+            model_id = %model_id,
+            config_path = %config_path.display(),
+            "config persisted"
+        );
+    } else {
+        tracing::debug!(target: "backend::model_download", model_id = %model_id, "no config_path, skip persist");
     }
     {
-        let mut guard = state.settings.lock().map_err(|_| "无法写入设置".to_owned())?;
+        let mut guard = state.settings.lock().map_err(|_| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, "settings write lock failed");
+            "无法写入设置".to_owned()
+        })?;
         *guard = Ok(updated.clone());
     }
+    tracing::debug!(target: "backend::model_download", model_id = %model_id, "settings updated in memory");
     // 清空已加载引擎，下次推理重新加载
-    if let Ok(mut engine) = state.engine.lock() {
+    let engine_cleared = if let Ok(mut engine) = state.engine.lock() {
+        let had_engine = engine.is_some();
         *engine = None;
-    }
+        had_engine
+    } else {
+        false
+    };
+    tracing::debug!(
+        target: "backend::model_download",
+        model_id = %model_id,
+        had_engine = engine_cleared,
+        "engine cleared for reload"
+    );
     state.touch_activity();
+    tracing::info!(target: "backend::model_download", model_id = %model_id, "activate_downloaded_model success");
     Ok(updated.status(false))
 }
 #[tauri::command]
@@ -1059,28 +1558,46 @@ pub fn delete_downloaded_model(
     request: DeleteDownloadedModelRequest,
 ) -> Result<(), String> {
     let model_id = request.model_id.trim().to_owned();
+    let _span = tracing::info_span!(target: "backend::model_download", "delete_model", model_id = %model_id).entered();
+    tracing::info!(target: "backend::model_download", model_id = %model_id, "delete_downloaded_model request");
     if model_id.is_empty() {
+        tracing::warn!(target: "backend::model_download", "delete_downloaded_model rejected: empty model_id");
         return Err("modelId 不能为空".to_owned());
     }
     if state.live_active.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::warn!(target: "backend::model_download", model_id = %model_id, "delete blocked: live session active");
         return Err("实时翻译进行中，请先停止后再删除模型".to_owned());
     }
     let model = downloadable_models()
         .into_iter()
         .find(|m| m.id == model_id)
-        .ok_or_else(|| format!("未知模型 {model_id}"))?;
+        .ok_or_else(|| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, "unknown model for delete");
+            format!("未知模型 {model_id}")
+        })?;
     let model_root: PathBuf = {
-        let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
-        let settings = guard.as_ref().map_err(|err| err.clone())?;
+        let guard = state.settings.lock().map_err(|_| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, "settings lock failed for delete");
+            "无法读取设置".to_owned()
+        })?;
+        let settings = guard.as_ref().map_err(|err| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, error = %err, "settings error for delete");
+            err.clone()
+        })?;
         settings.model_root.clone()
     };
+    tracing::debug!(target: "backend::model_download", model_id = %model_id, model_root = %model_root.display(), "delete resolved model_root");
     let base = download_base_dir(&model_root, &model.id);
     if !base.exists() {
+        tracing::warn!(target: "backend::model_download", model_id = %model_id, base = %base.display(), "delete failed: not exists");
         return Err(format!("模型 {model_id} 未下载，无需删除"));
     }
     // 禁止删除当前已启用的模型
     {
-        let guard = state.settings.lock().map_err(|_| "无法读取设置".to_owned())?;
+        let guard = state.settings.lock().map_err(|_| {
+            tracing::error!(target: "backend::model_download", model_id = %model_id, "settings lock failed for active check");
+            "无法读取设置".to_owned()
+        })?;
         if let Ok(settings) = guard.as_ref() {
             let cur_hy = settings.hy_model.to_string_lossy().to_string().replace('\\', "/").to_lowercase();
             let cur_det = settings.detector_model_dir.to_string_lossy().to_string().replace('\\', "/").to_lowercase();
@@ -1092,24 +1609,69 @@ pub fn delete_downloaded_model(
                 cur_det.starts_with(&base_str) || cur_rec.starts_with(&base_str)
             };
             if is_active {
+                tracing::warn!(
+                    target: "backend::model_download",
+                    model_id = %model_id,
+                    base = %base.display(),
+                    kind = %model.kind,
+                    "delete blocked: model is active"
+                );
                 return Err(format!("模型 {model_id} 当前已启用，请先切换到其他模型后再删除"));
             }
+            tracing::debug!(target: "backend::model_download", model_id = %model_id, is_active = is_active, "active check done");
         }
     }
     // 若有正在进行的下载，先取消
-    if let Ok(mut handles) = DOWNLOAD_HANDLES.lock() {
+    let had_handle = if let Ok(mut handles) = DOWNLOAD_HANDLES.lock() {
         if let Some(handle) = handles.remove(&model_id) {
             handle.abort();
+            tracing::info!(target: "backend::model_download", model_id = %model_id, "aborted active download handle before delete");
+            true
+        } else {
+            tracing::debug!(target: "backend::model_download", model_id = %model_id, "no handle to abort for delete");
+            false
         }
-    }
-    if let Ok(mut flags) = CANCEL_FLAGS.lock() {
-        flags.remove(&model_id);
-    }
-    if let Ok(mut map) = TASK_MAP.lock() {
-        map.remove(&model_id);
-    }
+    } else {
+        tracing::warn!(target: "backend::model_download", model_id = %model_id, "DOWNLOAD_HANDLES lock failed for delete");
+        false
+    };
+    let had_flag = if let Ok(mut flags) = CANCEL_FLAGS.lock() {
+        let existed = flags.remove(&model_id).is_some();
+        tracing::debug!(target: "backend::model_download", model_id = %model_id, existed = existed, "cancel flag removed");
+        existed
+    } else {
+        tracing::warn!(target: "backend::model_download", model_id = %model_id, "CANCEL_FLAGS lock failed for delete");
+        false
+    };
+    let had_task = if let Ok(mut map) = TASK_MAP.lock() {
+        let existed = map.remove(&model_id).is_some();
+        tracing::debug!(target: "backend::model_download", model_id = %model_id, existed = existed, "task entry removed");
+        existed
+    } else {
+        tracing::warn!(target: "backend::model_download", model_id = %model_id, "TASK_MAP lock failed for delete");
+        false
+    };
     // 删除目录
-    std::fs::remove_dir_all(&base).map_err(|e| format!("删除模型目录失败: {e}"))?;
+    tracing::info!(
+        target: "backend::model_download",
+        model_id = %model_id,
+        base = %base.display(),
+        had_handle = had_handle,
+        had_flag = had_flag,
+        had_task = had_task,
+        "removing model directory"
+    );
+    if let Err(e) = std::fs::remove_dir_all(&base) {
+        tracing::error!(
+            target: "backend::model_download",
+            model_id = %model_id,
+            base = %base.display(),
+            error = %e,
+            "remove_dir_all failed"
+        );
+        return Err(format!("删除模型目录失败: {e}"));
+    }
+    tracing::info!(target: "backend::model_download", model_id = %model_id, base = %base.display(), "delete_downloaded_model success");
     Ok(())
 }
 

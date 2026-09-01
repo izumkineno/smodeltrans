@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onActivated, onBeforeUnmount, onDeactivated, ref } from "vue";
+import { computed, watch, onActivated, onBeforeUnmount, onDeactivated, ref } from "vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   NAlert,
@@ -182,6 +182,21 @@ const selectedTarget = computed(() =>
 const canConfigure = computed(
   () => liveStatus.value.state === "idle" || liveStatus.value.state === "error",
 );
+
+// Structured logs for key user selections
+watch(selectedTargetId, (next, prev) => {
+  if (next !== prev) {
+    const target = captureWindows.value.find(w => w.id === next);
+    console.info("[LiveTranslationPage] window selection changed", { previous: prev, next, title: target?.title, process: target?.processName, size: target ? `${target.width}x${target.height}` : undefined });
+    console.debug("[LiveTranslationPage] window selection params", { next, prev, totalWindows: captureWindows.value.length });
+  }
+});
+
+watch(targetLanguage, (next, prev) => {
+  if (next !== prev) {
+    console.info("[LiveTranslationPage] targetLanguage changed", { previous: prev, next });
+  }
+});
 const canStart = computed(
   () =>
     isDesktopRuntime &&
@@ -283,11 +298,14 @@ function handleTriggerKeyCapture(event: KeyboardEvent): void {
   event.preventDefault();
   event.stopPropagation();
   const key = normalizeRecordedTriggerKey(event);
+  console.debug("[LiveTranslationPage] handleTriggerKeyCapture: key event", { code: event.code, keyCode: event.keyCode, key });
   if (!key) {
+    console.warn("[LiveTranslationPage] handleTriggerKeyCapture: invalid key, no virtual key");
     triggerKeyCaptureHint.value =
       "当前环境没有返回 Windows virtual-key code，请在 Windows 桌面端重新录入。";
     return;
   }
+  console.info("[LiveTranslationPage] handleTriggerKeyCapture: captured", { key, label: formatTriggerKey(key) });
   liveRecognitionSettings.value.triggerKey = key;
   triggerKeyCaptureHint.value = `已录入 ${formatTriggerKey(key)}，保存识别设置后生效。`;
   stopTriggerKeyCapture();
@@ -295,43 +313,63 @@ function handleTriggerKeyCapture(event: KeyboardEvent): void {
 
 
 function toggleTriggerKeyCapture(): void {
+  console.info("[LiveTranslationPage] toggleTriggerKeyCapture: user toggled capture", { wasCapturing: isCapturingTriggerKey.value });
   if (isCapturingTriggerKey.value) {
     stopTriggerKeyCapture();
     triggerKeyCaptureHint.value = "已取消按键录入。";
+    console.debug("[LiveTranslationPage] toggleTriggerKeyCapture: cancelled");
     return;
   }
   if (typeof window === "undefined") {
+    console.warn("[LiveTranslationPage] toggleTriggerKeyCapture: no window");
     return;
   }
   triggerKeyCaptureHint.value = "请按下要作为触发键的按键……";
   isCapturingTriggerKey.value = true;
+  console.debug("[LiveTranslationPage] toggleTriggerKeyCapture: started capture");
   window.addEventListener("keydown", handleTriggerKeyCapture, true);
 }
 
 function applyStatus(status: LiveSessionStatus): void {
+  console.debug("[LiveTranslationPage] applyStatus: incoming", { state: status.state, message: status.message, sessionId: status.sessionId, revision: status.latestRevision, roi: status.roi });
   if (status.sessionId && status.sessionId !== debugSessionId) {
+    console.info("[LiveTranslationPage] applyStatus: new session detected", { oldSession: debugSessionId, newSession: status.sessionId });
     debugSessionId = status.sessionId;
     debugRecords.value = [];
   }
   liveStatus.value = status;
   if (status.target) {
+    if (selectedTargetId.value !== status.target.id) {
+      console.debug("[LiveTranslationPage] applyStatus: target window updated", { targetId: status.target.id, title: status.target.title });
+    }
     selectedTargetId.value = status.target.id;
   }
   if (status.state !== "error") {
     commandError.value = "";
   }
+  if (status.state === "error") {
+    console.error("[LiveTranslationPage] applyStatus: session error", { message: status.message, sessionId: status.sessionId });
+  }
 }
 
 function applyDebugRecord(record: LiveDebugRecord): void {
+  console.debug("[LiveTranslationPage] applyDebugRecord: incoming", { sessionId: record.sessionId, outcome: record.outcome, sequence: record.sequence, durationMs: record.durationMs, targetLanguage: record.targetLanguage });
   if (record.sessionId !== debugSessionId) {
+    console.warn("[LiveTranslationPage] applyDebugRecord: ignored mismatched session", { recordSession: record.sessionId, currentSession: debugSessionId });
     return;
   }
   debugRecords.value = [record, ...debugRecords.value].slice(0, MAX_DEBUG_RECORDS);
+  if (record.outcome === "failed") {
+    console.warn("[LiveTranslationPage] applyDebugRecord: failed record", { sequence: record.sequence, message: record.message });
+  } else {
+    console.info("[LiveTranslationPage] applyDebugRecord: outcome", { outcome: record.outcome, sequence: record.sequence, durationMs: record.durationMs, regionCount: record.regionCount });
+  }
 }
 
 
 function setCommandError(error: unknown): void {
   const message = errorText(error);
+  console.error("[LiveTranslationPage] commandError", { message, error: error instanceof Error ? error.stack : String(error) });
   commandError.value = message;
   showWorkspaceToast(toast, "error", message);
 }
@@ -377,19 +415,30 @@ function debugOutcomeLabel(outcome: LiveDebugOutcome): string {
 }
 
 async function refreshWindows(notifyOnError = true): Promise<void> {
+  console.info("[LiveTranslationPage] refreshWindows: user triggered window list refresh", { notifyOnError, activeAction: activeAction.value, canConfigure: canConfigure.value });
   if (!isDesktopRuntime || activeAction.value || !canConfigure.value) {
+    console.debug("[LiveTranslationPage] refreshWindows: skipped", { isDesktopRuntime, activeAction: activeAction.value, canConfigure: canConfigure.value });
     return;
   }
+  const t0 = Date.now();
   activeAction.value = "refresh";
   try {
     const windows = await listCaptureWindows();
+    const duration = Date.now() - t0;
+    console.info("[LiveTranslationPage] refreshWindows: success", { count: windows.length, durationMs: duration, windowsLoaded: true });
+    console.debug("[LiveTranslationPage] refreshWindows: window list", { windows: windows.map(w => ({ id: w.id, title: w.title, process: w.processName, size: `${w.width}x${w.height}` })) });
     captureWindows.value = windows;
     windowsLoaded.value = true;
     if (!windows.some((target) => target.id === selectedTargetId.value)) {
+      if (selectedTargetId.value !== null) {
+        console.warn("[LiveTranslationPage] refreshWindows: selected window no longer available, clearing", { previous: selectedTargetId.value });
+      }
       selectedTargetId.value = null;
     }
     commandError.value = "";
   } catch (error) {
+    const duration = Date.now() - t0;
+    console.error("[LiveTranslationPage] refreshWindows: failed", { error: errorText(error), durationMs: duration });
     if (notifyOnError) {
       setCommandError(error);
     }
@@ -399,16 +448,21 @@ async function refreshWindows(notifyOnError = true): Promise<void> {
 }
 
 function refreshWindowsOnTargetWindowInteraction(): void {
+  console.debug("[LiveTranslationPage] refreshWindowsOnTargetWindowInteraction: selector interacted, refreshing windows silently");
   void refreshWindows(false);
 }
 
 async function startSession(): Promise<void> {
+  console.info("[LiveTranslationPage] startSession: user triggered start", { targetId: selectedTargetId.value, language: targetLanguage.value, canStart: canStart.value });
   const targetId = selectedTargetId.value;
   const language = targetLanguage.value.trim();
+  console.debug("[LiveTranslationPage] startSession: params", { targetId, language, overlayMode: liveOverlaySettings.value });
   if (!canStart.value || !targetId || !language) {
+    console.warn("[LiveTranslationPage] startSession: validation failed, abort", { canStart: canStart.value, hasTarget: !!targetId, hasLanguage: !!language });
     return;
   }
   stopTriggerKeyCapture();
+  console.debug("[LiveTranslationPage] startSession: persisting settings before start");
   activeAction.value = "start";
   try {
     loadPersistedLiveOverlaySettings();
@@ -428,16 +482,19 @@ async function startSession(): Promise<void> {
     if (translationPersistenceError) {
       showWorkspaceToast(toast, "warning", translationPersistenceError);
     }
-    applyStatus(
-      await startLiveSession(
+    const t0 = Date.now();
+    const status = await startLiveSession(
         targetId,
         language,
         liveOverlaySettings.value,
         liveRecognitionSettings.value,
         liveTranslationSettings.value,
-      ),
-    );
+      );
+    const duration = Date.now() - t0;
+    console.info("[LiveTranslationPage] startSession: backend start success", { targetId, language, durationMs: duration, state: status.state, sessionId: status.sessionId });
+    applyStatus(status);
   } catch (error) {
+    console.error("[LiveTranslationPage] startSession: failed", { targetId, language, error: errorText(error) });
     setCommandError(error);
   } finally {
     activeAction.value = null;
@@ -445,31 +502,40 @@ async function startSession(): Promise<void> {
 }
 
 function saveLiveOverlayPreferences(): void {
+  console.info("[LiveTranslationPage] saveLiveOverlayPreferences: user triggered save", { overlay: liveOverlaySettings.value, style: liveSubtitleStyleSettings.value });
   const persistError = savePersistedLiveOverlaySettings();
   if (persistError) {
+    console.error("[LiveTranslationPage] saveLiveOverlayPreferences: persist failed", { error: persistError });
     showWorkspaceToast(toast, "error", persistError);
     return;
   }
   const stylePersistenceError = savePersistedLiveSubtitleStyleSettings();
   if (stylePersistenceError) {
+    console.error("[LiveTranslationPage] saveLiveOverlayPreferences: style persist failed", { error: stylePersistenceError });
     showWorkspaceToast(toast, "error", stylePersistenceError);
     return;
   }
+  console.info("[LiveTranslationPage] saveLiveOverlayPreferences: saved successfully");
   showWorkspaceToast(toast, "success", "实时显示设置已保存，下次开始抓取时生效。");
 }
 async function toggleLiveRegionBoxes(): Promise<void> {
   const visible = !liveOverlaySettings.value.showRegionBoxes;
+  console.info("[LiveTranslationPage] toggleLiveRegionBoxes: user toggled boxes", { visible, wasVisible: !visible });
   liveOverlaySettings.value.showRegionBoxes = visible;
   const persistError = savePersistedLiveOverlaySettings();
   if (isDesktopRuntime) {
     try {
+      console.debug("[LiveTranslationPage] toggleLiveRegionBoxes: syncing to backend", { visible });
       await setLiveRegionBoxesVisible(visible);
+      console.info("[LiveTranslationPage] toggleLiveRegionBoxes: backend sync success", { visible });
     } catch (error) {
+      console.error("[LiveTranslationPage] toggleLiveRegionBoxes: backend sync failed", { visible, error: errorText(error) });
       setCommandError(error);
       return;
     }
   }
   if (persistError) {
+    console.warn("[LiveTranslationPage] toggleLiveRegionBoxes: persist warning", { error: persistError });
     showWorkspaceToast(toast, "warning", persistError);
     return;
   }
@@ -478,48 +544,68 @@ async function toggleLiveRegionBoxes(): Promise<void> {
 
 
 function saveLiveRecognitionPreferences(): void {
+  console.info("[LiveTranslationPage] saveLiveRecognitionPreferences: user triggered save", { settings: liveRecognitionSettings.value });
   const persistError = savePersistedLiveRecognitionSettings();
   if (persistError) {
+    console.error("[LiveTranslationPage] saveLiveRecognitionPreferences: persist failed", { error: persistError });
     showWorkspaceToast(toast, "error", persistError);
     return;
   }
+  console.info("[LiveTranslationPage] saveLiveRecognitionPreferences: saved successfully", { mode: liveRecognitionSettings.value.mode, triggerKey: liveRecognitionSettings.value.triggerKey });
   showWorkspaceToast(toast, "success", "实时识别设置已保存，下次开始抓取时生效。");
 }
 
 function saveLiveTranslationPreferences(): void {
+  console.info("[LiveTranslationPage] saveLiveTranslationPreferences: user triggered save", { promptLen: liveTranslationSettings.value.supplementalPrompt?.length ?? 0, targetLanguage: targetLanguage.value });
   const persistError = savePersistedLiveTranslationSettings();
   if (persistError) {
+    console.error("[LiveTranslationPage] saveLiveTranslationPreferences: persist failed", { error: persistError });
     showWorkspaceToast(toast, "error", persistError);
     return;
   }
+  console.info("[LiveTranslationPage] saveLiveTranslationPreferences: saved successfully");
   showWorkspaceToast(toast, "success", "实时翻译补充提示已保存，下次开始抓取时生效。");
 }
 
 async function runSessionAction(action: Exclude<LiveAction, "refresh" | "start">): Promise<void> {
+  console.info("[LiveTranslationPage] runSessionAction: user triggered", { action, sessionId: liveStatus.value.sessionId, state: liveStatus.value.state });
   if (!isDesktopRuntime || activeAction.value) {
+    console.debug("[LiveTranslationPage] runSessionAction: skipped", { isDesktopRuntime, activeAction: activeAction.value });
     return;
   }
   const sessionId = liveStatus.value.sessionId;
   if (action !== "stop" && !sessionId) {
+    console.error("[LiveTranslationPage] runSessionAction: missing sessionId for action", { action });
     setCommandError(new Error("当前实时会话标识不可用，请刷新状态后重试。"));
     return;
   }
+  console.debug("[LiveTranslationPage] runSessionAction: executing", { action, sessionId });
   activeAction.value = action;
+  const t0 = Date.now();
   try {
     let status: LiveSessionStatus;
     if (action === "pause") {
+      console.debug("[LiveTranslationPage] runSessionAction: pausing", { sessionId });
       status = await pauseLiveSession(sessionId!);
     } else if (action === "resume") {
+      console.debug("[LiveTranslationPage] runSessionAction: resuming", { sessionId });
       status = await resumeLiveSession(sessionId!);
     } else if (action === "reselect") {
+      console.debug("[LiveTranslationPage] runSessionAction: reselect ROI", { sessionId });
       status = await beginLiveRoiUpdate(sessionId!);
     } else if (action === "cancel") {
+      console.debug("[LiveTranslationPage] runSessionAction: cancel selection", { sessionId });
       status = await cancelLiveSelection(sessionId!);
     } else {
+      console.debug("[LiveTranslationPage] runSessionAction: stopping", { sessionId });
       status = await stopLiveSession(sessionId);
     }
+    const duration = Date.now() - t0;
+    console.info("[LiveTranslationPage] runSessionAction: success", { action, durationMs: duration, newState: status.state, sessionId });
     applyStatus(status);
   } catch (error) {
+    const duration = Date.now() - t0;
+    console.error("[LiveTranslationPage] runSessionAction: failed", { action, durationMs: duration, error: errorText(error) });
     setCommandError(error);
   } finally {
     activeAction.value = null;
@@ -527,6 +613,7 @@ async function runSessionAction(action: Exclude<LiveAction, "refresh" | "start">
 }
 
 function stopStatusBinding(): void {
+  console.debug("[LiveTranslationPage] stopStatusBinding: cleaning up", { version: bindingVersion });
   bindingVersion += 1;
   statusUnlisten?.();
   debugUnlisten?.();
@@ -535,7 +622,9 @@ function stopStatusBinding(): void {
 }
 
 async function startStatusBinding(): Promise<void> {
+  console.info("[LiveTranslationPage] startStatusBinding: initializing live status binding", { isDesktopRuntime, version: bindingVersion });
   if (!isDesktopRuntime) {
+    console.debug("[LiveTranslationPage] startStatusBinding: skipped (browser preview)");
     return;
   }
   stopStatusBinding();
@@ -556,11 +645,15 @@ async function startStatusBinding(): Promise<void> {
     }
     statusUnlisten = nextStatusUnlisten;
     debugUnlisten = nextDebugUnlisten;
-    applyStatus(await getLiveSessionStatus());
+    console.info("[LiveTranslationPage] startStatusBinding: listeners attached", { version });
+    const initialStatus = await getLiveSessionStatus();
+    console.debug("[LiveTranslationPage] startStatusBinding: initial status", { state: initialStatus.state, sessionId: initialStatus.sessionId });
+    applyStatus(initialStatus);
     if (canConfigure.value) {
       await refreshWindows(false);
     }
   } catch (error) {
+    console.error("[LiveTranslationPage] startStatusBinding: failed", { version, error: errorText(error) });
     nextStatusUnlisten?.();
     nextDebugUnlisten?.();
     if (version === bindingVersion) {
@@ -570,20 +663,29 @@ async function startStatusBinding(): Promise<void> {
 }
 
 function cleanupPage(): void {
+  console.debug("[LiveTranslationPage] cleanupPage: cleaning up page resources");
   stopTriggerKeyCapture();
   stopStatusBinding();
 }
 
 onActivated(() => {
+  console.info("[LiveTranslationPage] onActivated: page activated", { isDesktopRuntime });
   loadPersistedTargetLanguage();
+  console.debug("[LiveTranslationPage] onActivated: targetLanguage", { targetLanguage: targetLanguage.value });
   loadPersistedLiveOverlaySettings();
   loadPersistedLiveSubtitleStyleSettings();
   loadPersistedLiveRecognitionSettings();
   loadPersistedLiveTranslationSettings();
   void startStatusBinding();
 });
-onDeactivated(cleanupPage);
-onBeforeUnmount(cleanupPage);
+onDeactivated(() => {
+  console.debug("[LiveTranslationPage] onDeactivated: page deactivated");
+  cleanupPage();
+});
+onBeforeUnmount(() => {
+  console.debug("[LiveTranslationPage] onBeforeUnmount: component unmounting");
+  cleanupPage();
+});
 </script>
 
 <template>

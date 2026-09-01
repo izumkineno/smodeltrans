@@ -43,11 +43,15 @@ rayon = "1.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "time", "sync", "macros", "fs", "io-util", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "local-time", "time"] }
+tracing-appender = "0.2"
+tracing-log = "0.2"
+time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 axum = "0.7"
 tower-http = { version = "0.6", features = ["cors"] }
 tokio-stream = "0.1"
 simple_downloader = { version = "0.3.1", features = ["resume", "progress"] }
-
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = "=2.0.1"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

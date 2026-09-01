@@ -38,7 +38,9 @@ const RECOGNITION_RESCUE_MAX_SPAN: usize = 3;
 
 fn trace_ocr(message: std::fmt::Arguments<'_>) {
     if std::env::var_os("SMODELTRANS_TRACE_OCR").is_some() {
-        eprintln!("[ocr] {message}");
+        tracing::debug!(target: "ocr", "{}", message);
+    } else {
+        tracing::trace!(target: "ocr", "{}", message);
     }
 }
 
@@ -1767,7 +1769,7 @@ mod cuda_model_pair_tests {
                 &cancellation,
             ) {
                 Ok((image_text, live_text)) => {
-                    eprintln!("[cuda-ocr] {label}: image={image_text:?}; live={live_text:?}");
+                    tracing::debug!(target: "ocr::cuda", label = %label, image_text = ?image_text, live_text = ?live_text, "cuda-ocr compare");
                 }
                 Err(error) => failures.push(format!("{label}: {error}")),
             }

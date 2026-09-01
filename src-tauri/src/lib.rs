@@ -1,4 +1,5 @@
 mod backend;
+mod logging;
 mod model_config;
 mod model_support;
 mod models;
@@ -6,7 +7,6 @@ mod openai_compat;
 mod output;
 mod quick_translation;
 mod selection;
-
 use std::sync::Arc;
 use tauri::Manager;
 
@@ -24,6 +24,21 @@ pub fn run() {
 
     builder
         .setup(|app| {
+            // tracing B 方案：尽早初始化，双文件落盘（session + latest）
+            let log_dir = logging::resolve_app_log_directory(app.handle());
+            if let Err(e) = logging::prepare_log_directory(&log_dir) {
+                eprintln!("准备日志目录失败: {e}");
+            } else {
+                let session_name = logging::build_session_log_file_name();
+                logging::init_tracing(log_dir.clone(), session_name);
+                tracing::info!(
+                    target: "app::startup",
+                    version = env!("CARGO_PKG_VERSION"),
+                    log_dir = %log_dir.display(),
+                    "应用启动"
+                );
+            }
+
             let resource_root = app.path().resource_dir().ok();
             let config_path = app
                 .path()
@@ -52,7 +67,9 @@ pub fn run() {
                     let port: Arc<dyn openai_compat::adapter::TranslationPort> =
                         Arc::new(openai_compat::adapter::BackendStateAdapter::new(state_for_spawn));
                     if let Err(e) = openai_handle_for_spawn.start(port).await {
-                        eprintln!("[openai_compat] auto-start failed: {}", e);
+                        tracing::error!(target: "openai_compat", error = %e, "auto-start 失败");
+                    } else {
+                        tracing::info!(target: "openai_compat", "auto-start 成功");
                     }
                 });
             }
@@ -64,6 +81,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            logging::frontend_log,
+            logging::list_log_files,
+            logging::read_log_file,
+            logging::open_log_directory,
             quick_translation::configure_quick_translation,
             backend::commands::get_backend_status,
             backend::commands::get_model_runtime_status,

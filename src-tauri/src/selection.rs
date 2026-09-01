@@ -39,43 +39,65 @@ impl Display for SelectionReadError {
 impl std::error::Error for SelectionReadError {}
 
 pub(crate) fn read_selected_text() -> Result<SelectedText, SelectionReadError> {
+    tracing::debug!(target: "selection", "read_selected_text requested");
     #[cfg(target_os = "windows")]
     {
         let worker = std::thread::Builder::new()
             .name("smodeltrans-uia-selection".to_owned())
             .spawn(read_selected_text_on_current_thread)
             .map_err(|error| {
+                tracing::error!(target: "selection", error = %error, "failed to spawn selection thread");
                 SelectionReadError::System(format!("启动选区读取线程失败：{error}"))
             })?;
-        return worker
+        let result = worker
             .join()
             .map_err(|_| SelectionReadError::System("选区读取线程异常退出。".to_owned()))?;
+        match &result {
+            Ok(selection) => tracing::info!(target: "selection", text_len = selection.text.chars().count(), has_bounds = selection.bounds.is_some(), "read_selected_text success"),
+            Err(error) => tracing::warn!(target: "selection", error = %error, "read_selected_text failed"),
+        }
+        return result;
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        tracing::warn!(target: "selection", "unsupported platform for selection");
         Err(SelectionReadError::UnsupportedPlatform)
     }
 }
-
 #[cfg(target_os = "windows")]
 fn read_selected_text_on_current_thread() -> Result<SelectedText, SelectionReadError> {
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
+    tracing::trace!(target: "selection", "initializing COM for UIA selection");
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
         .ok()
         .map_err(|error| {
+            tracing::error!(target: "selection", error = %error, "CoInitializeEx failed");
             SelectionReadError::System(format!("初始化 UI Automation COM 线程失败：{error}"))
         })?;
     let _com_guard = ComGuard;
 
-    match read_selected_text_with_uia() {
-        Ok(Some(selection)) => Ok(selection),
-        Ok(None) => Err(SelectionReadError::NoTextSelection),
-        Err(error) => Err(SelectionReadError::System(format!(
-            "读取当前文字选区失败：{error}"
-        ))),
+    let result = match read_selected_text_with_uia() {
+        Ok(Some(selection)) => {
+            tracing::debug!(target: "selection", text_len = selection.text.chars().count(), has_bounds = selection.bounds.is_some(), "UIA selection found");
+            Ok(selection)
+        },
+        Ok(None) => {
+            tracing::debug!(target: "selection", "UIA no text selection");
+            Err(SelectionReadError::NoTextSelection)
+        },
+        Err(error) => {
+            tracing::warn!(target: "selection", error = %error, "UIA read failed");
+            Err(SelectionReadError::System(format!(
+                "读取当前文字选区失败：{error}"
+            )))
+        },
+    };
+    if let Err(error) = &result {
+        tracing::warn!(target: "selection", error = %error, "read_selected_text_on_current_thread failed");
     }
+    result
 }
 
 #[cfg(target_os = "windows")]

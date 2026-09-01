@@ -42,6 +42,9 @@ impl OutputPort for ImageOutput {
         target_language: &str,
         cancellation: &CancellationToken,
     ) -> Result<TranslationOutput, BackendFailure> {
+        let _span = tracing::debug_span!(target: "output", "render", target_language = %target_language, region_count = regions.len()).entered();
+        tracing::info!(target: "output", target_language = %target_language, region_count = regions.len(), image_width = image.canvas().width(), image_height = image.canvas().height(), "render translation output started");
+        tracing::debug!(target: "output", regions = ?regions.iter().map(|r| (r.order, r.quad_points)).collect::<Vec<_>>(), "ordered region input");
         cancellation.check()?;
         let mut rendered: RgbaImage = DynamicImage::ImageRgb8(image.canvas().clone()).into_rgba8();
         let mut translated_text = Vec::with_capacity(regions.len());
@@ -123,6 +126,9 @@ impl OutputPort for ImageOutput {
         regions: Vec<RegionRecord>,
         cancellation: &CancellationToken,
     ) -> Result<OcrOutput, BackendFailure> {
+        let _span = tracing::debug_span!(target: "output", "render_ocr", region_count = regions.len()).entered();
+        tracing::info!(target: "output", region_count = regions.len(), image_width = image.canvas().width(), image_height = image.canvas().height(), "render ocr output started");
+        tracing::debug!(target: "output", ordered = ?ordered_regions(&regions).iter().map(|r| r.order).collect::<Vec<_>>(), "region ordering for ocr");
         cancellation.check()?;
         let mut rendered: RgbaImage = DynamicImage::ImageRgb8(image.canvas().clone()).into_rgba8();
         let ordered = ordered_regions(&regions);
@@ -201,6 +207,8 @@ impl OutputPort for ImageOutput {
 }
 
 fn ordered_regions(regions: &[RegionRecord]) -> Vec<&RegionRecord> {
+    tracing::trace!(target: "output", region_count = regions.len(), "ordered_regions called");
+    let _span = tracing::trace_span!(target: "output", "ordered_regions", count = regions.len()).entered();
     let mut ordered = regions.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|region| region.order);
     ordered
@@ -248,6 +256,7 @@ fn clean_annotation(value: &str) -> String {
 }
 
 fn resolve_font(path: Option<&Path>, texts: &[String]) -> Result<FontArc, BackendFailure> {
+    tracing::debug!(target: "output", font_path = ?path, text_count = texts.len(), "resolve_font started");
     if let Some(path) = path {
         let bytes = fs::read(path)
             .map_err(|error| BackendFailure::output(format!("无法读取字体：{error}")))?;
@@ -257,6 +266,7 @@ fn resolve_font(path: Option<&Path>, texts: &[String]) -> Result<FontArc, Backen
         if !covers(&font, texts) {
             return Err(BackendFailure::output("显式字体不覆盖全部译文字符"));
         }
+        tracing::info!(target: "output", font_path = ?path, "explicit font resolved and covers text");
         return Ok(font);
     }
     let mut database = fontdb::Database::new();
@@ -269,6 +279,7 @@ fn resolve_font(path: Option<&Path>, texts: &[String]) -> Result<FontArc, Backen
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then(left.2.cmp(&right.2)));
+    tracing::debug!(target: "output", candidate_count = candidates.len(), "system font candidates collected");
     for (_, id, _) in candidates {
         let maybe_font = database.with_face_data(id, |data, face_index| {
             FontVec::try_from_vec_and_index(data.to_vec(), face_index)
@@ -276,9 +287,11 @@ fn resolve_font(path: Option<&Path>, texts: &[String]) -> Result<FontArc, Backen
                 .map(FontArc::from)
         });
         if let Some(font) = maybe_font.flatten().filter(|font| covers(font, texts)) {
+            tracing::info!(target: "output", font_id = ?id, "system font selected that covers text");
             return Ok(font);
         }
     }
+    tracing::warn!(target: "output", text_count = texts.len(), "no system font covers all characters");
     Err(BackendFailure::output("没有系统字体覆盖全部译文字符"))
 }
 

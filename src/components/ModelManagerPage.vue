@@ -144,8 +144,11 @@ function isDownloaded(modelId: string): boolean {
 }
 
 async function refreshDownloaded(): Promise<void> {
+  console.debug("[ModelManagerPage] refreshDownloaded: fetching downloaded list");
+  const t0 = Date.now();
   try {
     const list = await listDownloadedModels();
+    const duration = Date.now() - t0;
     const next = new Set<string>();
     const base: Record<string, string> = {};
     for (const item of list) {
@@ -154,28 +157,39 @@ async function refreshDownloaded(): Promise<void> {
     }
     downloadedSet.value = next;
     downloadedBaseDir.value = base;
-  } catch {
-    // 忽略
+    console.info("[ModelManagerPage] refreshDownloaded: success", { total: list.length, downloaded: next.size, durationMs: duration });
+  } catch (error) {
+    const duration = Date.now() - t0;
+    console.warn("[ModelManagerPage] refreshDownloaded: failed", { error: error instanceof Error ? error.message : String(error), durationMs: duration });
   }
 }
 
 async function handleSwitchModel(modelId: string): Promise<void> {
+  console.info("[ModelManagerPage] handleSwitchModel: user requested switch", { modelId, isDownloaded: isDownloaded(modelId), isInstalled: isModelInstalled(modelId) });
   if (!isDownloaded(modelId)) {
+    console.warn("[ModelManagerPage] handleSwitchModel: not downloaded", { modelId });
     setSettingsFeedback("error", "该模型尚未下载，请先下载");
     return;
   }
   if (isModelInstalled(modelId)) {
+    console.info("[ModelManagerPage] handleSwitchModel: already installed", { modelId });
     setSettingsFeedback("info", "该模型已是当前启用模型");
     return;
   }
+  console.debug("[ModelManagerPage] handleSwitchModel: activating", { modelId });
+  const t0 = Date.now();
   settingsLoading.value = true;
   try {
     const status = (await activateDownloadedModel(modelId)) as BackendStatus;
+    const duration = Date.now() - t0;
+    console.info("[ModelManagerPage] handleSwitchModel: success", { modelId, durationMs: duration, ready: status.ready });
     applyBackendStatus(status);
     await loadModelCatalog();
     await refreshDownloaded();
     setSettingsFeedback("success", `已切换到模型 ${modelId}，后端已更新`);
   } catch (error) {
+    const duration = Date.now() - t0;
+    console.error("[ModelManagerPage] handleSwitchModel: failed", { modelId, durationMs: duration, error: error instanceof Error ? error.message : String(error) });
     setSettingsFeedback("error", error instanceof Error ? error.message : `切换失败 ${modelId}`);
   } finally {
     settingsLoading.value = false;
@@ -209,6 +223,7 @@ const settingsStatusLabel = computed(() => {
 });
 
 function applyBackendStatus(status: BackendStatus) {
+  console.debug("[ModelManagerPage] applyBackendStatus: applying", { ready: status.ready, detectorVariant: status.detectorVariant, hyModel: status.hyModel, device: status.device });
   applySharedBackendStatus(status);
   modelDetectorPath.value = status.detectorModelDir;
   modelRecognizerPath.value = status.recognizerModelDir;
@@ -233,17 +248,25 @@ function applyBackendStatus(status: BackendStatus) {
 }
 
 async function refreshBackendStatus(notify = true) {
+  console.info("[ModelManagerPage] refreshBackendStatus: user triggered refresh", { notify, isDesktopRuntime });
   if (!isDesktopRuntime) {
+    console.warn("[ModelManagerPage] refreshBackendStatus: not in Tauri");
     setSettingsFeedback("warning", "模型状态仅在 Tauri 桌面端可读取。", notify);
     return;
   }
+  console.debug("[ModelManagerPage] refreshBackendStatus: fetching");
+  const t0 = Date.now();
   settingsLoading.value = true;
   try {
     const status = await fetchSharedBackendStatus();
+    const duration = Date.now() - t0;
+    console.info("[ModelManagerPage] refreshBackendStatus: success", { ready: status.ready, durationMs: duration, message: status.message });
     applyBackendStatus(status);
     void loadModelCatalog();
     setSettingsFeedback(status.ready ? "success" : "warning", status.message, notify);
   } catch (error) {
+    const duration = Date.now() - t0;
+    console.error("[ModelManagerPage] refreshBackendStatus: failed", { durationMs: duration, error: error instanceof Error ? error.message : String(error) });
     setSettingsFeedback("error", error instanceof Error ? error.message : "无法读取后端模型状态。", notify);
   } finally {
     settingsLoading.value = false;
@@ -307,13 +330,17 @@ function selectDialogTranslationModel(value: string | null): void {
 
 
 async function loadModelCatalog(): Promise<void> {
+  console.debug("[ModelManagerPage] loadModelCatalog: loading", { isDesktopRuntime });
   if (!isDesktopRuntime) {
     catalogLoaded.value = true;
+    console.info("[ModelManagerPage] loadModelCatalog: skipped (browser preview)");
     return;
   }
   try {
     modelCatalog.value = await getModelCatalog();
-  } catch {
+    console.info("[ModelManagerPage] loadModelCatalog: loaded", { translation: modelCatalog.value.translation.length, ocr: modelCatalog.value.ocr.length, fonts: modelCatalog.value.fonts.length });
+  } catch (error) {
+    console.warn("[ModelManagerPage] loadModelCatalog: failed", { error: error instanceof Error ? error.message : String(error) });
     modelCatalog.value = { translation: [], ocr: [], fonts: [] };
   } finally {
     catalogLoaded.value = true;
@@ -321,12 +348,15 @@ async function loadModelCatalog(): Promise<void> {
 }
 
 function selectTranslationModel(path: string): void {
+  console.info("[ModelManagerPage] selectTranslationModel: user selected", { path });
   modelHyPath.value = path;
   setSettingsFeedback("info", "已选择翻译模型 Hy-MT2，点击“保存设置”生效。");
 }
 
 function selectOcrModel(value: string): void {
+  console.info("[ModelManagerPage] selectOcrModel: user selected", { value });
   if (value.startsWith(UNCONFIGURED_OCR_PREFIX)) {
+    console.warn("[ModelManagerPage] selectOcrModel: unconfigured type selected", { value });
     setSettingsFeedback("error", "该模型类型尚未配置路径，请点击“配置路径…”设置。");
     return;
   }
@@ -340,6 +370,7 @@ function selectOcrModel(value: string): void {
 }
 
 function openModelDialog(mode: Exclude<ModelDialogMode, null>): void {
+  console.info("[ModelManagerPage] openModelDialog: user opened dialog", { mode });
   dialogTranslationPath.value = "";
   dialogOcrDetectorPath.value = "";
   dialogOcrRecognizerPath.value = "";
@@ -550,7 +581,9 @@ function parseStopStrings(): string[] | null {
 }
 
 async function saveModelSettings() {
+  console.info("[ModelManagerPage] saveModelSettings: user triggered save", { detectorPath: modelDetectorPath.value, recognizerPath: modelRecognizerPath.value, hyPath: modelHyPath.value, device: device.value });
   if (!isDesktopRuntime) {
+    console.warn("[ModelManagerPage] saveModelSettings: not in Tauri");
     setSettingsFeedback("warning", "模型设置仅在 Tauri 桌面端可保存。");
     return;
   }
@@ -627,10 +660,11 @@ async function saveModelSettings() {
   // 保留当前的语言与提示词，不在此页修改
   const status = backendStatus.value;
   if (!status) {
+    console.error("[ModelManagerPage] saveModelSettings: backend status not ready");
     setSettingsFeedback("error", "后端状态未就绪，请先刷新。");
     return;
   }
-
+  console.debug("[ModelManagerPage] saveModelSettings: params validated", { idleUnloadSeconds: idleUnloadSeconds.value, regionParallelism: regionParallelism.value });
   const settings: BackendSettingsUpdate = {
     detectorModelDir,
     recognizerModelDir,
@@ -663,9 +697,13 @@ async function saveModelSettings() {
     },
   };
 
+  console.debug("[ModelManagerPage] saveModelSettings: sending to backend", { settings });
+  const t0 = Date.now();
   settingsLoading.value = true;
   try {
     const nextStatus = await updateBackendSettings(settings);
+    const duration = Date.now() - t0;
+    console.info("[ModelManagerPage] saveModelSettings: success", { durationMs: duration, ready: nextStatus.ready });
     applyBackendStatus(nextStatus);
     setSettingsFeedback(
       "success",
@@ -674,6 +712,8 @@ async function saveModelSettings() {
         : "设置已保存，下一次翻译会使用新的参数。",
     );
   } catch (error) {
+    const duration = Date.now() - t0;
+    console.error("[ModelManagerPage] saveModelSettings: failed", { durationMs: duration, error: error instanceof Error ? error.message : String(error) });
     setSettingsFeedback("error", error instanceof Error ? error.message : "无法保存模型设置。");
   } finally {
     settingsLoading.value = false;
@@ -685,6 +725,7 @@ let downloadProgressUnlisten: (() => void) | undefined;
 let mockTimers = new Map<string, ReturnType<typeof setInterval>>();
 
 function handleDownloadProgress(payload: { modelId: string; source: DownloadSource; progress: number; downloadedBytes: number; totalBytes: number; status: string; message?: string }) {
+  console.debug("[ModelManagerPage] handleDownloadProgress: event", { modelId: payload.modelId, status: payload.status, progress: payload.progress, downloaded: payload.downloadedBytes, total: payload.totalBytes });
   const statusMap: Record<string, DownloadTaskState["status"]> = {
     downloading: "downloading",
     completed: "completed",
@@ -703,17 +744,27 @@ function handleDownloadProgress(payload: { modelId: string; source: DownloadSour
     message: payload.message,
   };
   if (normalizedStatus === "completed") {
+    console.info("[ModelManagerPage] handleDownloadProgress: completed", { modelId: payload.modelId, totalBytes: payload.totalBytes });
     setSettingsFeedback("success", `模型 ${payload.modelId} 下载完成，已落盘。`);
     void loadModelCatalog();
     void refreshBackendStatus(false);
     void refreshDownloaded();
   } else if (normalizedStatus === "error") {
+    console.error("[ModelManagerPage] handleDownloadProgress: error", { modelId: payload.modelId, message: payload.message });
     setSettingsFeedback("error", payload.message || `模型 ${payload.modelId} 下载失败。`);
+  } else if (normalizedStatus === "downloading") {
+    if (payload.progress % 20 === 0 || payload.progress === 100) {
+      console.debug("[ModelManagerPage] handleDownloadProgress: downloading", { modelId: payload.modelId, progress: payload.progress });
+    }
   }
 }
 
 async function handleDownload(modelId: string) {
-  if (downloadTasks.value[modelId]?.status === "downloading") return;
+  console.info("[ModelManagerPage] handleDownload: user requested download", { modelId, source: downloadSource.value, currentStatus: downloadTasks.value[modelId]?.status });
+  if (downloadTasks.value[modelId]?.status === "downloading") {
+    console.warn("[ModelManagerPage] handleDownload: already downloading, ignored", { modelId });
+    return;
+  }
   if (!isDesktopRuntime) {
     let progress = 0;
     downloadTasks.value[modelId] = {
@@ -755,15 +806,19 @@ async function handleDownload(modelId: string) {
     return;
   }
   try {
+    console.debug("[ModelManagerPage] handleDownload: starting via backend", { modelId, source: downloadSource.value });
     const state = await startModelDownload(modelId, downloadSource.value);
     downloadTasks.value[modelId] = state;
+    console.info("[ModelManagerPage] handleDownload: started", { modelId, source: downloadSource.value, progress: state.progress });
     setSettingsFeedback("info", `已开始从 ${downloadSource.value === "modelscope" ? "ModelScope" : "Hugging Face"} 下载 ${modelId}。`);
   } catch (error) {
+    console.error("[ModelManagerPage] handleDownload: failed to start", { modelId, error: error instanceof Error ? error.message : String(error) });
     setSettingsFeedback("error", error instanceof Error ? error.message : "无法开始下载。");
   }
 }
 
 async function handleCancelDownload(modelId: string) {
+  console.info("[ModelManagerPage] handleCancelDownload: user requested cancel", { modelId, status: downloadTasks.value[modelId]?.status });
   const timer = mockTimers.get(modelId);
   if (timer) {
     clearInterval(timer);
@@ -777,34 +832,44 @@ async function handleCancelDownload(modelId: string) {
       totalBytes: 100,
       message: "已取消",
     };
+    console.info("[ModelManagerPage] handleCancelDownload: mock cancelled", { modelId });
     setSettingsFeedback("info", `已取消下载 ${modelId}。`);
     return;
   }
   try {
+    console.debug("[ModelManagerPage] handleCancelDownload: cancelling via backend", { modelId });
     await cancelModelDownload(modelId);
     const existing = downloadTasks.value[modelId];
     if (existing) {
       downloadTasks.value[modelId] = { ...existing, status: "cancelled", message: "已取消" };
     }
+    console.info("[ModelManagerPage] handleCancelDownload: cancelled", { modelId });
     setSettingsFeedback("info", `已取消下载 ${modelId}。`);
   } catch (error) {
+    console.error("[ModelManagerPage] handleCancelDownload: failed", { modelId, error: error instanceof Error ? error.message : String(error) });
     setSettingsFeedback("error", error instanceof Error ? error.message : "取消失败。");
   }
 }
 async function handleDeleteModel(modelId: string): Promise<void> {
+  console.info("[ModelManagerPage] handleDeleteModel: user requested delete", { modelId, isDownloaded: isDownloaded(modelId), isInstalled: isModelInstalled(modelId) });
   if (!isDownloaded(modelId)) {
+    console.warn("[ModelManagerPage] handleDeleteModel: not downloaded", { modelId });
     setSettingsFeedback("error", "该模型尚未下载，无需删除");
     return;
   }
   if (isModelInstalled(modelId)) {
+    console.warn("[ModelManagerPage] handleDeleteModel: is active model, blocked", { modelId });
     setSettingsFeedback("error", "该模型当前已启用，请先切换到其他模型后再删除");
     return;
   }
   const task = downloadTasks.value[modelId];
   if (task?.status === "downloading") {
+    console.warn("[ModelManagerPage] handleDeleteModel: downloading, blocked", { modelId });
     setSettingsFeedback("error", "模型正在下载中，请先取消后再删除");
     return;
   }
+  console.debug("[ModelManagerPage] handleDeleteModel: deleting", { modelId });
+  const t0 = Date.now();
   settingsLoading.value = true;
   try {
     await deleteDownloadedModel(modelId);
@@ -813,29 +878,38 @@ async function handleDeleteModel(modelId: string): Promise<void> {
     if (downloadTasks.value[modelId]) {
       delete downloadTasks.value[modelId];
     }
+    const duration = Date.now() - t0;
+    console.info("[ModelManagerPage] handleDeleteModel: success", { modelId, durationMs: duration });
     setSettingsFeedback("success", `已删除模型 ${modelId}`);
   } catch (error) {
+    const duration = Date.now() - t0;
+    console.error("[ModelManagerPage] handleDeleteModel: failed", { modelId, durationMs: duration, error: error instanceof Error ? error.message : String(error) });
     setSettingsFeedback("error", error instanceof Error ? error.message : `删除失败 ${modelId}`);
   } finally {
     settingsLoading.value = false;
   }
 }
 onMounted(async () => {
+  console.info("[ModelManagerPage] onMounted: initializing", { hasBackendStatus: !!backendStatus.value, isDesktopRuntime });
   if (backendStatus.value) {
+    console.debug("[ModelManagerPage] onMounted: applying existing backend status");
     applyBackendStatus(backendStatus.value);
   }
   void loadModelCatalog();
   void refreshBackendStatus(false);
   void refreshDownloaded();
+  console.debug("[ModelManagerPage] onMounted: triggered load + refresh + downloaded");
   try {
     downloadProgressUnlisten = await listenDownloadProgress(handleDownloadProgress);
-  } catch {
-    // 浏览器预览无事件
+    console.info("[ModelManagerPage] onMounted: download progress listener attached");
+  } catch (error) {
+    console.warn("[ModelManagerPage] onMounted: download listener failed (browser preview)", { error: error instanceof Error ? error.message : String(error) });
   }
 });
 
 
 onBeforeUnmount(() => {
+  console.debug("[ModelManagerPage] onBeforeUnmount: cleaning up");
   downloadProgressUnlisten?.();
   mockTimers.forEach((timer) => clearInterval(timer));
   mockTimers.clear();

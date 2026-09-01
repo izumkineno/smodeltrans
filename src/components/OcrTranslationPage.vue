@@ -163,7 +163,9 @@ function clearProgressListener() {
 }
 
 async function selectFile(file: File | undefined) {
+  console.info("[OcrTranslationPage] selectFile: user selected file", { fileName: file?.name, fileSize: file?.size, fileType: file?.type });
   if (!file) {
+    console.debug("[OcrTranslationPage] selectFile: no file provided");
     return;
   }
 
@@ -172,8 +174,10 @@ async function selectFile(file: File | undefined) {
   activeController.value = null;
   clearProgressListener();
 
+  console.debug("[OcrTranslationPage] selectFile: validating", { name: file.name, size: file.size, type: file.type });
   const validationMessage = validateImageFile(file);
   if (validationMessage) {
+    console.warn("[OcrTranslationPage] selectFile: validation failed", { fileName: file.name, size: file.size, error: validationMessage });
     releaseImagePreview(previewUrl.value);
     selectedFile.value = null;
     previewUrl.value = null;
@@ -187,13 +191,18 @@ async function selectFile(file: File | undefined) {
     return;
   }
 
+  console.debug("[OcrTranslationPage] selectFile: creating preview", { fileName: file.name });
+  const t0 = Date.now();
   const nextPreviewUrl = createImagePreview(file);
   const previewValidationMessage = await validateImagePreview(nextPreviewUrl);
+  const decodeDuration = Date.now() - t0;
   if (currentSelection !== selectionVersion) {
+    console.debug("[OcrTranslationPage] selectFile: superseded by newer selection", { fileName: file.name, version: currentSelection });
     releaseImagePreview(nextPreviewUrl);
     return;
   }
   if (previewValidationMessage) {
+    console.error("[OcrTranslationPage] selectFile: preview validation failed", { fileName: file.name, error: previewValidationMessage, durationMs: decodeDuration });
     releaseImagePreview(nextPreviewUrl);
     releaseImagePreview(previewUrl.value);
     selectedFile.value = null;
@@ -207,6 +216,7 @@ async function selectFile(file: File | undefined) {
     setErrorState(previewValidationMessage);
     return;
   }
+  console.info("[OcrTranslationPage] selectFile: preview decoded", { fileName: file.name, size: file.size, durationMs: decodeDuration, previewUrlLen: nextPreviewUrl.length });
 
   releaseImagePreview(previewUrl.value);
   selectedFile.value = file;
@@ -219,10 +229,12 @@ async function selectFile(file: File | undefined) {
   errorMessage.value = "";
   actionFeedback.value = "";
   workflowState.value = "preview";
+  console.info("[OcrTranslationPage] selectFile: file ready for translation", { fileName: file.name, size: file.size, workflowState: workflowState.value });
   setStatusToast("success", `${file.name} 已准备好翻译。`);
 }
 
 function handlePreviewError() {
+  console.error("[OcrTranslationPage] handlePreviewError: preview failed to render", { fileName: selectedFile.value?.name, hadPreview: !!previewUrl.value });
   selectionVersion += 1;
   activeController.value?.abort();
   activeController.value = null;
@@ -242,7 +254,9 @@ function handlePreviewError() {
 
 function handleFileInput(event: Event) {
   const input = event.currentTarget as HTMLInputElement;
-  void selectFile(input.files?.[0]);
+  const file = input.files?.[0];
+  console.info("[OcrTranslationPage] handleFileInput: user picked file via input", { fileName: file?.name, fileSize: file?.size });
+  void selectFile(file);
   input.value = "";
 }
 
@@ -258,16 +272,21 @@ function handleDragLeave() {
 function handleDrop(event: DragEvent) {
   event.preventDefault();
   isDragActive.value = false;
-  void selectFile(event.dataTransfer?.files[0]);
+  const file = event.dataTransfer?.files[0];
+  console.info("[OcrTranslationPage] handleDrop: user dropped file", { fileName: file?.name, fileSize: file?.size, type: file?.type });
+  void selectFile(file);
 }
 
 function openFilePicker() {
+  console.info("[OcrTranslationPage] openFilePicker: user opened file picker");
   fileInput.value?.click();
 }
 
 async function startTranslation() {
+  console.info("[OcrTranslationPage] startTranslation: user triggered", { fileName: selectedFile.value?.name, fileSize: selectedFile.value?.size, targetLanguage: targetLanguage.value, canStart: canStartTranslation.value });
   const file = selectedFile.value;
   if (!file || !canStartTranslation.value) {
+    console.warn("[OcrTranslationPage] startTranslation: cannot start", { hasFile: !!file, canStart: canStartTranslation.value, workflowState: workflowState.value });
     return;
   }
 
@@ -285,6 +304,9 @@ async function startTranslation() {
   clearProgressListener();
   processingProgress.value = 0;
   const requestId = createTranslationRequestId();
+  console.info("[OcrTranslationPage] startTranslation: request created", { requestId, fileName: file.name, fileSize: file.size, targetLanguage: targetLanguage.value });
+  console.debug("[OcrTranslationPage] startTranslation: params", { requestId, fileType: file.type, isDesktopRuntime });
+  const t0 = Date.now();
 
   try {
     if (isDesktopRuntime) {
@@ -311,6 +333,7 @@ async function startTranslation() {
     );
 
     if (controller.signal.aborted || activeController.value !== controller) {
+      console.warn("[OcrTranslationPage] startTranslation: aborted after provider", { requestId, aborted: controller.signal.aborted, durationMs: Date.now() - t0 });
       if (activeController.value === controller && controller.signal.aborted) {
         workflowState.value = "cancelled";
         statusMessage.value = "翻译已取消，图片预览仍可用。";
@@ -318,6 +341,8 @@ async function startTranslation() {
       return;
     }
 
+    const duration = Date.now() - t0;
+    console.info("[OcrTranslationPage] startTranslation: success", { requestId, fileName: file.name, fileSize: file.size, targetLanguage: targetLanguage.value, durationMs: duration, backendDurationMs: translation.durationMs, isTranslated: translation.isTranslated, resultLen: translation.text.length, providerLabel: translation.providerLabel, hasAnnotated: !!translation.annotatedImageDataUrl });
     resultText.value = translation.text;
     annotatedResultUrl.value = translation.annotatedImageDataUrl;
     providerLabel.value = translation.providerLabel;
@@ -332,7 +357,9 @@ async function startTranslation() {
         : "PP-OCR 识别结果已准备好；Hy 翻译需要 CUDA。",
     );
   } catch (error) {
+    const duration = Date.now() - t0;
     if (controller.signal.aborted || isTranslationCancellation(error)) {
+      console.info("[OcrTranslationPage] startTranslation: cancelled", { requestId, durationMs: duration });
       if (activeController.value === controller) {
         workflowState.value = "cancelled";
         statusMessage.value = "翻译已取消，图片预览仍可用。";
@@ -340,8 +367,10 @@ async function startTranslation() {
       return;
     }
     if (activeController.value !== controller) {
+      console.debug("[OcrTranslationPage] startTranslation: stale controller ignoring error", { requestId });
       return;
     }
+    console.error("[OcrTranslationPage] startTranslation: failed", { requestId, durationMs: duration, fileName: file.name, error: error instanceof Error ? error.message : String(error) });
     setErrorState(
       error instanceof Error
         ? error.message
@@ -359,17 +388,21 @@ async function startTranslation() {
 }
 
 function cancelTranslation() {
+  console.info("[OcrTranslationPage] cancelTranslation: user triggered cancel", { hasController: !!activeController.value, workflowState: workflowState.value, fileName: selectedFile.value?.name });
   if (!activeController.value) {
+    console.debug("[OcrTranslationPage] cancelTranslation: no active controller");
     return;
   }
   activeController.value.abort();
   clearProgressListener();
   processingProgress.value = 0;
   workflowState.value = "cancelled";
+  console.info("[OcrTranslationPage] cancelTranslation: cancelled");
   setStatusToast("warning", "翻译已取消，图片预览仍可用。");
 }
 
 function resetWorkflow() {
+  console.info("[OcrTranslationPage] resetWorkflow: user reset workspace", { hadFile: !!selectedFile.value, workflowState: workflowState.value });
   selectionVersion += 1;
   activeController.value?.abort();
   activeController.value = null;
@@ -391,37 +424,49 @@ function resetWorkflow() {
 }
 
 async function copyResult() {
+  console.info("[OcrTranslationPage] copyResult: user triggered copy", { hasResult: !!resultText.value, len: resultText.value?.length ?? 0, isTranslated: resultIsTranslated.value });
   if (!resultText.value) {
+    console.debug("[OcrTranslationPage] copyResult: no result");
     return;
   }
   try {
     await copyTranslationText(resultText.value);
+    console.info("[OcrTranslationPage] copyResult: success", { len: resultText.value.length });
     setActionFeedback("success", "结果已复制到剪贴板。");
-  } catch {
+  } catch (error) {
+    console.error("[OcrTranslationPage] copyResult: failed", { error: error instanceof Error ? error.message : String(error) });
     setActionFeedback("error", "剪贴板不可用，请手动选择文本进行复制。");
   }
 }
 
 function saveResult() {
+  console.info("[OcrTranslationPage] saveResult: user triggered save", { hasResult: !!resultText.value, fileName: selectedFile.value?.name, len: resultText.value?.length ?? 0 });
   if (!resultText.value || !selectedFile.value) {
+    console.debug("[OcrTranslationPage] saveResult: missing result or file");
     return;
   }
   try {
     saveTranslationText(resultText.value, selectedFile.value.name);
+    console.info("[OcrTranslationPage] saveResult: saved", { fileName: selectedFile.value.name, len: resultText.value.length });
     setActionFeedback("success", "结果已保存为文本文件。");
-  } catch {
+  } catch (error) {
+    console.error("[OcrTranslationPage] saveResult: failed", { error: error instanceof Error ? error.message : String(error) });
     setActionFeedback("error", "结果无法保存，请从结果面板重试。");
   }
 }
 
 function saveAnnotatedImage() {
+  console.info("[OcrTranslationPage] saveAnnotatedImage: user triggered save", { hasAnnotated: !!annotatedResultUrl.value, fileName: selectedFile.value?.name });
   if (!annotatedResultUrl.value || !selectedFile.value) {
+    console.debug("[OcrTranslationPage] saveAnnotatedImage: missing annotated image");
     return;
   }
   try {
     saveImageDataUrl(annotatedResultUrl.value, selectedFile.value.name);
+    console.info("[OcrTranslationPage] saveAnnotatedImage: saved", { fileName: selectedFile.value.name });
     setActionFeedback("success", "标注图片已保存。");
-  } catch {
+  } catch (error) {
+    console.error("[OcrTranslationPage] saveAnnotatedImage: failed", { error: error instanceof Error ? error.message : String(error) });
     setActionFeedback("error", "标注图片无法保存，请重试。");
   }
 }
@@ -495,6 +540,7 @@ function clipboardFileFromEvent(event: ClipboardEvent): File | null {
 }
 
 async function readTauriClipboardImage(): Promise<File> {
+  console.info("[OcrTranslationPage] readTauriClipboardImage: reading clipboard image via Tauri");
   const image = await readImage();
   const [rgba, size] = await Promise.all([image.rgba(), image.size()]);
   const canvas = document.createElement("canvas");
@@ -518,12 +564,16 @@ async function readTauriClipboardImage(): Promise<File> {
       }
     }, "image/png");
   });
-  return new File([blob], `clipboard-${Date.now()}.png`, { type: "image/png" });
+  const file = new File([blob], `clipboard-${Date.now()}.png`, { type: "image/png" });
+  console.info("[OcrTranslationPage] readTauriClipboardImage: decoded", { size: file.size, width: size.width, height: size.height });
+  return file;
 }
 
 async function handlePaste(event: ClipboardEvent) {
+  console.debug("[OcrTranslationPage] handlePaste: paste event", { types: Array.from(event.clipboardData?.types ?? []) });
   const webFile = clipboardFileFromEvent(event);
   if (webFile) {
+    console.info("[OcrTranslationPage] handlePaste: web clipboard image found", { fileName: webFile.name, size: webFile.size, type: webFile.type });
     event.preventDefault();
     await selectFile(webFile);
     return;
@@ -539,25 +589,32 @@ async function handlePaste(event: ClipboardEvent) {
   if (!mayContainImage) {
     return;
   }
+  console.debug("[OcrTranslationPage] handlePaste: trying Tauri clipboard");
   event.preventDefault();
   try {
-    await selectFile(await readTauriClipboardImage());
-  } catch {
+    const file = await readTauriClipboardImage();
+    console.info("[OcrTranslationPage] handlePaste: Tauri clipboard success", { fileName: file.name, size: file.size });
+    await selectFile(file);
+  } catch (error) {
+    console.warn("[OcrTranslationPage] handlePaste: no image in clipboard", { error: error instanceof Error ? error.message : String(error) });
     setActionFeedback("warning", "剪贴板中没有可读取的图片。");
   }
 }
 
 onActivated(() => {
+  console.info("[OcrTranslationPage] onActivated: page activated", { isDesktopRuntime });
   window.addEventListener("paste", handlePaste);
   addImagePreviewWheelListener();
 });
 
 onDeactivated(() => {
+  console.debug("[OcrTranslationPage] onDeactivated: page deactivated");
   window.removeEventListener("paste", handlePaste);
   removeImagePreviewWheelListener();
 });
 
 onBeforeUnmount(() => {
+  console.debug("[OcrTranslationPage] onBeforeUnmount: cleaning up", { hasController: !!activeController.value, hasPreview: !!previewUrl.value });
   selectionVersion += 1;
   activeController.value?.abort();
   activeController.value = null;
