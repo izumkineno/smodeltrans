@@ -39,6 +39,57 @@ fn require_flash_attn() -> Result<()> {
     Ok(())
 }
 
+fn dtype_hint(message: &str) -> String {
+    // 从 "unknown dtype for tensor 40" 提取数字并映射到 GGML_TYPE 名，便于用户自查
+    let dtype_id = message
+        .split("unknown dtype for tensor")
+        .nth(1)
+        .and_then(|tail| tail.trim().split_whitespace().next())
+        .and_then(|num| num.parse::<u32>().ok());
+    let Some(id) = dtype_id else {
+        return String::new();
+    };
+    let name = match id {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        6 => "Q5_0",
+        7 => "Q5_1",
+        8 => "Q8_0",
+        9 => "Q8_1",
+        10 => "Q2K",
+        11 => "Q3K",
+        12 => "Q4K",
+        13 => "Q5K",
+        14 => "Q6K",
+        15 => "Q8K",
+        16 => "IQ2_XXS",
+        17 => "IQ2_XS",
+        18 => "IQ3_XXS",
+        19 => "IQ1_S",
+        20 => "IQ4_NL",
+        21 => "IQ3_S",
+        22 => "IQ2_S",
+        23 => "IQ4_XS",
+        24 => "I8",
+        25 => "I16",
+        26 => "I32",
+        27 => "I64",
+        28 => "F64",
+        29 => "IQ1_M",
+        30 => "BF16",
+        34 => "TQ1_0",
+        35 => "TQ2_0",
+        39 => "MXFP4",
+        40 => "NVFP4",
+        41 => "Q1_0",
+        42 => "Q2_0",
+        _ => "UNKNOWN",
+    };
+    format!("（dtype={id} {name}）")
+}
+
 fn format_duration(duration: Duration) -> String {
     if duration.as_secs_f64() >= 1.0 {
         format!("{:.2}s", duration.as_secs_f64())
@@ -1082,14 +1133,40 @@ impl HySession {
         );
         require_flash_attn()?;
         let mut reader = BufReader::new(File::open(model_path)?);
-        let content = Content::read(&mut reader)?;
+        let content = Content::read(&mut reader).map_err(|error| {
+            let message = error.to_string();
+            if message.contains("unknown dtype") {
+                let hint = dtype_hint(&message);
+                anyhow::anyhow!(
+                    "{}; 该 GGUF 使用了 Candle 0.11 尚未支持的量化类型{}，请改用模型下载列表中的 Q4_K_M / Q6_K / Q8_0（文件路径：{}）",
+                    message,
+                    hint,
+                    model_path.display()
+                )
+            } else {
+                anyhow::Error::from(error)
+            }
+        })?;
         let embedding_length =
             metadata(&content, "hunyuan-dense.embedding_length")?.to_u32()? as usize;
         validate_vocab_metadata(&content, embedding_length)?;
         let tokenizer = candle_core::quantized::tokenizer::TokenizerFromGguf::from_gguf(&content)?;
         let context_length = metadata(&content, "hunyuan-dense.context_length")?.to_u32()? as usize;
         anyhow::ensure!(context_length > 0, "GGUF context length must be positive");
-        let model = ModelWeights::from_gguf(&content, &mut reader, device, context_length)?;
+        let model = ModelWeights::from_gguf(&content, &mut reader, device, context_length).map_err(|error| {
+            let message = error.to_string();
+            if message.contains("unknown dtype") {
+                let hint = dtype_hint(&message);
+                anyhow::anyhow!(
+                    "{}; 该 GGUF 的量化类型{}不受支持，请改用 Q4_K_M / Q6_K / Q8_0（{}）",
+                    message,
+                    hint,
+                    model_path.display()
+                )
+            } else {
+                error
+            }
+        })?;
         Ok(Self {
             tokenizer,
             model,

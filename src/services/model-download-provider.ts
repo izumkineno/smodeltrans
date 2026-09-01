@@ -92,38 +92,6 @@ export const MODELSCOPE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
     kind: "translation",
   },
   {
-    id: "hy-mt2-1.8b-2bit",
-    name: "Hy-MT2 1.8B 2Bit",
-    description: "超低比特极致压缩，ModelScope: Tencent-Hunyuan/Hy-MT2-1.8B-2bit-GGUF",
-    repoId: "Tencent-Hunyuan/Hy-MT2-1.8B-2bit-GGUF",
-    files: ["Hy-MT2-1.8B-2Bit.gguf"],
-    fileSpecs: [
-      {
-        repoId: "Tencent-Hunyuan/Hy-MT2-1.8B-2bit-GGUF",
-        file: "Hy-MT2-1.8B-2Bit.gguf",
-        dest: "Hy-MT2-1.8B-2Bit.gguf",
-      },
-    ],
-    sizeText: "~573 MB",
-    kind: "translation",
-  },
-  {
-    id: "hy-mt2-1.8b-1.25bit",
-    name: "Hy-MT2 1.8B 1.25Bit",
-    description: "1.25bit 极致量化仅 440MB，推理提速 1.5x，ModelScope: Tencent-Hunyuan/Hy-MT2-1.8B-1.25bit-GGUF",
-    repoId: "Tencent-Hunyuan/Hy-MT2-1.8B-1.25bit-GGUF",
-    files: ["Hy-MT2-1.8B-1.25Bit.gguf"],
-    fileSpecs: [
-      {
-        repoId: "Tencent-Hunyuan/Hy-MT2-1.8B-1.25bit-GGUF",
-        file: "Hy-MT2-1.8B-1.25Bit.gguf",
-        dest: "Hy-MT2-1.8B-1.25Bit.gguf",
-      },
-    ],
-    sizeText: "~440 MB",
-    kind: "translation",
-  },
-  {
     id: "hy-mt2-7b-q4",
     name: "Hy-MT2 7B Q4_K_M",
     description: "7B 多语言翻译核心，性能超越 DeepSeek/Kimi，ModelScope: Tencent-Hunyuan/Hy-MT2-7B-GGUF",
