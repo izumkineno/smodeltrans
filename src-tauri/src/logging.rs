@@ -40,7 +40,37 @@ pub fn prepare_log_directory(dir: &Path) -> Result<(), String> {
     if latest.exists() {
         let _ = fs::remove_file(&latest);
     }
+    // 启动前滚动：仅保留最近 2 个旧会话，预留本次会话后共 3 个
+    retain_latest_session_logs(dir, 2);
     Ok(())
+}
+
+fn retain_latest_session_logs(dir: &Path, keep: usize) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut logs: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_owned();
+            if !name.starts_with("smodeltrans-") || !name.ends_with(".log") || name == "latest.log" {
+                return None;
+            }
+            // 仅统计 smodeltrans-*.log 会话文件
+            Some(name)
+        })
+        .collect();
+    if logs.len() <= keep {
+        return;
+    }
+    // 文件名含 YYYYMMDD-HHMMSS 时间戳，字典序即时间序
+    logs.sort_unstable_by(|a, b| b.cmp(a));
+    for name in logs.into_iter().skip(keep) {
+        let path = dir.join(&name);
+        let _ = fs::remove_file(&path);
+        tracing::debug!(target: "app::logging", file = %name, "滚动清理旧会话日志");
+    }
 }
 
 pub fn build_session_log_file_name() -> String {
@@ -73,7 +103,7 @@ pub fn init_tracing(log_directory: PathBuf, session_file_name: String) {
         .with_writer(std::io::stdout);
 
     // 会话文件层：无颜色
-    let session_appender = rolling::never(&log_directory, session_file_name);
+    let session_appender = rolling::never(&log_directory, session_file_name.clone());
     let (session_writer, session_guard) = tracing_appender::non_blocking(session_appender);
     let session_layer = tracing_subscriber::fmt::layer()
         .with_timer(timer.clone())
@@ -101,8 +131,11 @@ pub fn init_tracing(log_directory: PathBuf, session_file_name: String) {
             tracing::info!(
                 target: "app::logging",
                 dir = %log_directory.display(),
+                session = %session_file_name,
                 "tracing 初始化完成"
             );
+            // 会话文件已落盘（首条日志触发创建），滚动保留最近 3 次启动
+            retain_latest_session_logs(&log_directory, 3);
         }
         Err(e) => {
             // OnceLock 已初始化或重复 init，保留 guard 防止丢失
