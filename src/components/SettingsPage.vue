@@ -1,16 +1,18 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
+import { open as openNativeDialog } from "@tauri-apps/plugin-dialog";
 import {
   NAlert,
   NButton,
   NCard,
   NInput,
+  NModal,
   NSelect,
-  NTag,
+  NTooltip,
   useMessage,
 } from "naive-ui";
-import { updateBackendSettings } from "../services/translation-provider";
-import type { BackendSettingsUpdate, BackendStatus } from "../services/translation-provider";
+import { getModelCatalog, saveModelCatalog, updateBackendSettings } from "../services/translation-provider";
+import type { BackendSettingsUpdate, BackendStatus, ModelCatalogOptions, ModelCatalogUpdate } from "../services/translation-provider";
 import {
   applySharedBackendStatus,
   backendStatus,
@@ -21,14 +23,22 @@ import {
 import { setThemeMode, themeMode } from "../services/theme-settings";
 import type { ThemeMode } from "../services/theme-settings";
 import { showWorkspaceToast, type WorkspaceToastType } from "../services/workspace-toast";
+import { isSupportedTargetLanguage } from "../constants/targetLanguageOptions";
 import OpenAiCompatCard from "./OpenAiCompatCard.vue";
-type TagType = "default" | "success" | "warning" | "error" | "info";
+import TargetLanguageSelect from "./TargetLanguageSelect.vue";
 
 const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const promptTemplate = ref("");
 const settingsMessage = ref("");
 const settingsMessageType = ref<WorkspaceToastType>("info");
 const settingsLoading = ref(false);
+const modelFontPath = ref<string | null>(null);
+const modelCatalog = ref<ModelCatalogOptions>({ translation: [], ocr: [], fonts: [] });
+const catalogLoaded = ref(false);
+const dialogSaving = ref(false);
+const dialogName = ref("");
+const dialogFontPath = ref("");
+const fontDialogOpen = ref(false);
 const themeModeOptions: Array<{ label: string; value: ThemeMode }> = [
   { label: "自动（跟随系统）", value: "system" },
   { label: "浅色（手动）", value: "light" },
@@ -39,47 +49,118 @@ const themeModeLabels: Record<ThemeMode, string> = {
   light: "浅色（手动）",
   dark: "深色（手动）",
 };
-const targetLanguageOptions: Array<{ label: string; value: string }> = [
-  { label: "中文 (Chinese · zh)", value: "Chinese" },
-  { label: "英语 (English · en)", value: "English" },
-  { label: "法语 (French · fr)", value: "French" },
-  { label: "葡萄牙语 (Portuguese · pt)", value: "Portuguese" },
-  { label: "西班牙语 (Spanish · es)", value: "Spanish" },
-  { label: "日语 (Japanese · ja)", value: "Japanese" },
-  { label: "土耳其语 (Turkish · tr)", value: "Turkish" },
-  { label: "俄语 (Russian · ru)", value: "Russian" },
-  { label: "阿拉伯语 (Arabic · ar)", value: "Arabic" },
-  { label: "韩语 (Korean · ko)", value: "Korean" },
-  { label: "泰语 (Thai · th)", value: "Thai" },
-  { label: "意大利语 (Italian · it)", value: "Italian" },
-  { label: "德语 (German · de)", value: "German" },
-  { label: "越南语 (Vietnamese · vi)", value: "Vietnamese" },
-  { label: "马来语 (Malay · ms)", value: "Malay" },
-  { label: "印尼语 (Indonesian · id)", value: "Indonesian" },
-  { label: "菲律宾语 (Filipino · tl)", value: "Filipino" },
-  { label: "印地语 (Hindi · hi)", value: "Hindi" },
-  { label: "繁体中文 (Traditional Chinese · zh-Hant)", value: "Traditional Chinese" },
-  { label: "波兰语 (Polish · pl)", value: "Polish" },
-  { label: "捷克语 (Czech · cs)", value: "Czech" },
-  { label: "荷兰语 (Dutch · nl)", value: "Dutch" },
-  { label: "高棉语 (Khmer · km)", value: "Khmer" },
-  { label: "缅甸语 (Burmese · my)", value: "Burmese" },
-  { label: "波斯语 (Persian · fa)", value: "Persian" },
-  { label: "古吉拉特语 (Gujarati · gu)", value: "Gujarati" },
-  { label: "乌尔都语 (Urdu · ur)", value: "Urdu" },
-  { label: "泰卢固语 (Telugu · te)", value: "Telugu" },
-  { label: "马拉地语 (Marathi · mr)", value: "Marathi" },
-  { label: "希伯来语 (Hebrew · he)", value: "Hebrew" },
-  { label: "孟加拉语 (Bengali · bn)", value: "Bengali" },
-  { label: "泰米尔语 (Tamil · ta)", value: "Tamil" },
-  { label: "乌克兰语 (Ukrainian · uk)", value: "Ukrainian" },
-  { label: "藏语 (Tibetan · bo)", value: "Tibetan" },
-  { label: "哈萨克语 (Kazakh · kk)", value: "Kazakh" },
-  { label: "蒙古语 (Mongolian · mn)", value: "Mongolian" },
-  { label: "维吾尔语 (Uyghur · ug)", value: "Uyghur" },
-  { label: "粤语 (Cantonese · yue)", value: "Cantonese" },
-];
 const toast = useMessage();
+
+function pathBaseName(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  const separator = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  return separator >= 0 ? trimmed.slice(separator + 1) : trimmed;
+}
+
+const SYSTEM_FONT_VALUE = "__system__";
+const fontModelOptions = computed(() => [
+  { label: "系统自动匹配", value: SYSTEM_FONT_VALUE },
+  ...modelCatalog.value.fonts.map((option) => ({
+    label: `${option.name}（${option.path ? pathBaseName(option.path) : ""}）`,
+    value: option.path ?? SYSTEM_FONT_VALUE,
+  })),
+]);
+const selectedFontValue = computed(() => modelFontPath.value ?? SYSTEM_FONT_VALUE);
+
+async function loadModelCatalog(): Promise<void> {
+  if (!isDesktopRuntime) {
+    catalogLoaded.value = true;
+    return;
+  }
+  try {
+    modelCatalog.value = await getModelCatalog();
+  } catch {
+    modelCatalog.value = { translation: [], ocr: [], fonts: [] };
+  } finally {
+    catalogLoaded.value = true;
+  }
+}
+
+function selectFontModel(value: string): void {
+  modelFontPath.value = value === SYSTEM_FONT_VALUE ? null : value;
+  setSettingsFeedback("info", "已选择标注字体，点击“保存设置”生效。");
+}
+
+function openFontDialog(): void {
+  dialogName.value = "";
+  dialogFontPath.value = "";
+  fontDialogOpen.value = true;
+}
+
+function closeFontDialog(): void {
+  fontDialogOpen.value = false;
+}
+
+async function pickDialogFontPath(): Promise<void> {
+  const selected = await openNativeDialog({
+    title: "选择标注字体",
+    defaultPath: dialogFontPath.value || undefined,
+    multiple: false,
+    filters: [{ name: "字体文件", extensions: ["ttf", "otf"] }],
+  });
+  if (typeof selected === "string" && selected.trim()) {
+    dialogFontPath.value = selected;
+  }
+}
+
+async function saveFontDialog(): Promise<void> {
+  if (dialogSaving.value) {
+    return;
+  }
+  if (!catalogLoaded.value) {
+    await loadModelCatalog();
+  }
+  const entryName = dialogName.value.trim();
+  if (!entryName) {
+    setSettingsFeedback("error", "请输入字体名称。");
+    return;
+  }
+  const path = dialogFontPath.value.trim();
+  if (!path) {
+    setSettingsFeedback("error", "请选择字体文件。");
+    return;
+  }
+  const next: ModelCatalogUpdate = {
+    translation: modelCatalog.value.translation.map((entry) => ({
+      name: entry.name,
+      path: entry.path,
+    })),
+    ocr: modelCatalog.value.ocr.map((entry) => ({
+      name: entry.name,
+      detectorDir: entry.detectorDir,
+      recognizerDir: entry.recognizerDir,
+    })),
+    fonts: modelCatalog.value.fonts
+      .filter((entry) => entry.path !== null)
+      .map((entry) => ({ name: entry.name, path: entry.path as string })),
+  };
+  const normalized = path.replace(/\\/g, "/").toLowerCase();
+  const exists = next.fonts.some((e) => e.path.replace(/\\/g, "/").toLowerCase() === normalized);
+  if (!exists) {
+    next.fonts.push({ name: entryName, path });
+  } else {
+    next.fonts = next.fonts.map((e) =>
+      e.path.replace(/\\/g, "/").toLowerCase() === normalized ? { name: entryName, path } : e,
+    );
+  }
+  dialogSaving.value = true;
+  try {
+    await saveModelCatalog(next);
+    await loadModelCatalog();
+    selectFontModel(dialogFontPath.value);
+    closeFontDialog();
+    setSettingsFeedback("success", `已配置「${entryName}」并选中，点击“保存设置”生效。`);
+  } catch (error) {
+    setSettingsFeedback("error", error instanceof Error ? error.message : "无法保存模型条目。");
+  } finally {
+    dialogSaving.value = false;
+  }
+}
 function setSettingsFeedback(
   type: WorkspaceToastType,
   message: string,
@@ -104,22 +185,10 @@ function handleThemeModeChange(nextMode: ThemeMode | null): void {
   setSettingsFeedback("success", `界面主题已切换为${themeModeLabels[nextMode]}。`, false);
 }
 
-const settingsTagType = computed<TagType>(() => {
-  if (!backendStatus.value) {
-    return "default";
-  }
-  return backendStatus.value.ready ? "success" : "warning";
-});
-
-const settingsStatusLabel = computed(() => {
-  if (!backendStatus.value) {
-    return isDesktopRuntime ? "读取中" : "浏览器预览";
-  }
-  return backendStatus.value.ready ? "模型已就绪" : "需要检查";
-});
 
 function applyBackendStatus(status: BackendStatus) {
   applySharedBackendStatus(status);
+  modelFontPath.value = status.fontPath ?? null;
   // targetLanguage is global ref, keep in sync
   if (status.targetLanguage) {
     targetLanguage.value = status.targetLanguage;
@@ -137,6 +206,7 @@ async function refreshBackendStatus(notify = true) {
   try {
     const status = await fetchSharedBackendStatus();
     applyBackendStatus(status);
+    void loadModelCatalog();
     setSettingsFeedback(status.ready ? "success" : "warning", status.message, notify);
   } catch (error) {
     setSettingsFeedback("error", error instanceof Error ? error.message : "无法读取后端状态。", notify);
@@ -146,11 +216,11 @@ async function refreshBackendStatus(notify = true) {
 }
 async function saveSettings() {
   const nextLanguage = targetLanguage.value.trim();
-  const isSupported = targetLanguageOptions.some((opt) => opt.value === nextLanguage);
-  if (!isSupported) {
+  if (!isSupportedTargetLanguage(nextLanguage)) {
     setSettingsFeedback("error", "目标语言不在 Hy-MT2 支持列表内，请从下拉选择（38 种）。");
     return;
   }
+
 
   const trimmedPromptTemplate = promptTemplate.value.trim();
   if (Array.from(trimmedPromptTemplate).length > 8192) {
@@ -179,7 +249,7 @@ async function saveSettings() {
     detectorModelDir: status.detectorModelDir,
     recognizerModelDir: status.recognizerModelDir,
     hyModel: status.hyModel,
-    fontPath: status.fontPath,
+    fontPath: modelFontPath.value?.trim() || null,
     targetLanguage: nextLanguage,
     device: status.device === "cpu" ? "cpu" : "cuda",
     regionParallelism: status.regionParallelism,
@@ -209,11 +279,11 @@ async function saveSettings() {
     settingsLoading.value = false;
   }
 }
-
 onMounted(() => {
   if (backendStatus.value) {
     applyBackendStatus(backendStatus.value);
   }
+  void loadModelCatalog();
   void refreshBackendStatus(false);
 });
 </script>
@@ -246,36 +316,37 @@ onMounted(() => {
       <n-card class="settings-card" :bordered="false">
         <div class="settings-card-heading">
           <div>
-            <p class="panel-kicker">运行状态</p>
-            <h2>模型服务</h2>
+            <p class="panel-kicker">Fonts</p>
+            <h2>标注字体</h2>
           </div>
-          <n-tag :type="settingsTagType" round size="small">{{ settingsStatusLabel }}</n-tag>
+          <n-button secondary size="small" @click="openFontDialog">导入字体…</n-button>
         </div>
-        <p class="settings-card-copy">
-          这里显示后端实际读取到的设备与模型状态，不会伪造就绪结果。详细模型与运行参数请前往“模型管理”配置。
+        <p class="settings-card-copy" style="margin-bottom: 12px">
+          用于图像翻译结果的文字标注字体；系统自动匹配为默认，导入后可在下拉中选择并保存生效。
         </p>
-        <div class="settings-metrics">
+        <dl class="settings-path-list" style="margin-top: 0">
           <div>
-            <span>设备</span>
-            <strong>{{ backendStatus?.device ?? "未读取" }}</strong>
+            <dt>当前字体</dt>
+            <dd class="settings-model-select-row">
+              <n-select
+                :value="selectedFontValue"
+                :options="fontModelOptions"
+                :placeholder="catalogLoaded ? '选择字体' : '加载字体列表…'"
+                size="small"
+                class="settings-model-select"
+                @update:value="selectFontModel"
+                aria-label="标注字体"
+              />
+              <n-tooltip v-if="modelFontPath" trigger="hover">
+                <template #trigger>
+                  <span class="settings-model-help" :title="modelFontPath" style="max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom">{{ modelFontPath }}</span>
+                </template>
+                {{ modelFontPath }}
+              </n-tooltip>
+              <span v-else class="settings-model-help">系统自动匹配</span>
+            </dd>
           </div>
-          <div>
-            <span>翻译器</span>
-            <strong>{{ backendStatus?.translatorLoaded ? "已加载" : "按需加载" }}</strong>
-          </div>
-          <div>
-            <span>OCR 并发</span>
-            <strong>{{ backendStatus?.regionParallelism ?? "—" }}</strong>
-          </div>
-          <div>
-            <span>Hy 批大小</span>
-            <strong>{{ backendStatus?.translationBatchSize ?? "—" }}</strong>
-          </div>
-        </div>
-        <p class="settings-card-copy">
-          模型路径、设备、批处理、空闲释放及生成参数已迁移至
-          <strong>模型管理</strong> 页面。
-        </p>
+        </dl>
       </n-card>
 
       <n-card class="settings-card settings-card-wide" :bordered="false">
@@ -287,19 +358,13 @@ onMounted(() => {
         </div>
         <p class="settings-card-copy">
           目标语言决定 Hy-MT2 的 <code>target_lang</code>（需使用<strong>完整语言名</strong>，English prompt 用英文名，中文 prompt 用中文名）。
-          本地翻译默认使用官方 Default 模板：<code>Translate the following text into {target_language}. Note that you should only output the translated result without any additional explanation:\n\n{source_text}</code>，
-          参考 <a href="https://github.com/Tencent-Hunyuan/Hy-MT2#hy-mt2-translation-task-instruction-examples-chinese-english-comparison" target="_blank">Hy-MT2 官方指令示例</a>。
+          本地翻译默认使用官方 Default 模板：<code>Translate the following text into {target_language}. Note that you should only output the translated result without any additional explanation:\n\n{source_text}</code>。
           单模板支持 <code>{source_text}</code> / <code>{target_lang}</code> / <code>{target_language}</code> / <code>{format_type}</code> 占位符。
         </p>
         <div class="settings-field-grid">
           <label class="settings-field">
             <span>目标语言</span>
-            <n-select
-              v-model:value="targetLanguage"
-              :options="targetLanguageOptions"
-              placeholder="选择目标语言（Hy-MT2 支持 38 种）"
-              aria-label="目标语言"
-            />
+            <TargetLanguageSelect v-model="targetLanguage" />
           </label>
           <span class="settings-help" style="grid-column: 1 / -1">仅支持 Hy-MT2 官方 38 语言，已自动归一化英文全称；不支持的语言将校验失败。</span>
           <label class="settings-field settings-field-wide settings-textarea">
@@ -318,7 +383,6 @@ onMounted(() => {
       </n-card>
 
       <OpenAiCompatCard />
-
       <div class="settings-card-actions settings-page-actions settings-card-wide">
         <n-alert v-if="settingsMessage" class="settings-actions-feedback" :type="settingsMessageType" :show-icon="false">
           {{ settingsMessage }}
@@ -327,6 +391,28 @@ onMounted(() => {
         <n-button type="primary" :loading="settingsLoading" @click="saveSettings">保存设置</n-button>
       </div>
     </div>
+    <n-modal
+      v-model:show="fontDialogOpen"
+      preset="card"
+      title="配置标注字体路径"
+      :mask-closable="true"
+      style="width: 520px; max-width: calc(100vw - 48px)"
+      class="model-path-dialog"
+    >
+      <div class="model-dialog-fields">
+        <n-input v-model:value="dialogName" maxlength="64" placeholder="字体名称（用于下拉框显示）" />
+        <div class="model-dialog-path-row">
+          <span class="model-dialog-path-value" :title="dialogFontPath">{{ dialogFontPath || "未选择" }}</span>
+          <n-button secondary size="small" @click="pickDialogFontPath">选择字体文件</n-button>
+        </div>
+      </div>
+      <template #footer>
+        <div class="model-dialog-footer">
+          <n-button secondary size="small" :disabled="dialogSaving" @click="closeFontDialog">取消</n-button>
+          <n-button type="primary" size="small" :loading="dialogSaving" @click="saveFontDialog">注册并选择</n-button>
+        </div>
+      </template>
+    </n-modal>
   </section>
 </template>
 <style scoped src="../styles/settings-page.css"></style>

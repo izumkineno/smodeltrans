@@ -23,6 +23,8 @@ import {
 } from "../services/translation-provider";
 import type { TranslationProgress } from "../services/translation-provider";
 import { targetLanguage } from "../services/workspace-settings";
+import { isSupportedTargetLanguage } from "../constants/targetLanguageOptions";
+import TargetLanguageSelect from "./TargetLanguageSelect.vue";
 import { showWorkspaceToast, type WorkspaceToastType } from "../services/workspace-toast";
 import {
   isQuickTranslationShortcutModifierCode,
@@ -147,11 +149,11 @@ function validateRequest(): { text: string; language: string } | null {
   }
 
   const language = targetLanguage.value.trim();
-  const languageLength = Array.from(language).length;
-  if (languageLength < 1 || languageLength > 64) {
-    errorMessage.value = "目标语言长度必须为 1 到 64 个字符。";
+  if (!isSupportedTargetLanguage(language)) {
+    errorMessage.value = "目标语言不在 Hy-MT2 支持列表内，请从下拉选择（38 种）。";
     return null;
   }
+
 
   return { text, language };
 }
@@ -457,14 +459,9 @@ onBeforeUnmount(() => {
         <div class="text-options">
           <label class="text-option-field">
             <span>目标语言</span>
-            <n-input
-              v-model:value="targetLanguage"
-              maxlength="64"
-              placeholder="例如：Chinese"
-              aria-label="文本翻译目标语言"
-            />
+            <TargetLanguageSelect v-model="targetLanguage" aria-label="文本翻译目标语言" />
           </label>
-          <p class="text-option-help">支持自然语言名称，例如 Chinese、English、Japanese。</p>
+          <p class="text-option-help">仅支持 Hy-MT2 官方 38 语言，已自动归一化英文全称。</p>
         </div>
 
         <n-alert v-if="!isDesktopRuntime" class="text-runtime-alert" type="info" :show-icon="false">

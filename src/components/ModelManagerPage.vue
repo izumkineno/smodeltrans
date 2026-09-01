@@ -51,13 +51,12 @@ import {
 } from "../services/model-download-provider";
 
 type TagType = "default" | "success" | "warning" | "error" | "info";
-type ModelDialogMode = "translation" | "ocr" | "font" | null;
+type ModelDialogMode = "translation" | "ocr" | null;
 
 const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const modelDetectorPath = ref("");
 const modelRecognizerPath = ref("");
 const modelHyPath = ref("");
-const modelFontPath = ref<string | null>(null);
 const device = ref<DeviceKind>("cuda");
 const regionParallelism = ref(16);
 const translationBatchSize = ref(4);
@@ -214,7 +213,6 @@ function applyBackendStatus(status: BackendStatus) {
   modelDetectorPath.value = status.detectorModelDir;
   modelRecognizerPath.value = status.recognizerModelDir;
   modelHyPath.value = status.hyModel;
-  modelFontPath.value = status.fontPath;
   device.value = status.device === "cpu" ? "cpu" : "cuda";
   translationBatchSize.value = status.translationBatchSize;
   idleUnloadSeconds.value = status.idleUnloadSeconds;
@@ -266,16 +264,11 @@ const modelDialogTitle = computed(() => {
   if (modelDialogMode.value === "translation") {
     return "配置翻译模型路径";
   }
-  if (modelDialogMode.value === "ocr") {
-    return "配置 OCR 模型路径";
-  }
-  return "配置标注字体路径";
+  return "配置 OCR 模型路径";
 });
-const dialogName = ref("");
 const dialogTranslationPath = ref("");
 const dialogOcrDetectorPath = ref("");
 const dialogOcrRecognizerPath = ref("");
-const dialogFontPath = ref("");
 
 type OcrModelType =
   | "v5-server"
@@ -293,11 +286,6 @@ const OCR_MODEL_TYPES: Array<{ label: string; value: OcrModelType }> = [
 const dialogOcrType = ref<OcrModelType>("v5-mobile");
 const UNCONFIGURED_OCR_PREFIX = "__unset__:";
 
-function pathBaseName(path: string): string {
-  const trimmed = path.replace(/[\\/]+$/, "");
-  const separator = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
-  return separator >= 0 ? trimmed.slice(separator + 1) : trimmed;
-}
 
 const translationDialogPath = computed(
   () =>
@@ -317,15 +305,6 @@ function selectDialogTranslationModel(value: string | null): void {
 }
 
 
-const SYSTEM_FONT_VALUE = "__system__";
-const fontModelOptions = computed(() => [
-  { label: "系统自动匹配", value: SYSTEM_FONT_VALUE },
-  ...modelCatalog.value.fonts.map((option) => ({
-    label: `${option.name}（${option.path ? pathBaseName(option.path) : ""}）`,
-    value: option.path ?? SYSTEM_FONT_VALUE,
-  })),
-]);
-const selectedFontValue = computed(() => modelFontPath.value ?? SYSTEM_FONT_VALUE);
 
 async function loadModelCatalog(): Promise<void> {
   if (!isDesktopRuntime) {
@@ -360,17 +339,10 @@ function selectOcrModel(value: string): void {
   setSettingsFeedback("info", "已选择 OCR 模型，点击“保存设置”生效。");
 }
 
-function selectFontModel(value: string): void {
-  modelFontPath.value = value === SYSTEM_FONT_VALUE ? null : value;
-  setSettingsFeedback("info", "已选择标注字体，点击“保存设置”生效。");
-}
-
 function openModelDialog(mode: Exclude<ModelDialogMode, null>): void {
-  dialogName.value = "";
   dialogTranslationPath.value = "";
   dialogOcrDetectorPath.value = "";
   dialogOcrRecognizerPath.value = "";
-  dialogFontPath.value = "";
   dialogOcrType.value =
     backendStatus.value?.detectorVariant === "v5-server" ? "v5-server" : "v5-mobile";
   modelDialogMode.value = mode;
@@ -416,17 +388,6 @@ async function pickDialogOcrRecognizerPath(): Promise<void> {
   }
 }
 
-async function pickDialogFontPath(): Promise<void> {
-  const selected = await openNativeDialog({
-    title: "选择标注字体",
-    defaultPath: dialogFontPath.value || undefined,
-    multiple: false,
-    filters: [{ name: "字体文件", extensions: ["ttf", "otf"] }],
-  });
-  if (typeof selected === "string" && selected.trim()) {
-    dialogFontPath.value = selected;
-  }
-}
 
 async function saveModelDialog(): Promise<void> {
   if (dialogSaving.value) {
@@ -490,27 +451,6 @@ async function saveModelDialog(): Promise<void> {
           : e,
       );
     }
-  } else if (mode === "font") {
-    entryName = dialogName.value.trim();
-    if (!entryName) {
-      setSettingsFeedback("error", "请输入字体名称。");
-      return;
-    }
-    const path = dialogFontPath.value.trim();
-    if (!path) {
-      setSettingsFeedback("error", "请选择字体文件。");
-      return;
-    }
-    const normalized = path.replace(/\\/g, "/").toLowerCase();
-    const exists = next.fonts.some((e) => e.path.replace(/\\/g, "/").toLowerCase() === normalized);
-    if (!exists) {
-      next.fonts.push({ name: entryName, path });
-    } else {
-      // 同路径仅更新名称，避免字体下拉额外显示重复条目
-      next.fonts = next.fonts.map((e) =>
-        e.path.replace(/\\/g, "/").toLowerCase() === normalized ? { name: entryName, path } : e,
-      );
-    }
   } else {
     return;
   }
@@ -520,10 +460,8 @@ async function saveModelDialog(): Promise<void> {
     await loadModelCatalog();
     if (mode === "translation") {
       selectTranslationModel(dialogTranslationPath.value);
-    } else if (mode === "ocr") {
-      selectOcrModel(`${dialogOcrDetectorPath.value}|${dialogOcrRecognizerPath.value}`);
     } else {
-      selectFontModel(dialogFontPath.value);
+      selectOcrModel(`${dialogOcrDetectorPath.value}|${dialogOcrRecognizerPath.value}`);
     }
     closeModelDialog();
     setSettingsFeedback("success", `已配置「${entryName}」并选中，点击“保存设置”生效。`);
@@ -533,7 +471,6 @@ async function saveModelDialog(): Promise<void> {
     dialogSaving.value = false;
   }
 }
-
 function requireInteger(value: number, min: number, max: number, label: string): number | null {
   if (!Number.isInteger(value) || value < min || value > max) {
     setSettingsFeedback("error", `${label}必须为 ${min} 到 ${max} 的整数。`);
@@ -698,7 +635,7 @@ async function saveModelSettings() {
     detectorModelDir,
     recognizerModelDir,
     hyModel,
-    fontPath: modelFontPath.value?.trim() || null,
+    fontPath: status.fontPath ?? null,
     targetLanguage: (targetLanguage.value || status.targetLanguage || "Chinese").trim(),
     device: device.value,
     regionParallelism: ocrParallelism,
@@ -1048,40 +985,8 @@ onBeforeUnmount(() => {
         <p class="settings-help">切换后持久化到 <code>model-settings.json</code> 并清空引擎，下次推理自动加载。</p>
       </n-card>
 
-      <!-- 标注字体（保留手动导入） -->
-      <n-card class="settings-card settings-card-wide" :bordered="false">
-        <div class="settings-card-heading">
-          <div>
-            <p class="panel-kicker">Fonts</p>
-            <h2>标注字体</h2>
-          </div>
-          <n-button secondary size="small" @click="openModelDialog('font')">导入字体…</n-button>
-        </div>
-        <dl class="settings-path-list" style="margin-top:12px;">
-          <div>
-            <dt>当前字体</dt>
-            <dd class="settings-model-select-row">
-              <n-select
-                :value="selectedFontValue"
-                :options="fontModelOptions"
-                :placeholder="catalogLoaded ? '选择字体' : '加载字体列表…'"
-                size="small"
-                class="settings-model-select"
-                @update:value="selectFontModel"
-                aria-label="标注字体"
-              />
-              <n-tooltip v-if="modelFontPath" trigger="hover">
-                <template #trigger>
-                  <span class="settings-model-help" :title="modelFontPath" style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block; vertical-align:bottom;">{{ modelFontPath }}</span>
-                </template>
-                {{ modelFontPath }}
-              </n-tooltip>
-              <span v-else class="settings-model-help">系统自动匹配</span>
-            </dd>
-          </div>
-        </dl>
-      </n-card>
-<n-card class="settings-card" :bordered="false">
+
+      <n-card class="settings-card" :bordered="false">
         <div class="settings-card-heading">
           <div>
             <p class="panel-kicker">运行资源</p>
@@ -1107,6 +1012,7 @@ onBeforeUnmount(() => {
               :step="1"
               aria-label="OCR 区域并发"
             />
+            <span class="settings-help">并发 1–16，受显存策略自动约束。</span>
           </label>
           <label class="settings-field settings-number-field">
             <span>Hy 批大小</span>
@@ -1117,6 +1023,7 @@ onBeforeUnmount(() => {
               :step="1"
               aria-label="Hy 翻译批大小"
             />
+            <span class="settings-help">批大小 1–4，显存不足时自动降级。</span>
           </label>
           <label class="settings-field settings-number-field">
             <span>空闲释放时间（秒）</span>
@@ -1356,17 +1263,6 @@ onBeforeUnmount(() => {
           <div class="model-dialog-path-row">
             <span class="model-dialog-path-value" :title="dialogTranslationPath">{{ dialogTranslationPath || "未选择" }}</span>
             <n-button secondary size="small" @click="pickDialogTranslationPath">选择 GGUF 文件</n-button>
-          </div>
-        </template>
-        <template v-else>
-          <n-input
-            v-model:value="dialogName"
-            maxlength="64"
-            placeholder="字体名称（用于下拉框显示）"
-          />
-          <div class="model-dialog-path-row">
-            <span class="model-dialog-path-value" :title="dialogFontPath">{{ dialogFontPath || "未选择" }}</span>
-            <n-button secondary size="small" @click="pickDialogFontPath">选择字体文件</n-button>
           </div>
         </template>
       </div>
