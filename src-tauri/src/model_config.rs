@@ -6,8 +6,7 @@ pub(crate) const MAX_TOP_K: usize = 1024;
 pub(crate) const MAX_STOP_TOKENS: usize = 32;
 pub(crate) const MAX_STOP_STRINGS: usize = 16;
 pub(crate) const MAX_STOP_STRING_CHARS: usize = 128;
-pub(crate) const MAX_SYSTEM_PROMPT_CHARS: usize = 4096;
-pub(crate) const MAX_USER_PROMPT_CHARS: usize = 4096;
+pub(crate) const MAX_PROMPT_CHARS: usize = 8192;
 pub(crate) const MAX_MEMORY_TOKENS: usize = 262_144;
 pub(crate) const MAX_MEMORY_TURNS: usize = 1024;
 pub(crate) const MAX_TOKEN_ID: u32 = 1_000_000;
@@ -123,22 +122,25 @@ impl MemoryConfig {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct PromptConfig {
-    pub(crate) system: String,
-    pub(crate) user: String,
+    /// 单一翻译指令模板，支持 `{source_text}` / `{target_lang}` / `{target_language}` / `{format_type}` 占位符。
+    /// 为空时使用 Hy-MT2 官方 Default：`Translate the following text into {target_lang}. Note that you should only output the translated result without any additional explanation:\n\n{source_text}`
+    /// 包含 `{source_text}` 时为结构化完整提示（覆盖默认），否则作为附加约束拼于默认模板前。
+    pub(crate) template: String,
 }
 
 impl PromptConfig {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.system.trim().chars().count() > MAX_SYSTEM_PROMPT_CHARS {
-            bail!("prompt.system must contain at most {MAX_SYSTEM_PROMPT_CHARS} characters");
-        }
-        if self.user.trim().chars().count() > MAX_USER_PROMPT_CHARS {
-            bail!("prompt.user must contain at most {MAX_USER_PROMPT_CHARS} characters");
+        if self.template.trim().chars().count() > MAX_PROMPT_CHARS {
+            bail!("prompt.template must contain at most {MAX_PROMPT_CHARS} characters");
         }
         Ok(())
     }
-}
 
+    /// 是否包含 `{source_text}` 占位符，决定是否作为完整模板覆盖默认
+    pub(crate) fn has_source_text_placeholder(&self) -> bool {
+        self.template.contains("{source_text}")
+    }
+}
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModelConfig {
     pub(crate) target_language: String,
@@ -173,7 +175,7 @@ impl ModelConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{GenerationConfig, MAX_NEW_TOKENS, MAX_USER_PROMPT_CHARS, PromptConfig};
+    use super::{GenerationConfig, MAX_NEW_TOKENS, MAX_PROMPT_CHARS, PromptConfig};
 
     #[test]
     fn generation_config_validation_boundaries() {
@@ -223,16 +225,14 @@ mod tests {
     #[test]
     fn prompt_config_validation_covers_user_preset() {
         PromptConfig {
-            system: String::new(),
-            user: "Preserve product names.".to_owned(),
+            template: "Preserve product names.".to_owned(),
         }
         .validate()
         .unwrap();
 
         assert!(
             PromptConfig {
-                system: String::new(),
-                user: "x".repeat(MAX_USER_PROMPT_CHARS + 1),
+                template: "x".repeat(MAX_PROMPT_CHARS + 1),
             }
             .validate()
             .is_err()

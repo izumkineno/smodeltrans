@@ -41,6 +41,7 @@ import type {
   LiveSessionState,
   LiveSessionStatus,
 } from "../services/live-translation-provider";
+import TargetLanguageSelect from "./TargetLanguageSelect.vue";
 import {
   liveOverlaySettings,
   liveSubtitleStyleSettings,
@@ -156,6 +157,7 @@ const liveTriggerKeyLabels: Record<string, string> = {
   Pause: "Pause",
   NumLock: "Num Lock",
 };
+
 
 const liveStatus = ref<LiveSessionStatus>({
   state: "idle",
@@ -652,11 +654,9 @@ onBeforeUnmount(cleanupPage);
           />
           <label class="live-field">
             <span>目标语言</span>
-            <n-input
-              v-model:value="targetLanguage"
-              maxlength="64"
+            <TargetLanguageSelect
+              v-model="targetLanguage"
               :disabled="!canConfigure"
-              placeholder="例如：Chinese、English、Japanese"
               aria-label="实时翻译目标语言"
             />
           </label>
