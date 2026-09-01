@@ -59,6 +59,8 @@ pub(crate) struct BackendSettings {
     pub(crate) memory: MemoryConfig,
     pub(crate) model_root: PathBuf,
     pub(crate) catalog: ModelCatalog,
+    #[allow(dead_code)]
+    pub(crate) openai_compat: crate::openai_compat::config::OpenAiCompatConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -268,6 +270,8 @@ pub(crate) struct PersistedBackendSettings {
     pub(crate) prompt: Option<PersistedPromptSettings>,
     #[serde(default)]
     pub(crate) model_catalog: Option<ModelCatalog>,
+    #[serde(default)]
+    pub(crate) openai_compat: Option<crate::openai_compat::config::OpenAiCompatConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -502,11 +506,19 @@ impl BackendSettings {
                 .as_ref()
                 .and_then(|settings| settings.prompt.clone()),
         )?;
-
         let catalog = persisted
             .as_ref()
             .and_then(|settings| settings.model_catalog.clone())
             .unwrap_or_default();
+        let openai_compat = persisted
+            .as_ref()
+            .and_then(|settings| settings.openai_compat.clone())
+            .unwrap_or_default();
+        // 校验但不阻断启动，非法则回退默认
+        let openai_compat = match openai_compat.validate() {
+            Ok(()) => openai_compat,
+            Err(_) => crate::openai_compat::config::OpenAiCompatConfig::default(),
+        };
         Ok(Self {
             detector_model_dir,
             recognizer_model_dir,
@@ -522,6 +534,7 @@ impl BackendSettings {
             memory,
             model_root,
             catalog,
+            openai_compat,
         })
     }
 
@@ -578,6 +591,7 @@ impl BackendSettings {
             memory: Some(PersistedMemorySettings::from(&self.memory)),
             prompt: Some(PersistedPromptSettings::from(&self.prompt)),
             model_catalog: Some(self.catalog.clone()),
+            openai_compat: Some(self.openai_compat.clone()),
         }
     }
     /// Replace the persisted model catalog after validating every entry.

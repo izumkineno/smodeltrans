@@ -2,15 +2,17 @@ mod backend;
 mod model_config;
 mod model_support;
 mod models;
+mod openai_compat;
 mod output;
 mod quick_translation;
 mod selection;
 
+use std::sync::Arc;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build());
@@ -34,8 +36,30 @@ pub fn run() {
             );
             state.start_idle_monitor();
             let live_manager = backend::live::LiveSessionManager::new(state.clone());
+
+            // OpenAI 兼容服务：独立生命周期，严格通过 TranslationPort 解耦
+            let openai_initial = state
+                .settings
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().ok().map(|s| s.openai_compat.clone()))
+                .unwrap_or_default();
+            let openai_handle = openai_compat::server::OpenAiServerHandle::new(openai_initial.clone());
+            let openai_handle_for_spawn = openai_handle.clone();
+            let state_for_spawn = state.clone();
+            if openai_initial.enabled {
+                tauri::async_runtime::spawn(async move {
+                    let port: Arc<dyn openai_compat::adapter::TranslationPort> =
+                        Arc::new(openai_compat::adapter::BackendStateAdapter::new(state_for_spawn));
+                    if let Err(e) = openai_handle_for_spawn.start(port).await {
+                        eprintln!("[openai_compat] auto-start failed: {}", e);
+                    }
+                });
+            }
+
             app.manage(state);
             app.manage(live_manager);
+            app.manage(openai_handle);
             quick_translation::setup(app);
             Ok(())
         })
@@ -74,7 +98,9 @@ pub fn run() {
             backend::live::pause_live_session,
             backend::live::resume_live_session,
             backend::live::interrupt_live_translation,
-            backend::live::stop_live_session
+            backend::live::stop_live_session,
+            openai_compat::commands::get_openai_status,
+            openai_compat::commands::update_openai_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running smodeltrans application");

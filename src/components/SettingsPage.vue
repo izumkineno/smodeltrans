@@ -21,7 +21,7 @@ import {
 import { setThemeMode, themeMode } from "../services/theme-settings";
 import type { ThemeMode } from "../services/theme-settings";
 import { showWorkspaceToast, type WorkspaceToastType } from "../services/workspace-toast";
-
+import OpenAiCompatCard from "./OpenAiCompatCard.vue";
 type TagType = "default" | "success" | "warning" | "error" | "info";
 
 const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -288,6 +288,8 @@ onMounted(() => {
           </label>
         </div>
       </n-card>
+
+      <OpenAiCompatCard />
 
       <div class="settings-card-actions settings-page-actions settings-card-wide">
         <n-alert v-if="settingsMessage" class="settings-actions-feedback" :type="settingsMessageType" :show-icon="false">
