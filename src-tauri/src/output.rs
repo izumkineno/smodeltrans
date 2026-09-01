@@ -258,16 +258,24 @@ fn clean_annotation(value: &str) -> String {
 fn resolve_font(path: Option<&Path>, texts: &[String]) -> Result<FontArc, BackendFailure> {
     tracing::debug!(target: "output", font_path = ?path, text_count = texts.len(), "resolve_font started");
     if let Some(path) = path {
-        let bytes = fs::read(path)
-            .map_err(|error| BackendFailure::output(format!("无法读取字体：{error}")))?;
-        let font = FontVec::try_from_vec(bytes)
-            .map(FontArc::from)
-            .map_err(|_| BackendFailure::output("字体文件无效"))?;
-        if !covers(&font, texts) {
-            return Err(BackendFailure::output("显式字体不覆盖全部译文字符"));
+        match fs::read(path) {
+            Ok(bytes) => match FontVec::try_from_vec(bytes).map(FontArc::from) {
+                Ok(font) => {
+                    if covers(&font, texts) {
+                        tracing::info!(target: "output", font_path = ?path, "explicit font resolved and covers text");
+                        return Ok(font);
+                    } else {
+                        tracing::warn!(target: "output", font_path = ?path, "explicit font does not cover all characters, falling back to system font");
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(target: "output", font_path = ?path, "explicit font invalid, falling back to system font");
+                }
+            },
+            Err(error) => {
+                tracing::warn!(target: "output", font_path = ?path, error = %error, "cannot read explicit font, falling back to system font");
+            }
         }
-        tracing::info!(target: "output", font_path = ?path, "explicit font resolved and covers text");
-        return Ok(font);
     }
     let mut database = fontdb::Database::new();
     database.load_system_fonts();

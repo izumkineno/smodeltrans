@@ -7,6 +7,7 @@ import {
   NCard,
   NInput,
   NModal,
+  NPopconfirm,
   NSelect,
   NTooltip,
   useMessage,
@@ -180,13 +181,73 @@ async function saveFontDialog(): Promise<void> {
   try {
     await saveModelCatalog(next);
     await loadModelCatalog();
-    selectFontModel(dialogFontPath.value);
+    // 从重载后的 catalog 中精确定位新条目的实际存储路径，避免大小写/斜杠差异导致选中失效
+    const normalized = path.replace(/\\/g, "/").toLowerCase();
+    const matched = modelCatalog.value.fonts.find(
+      (e) => e.path && e.path.replace(/\\/g, "/").toLowerCase() === normalized,
+    );
+    const toSelect = matched?.path ?? path;
+    console.info("[SettingsPage] saveFontDialog: catalog reloaded, selecting", { toSelect, matched: !!matched, fonts: modelCatalog.value.fonts.length });
+    selectFontModel(toSelect);
     closeFontDialog();
-    console.info("[SettingsPage] saveFontDialog: saved successfully", { entryName, path });
+    console.info("[SettingsPage] saveFontDialog: saved successfully", { entryName, path: toSelect });
     setSettingsFeedback("success", `已配置「${entryName}」并选中，点击“保存设置”生效。`);
   } catch (error) {
     console.error("[SettingsPage] saveFontDialog: failed", { error: error instanceof Error ? error.message : String(error), entryName, path });
     setSettingsFeedback("error", error instanceof Error ? error.message : "无法保存模型条目。");
+  } finally {
+    dialogSaving.value = false;
+  }
+}
+
+async function deleteSelectedFont(): Promise<void> {
+  const current = modelFontPath.value;
+  console.info("[SettingsPage] deleteSelectedFont: user triggered delete", { current, selectedFontValue: selectedFontValue.value });
+  if (!current) {
+    console.warn("[SettingsPage] deleteSelectedFont: no custom font selected");
+    setSettingsFeedback("warning", "当前为系统字体，无需删除。");
+    return;
+  }
+  if (!catalogLoaded.value) {
+    await loadModelCatalog();
+  }
+  const normalized = current.replace(/\\/g, "/").toLowerCase();
+  const exists = modelCatalog.value.fonts.some((e) => e.path && e.path.replace(/\\/g, "/").toLowerCase() === normalized);
+  if (!exists) {
+    console.warn("[SettingsPage] deleteSelectedFont: font not in catalog", { current });
+    setSettingsFeedback("error", "该字体不在已导入列表中。");
+    return;
+  }
+  if (dialogSaving.value) {
+    console.warn("[SettingsPage] deleteSelectedFont: busy");
+    return;
+  }
+  const next: ModelCatalogUpdate = {
+    translation: modelCatalog.value.translation.map((entry) => ({ name: entry.name, path: entry.path })),
+    ocr: modelCatalog.value.ocr.map((entry) => ({ name: entry.name, detectorDir: entry.detectorDir, recognizerDir: entry.recognizerDir })),
+    fonts: modelCatalog.value.fonts
+      .filter((entry) => entry.path && entry.path.replace(/\\/g, "/").toLowerCase() !== normalized)
+      .filter((entry) => entry.path !== null)
+      .map((entry) => ({ name: entry.name, path: entry.path as string })),
+  };
+  console.debug("[SettingsPage] deleteSelectedFont: saving catalog after filter", { before: modelCatalog.value.fonts.length, after: next.fonts.length, deleted: current });
+  dialogSaving.value = true;
+  try {
+    await saveModelCatalog(next);
+    await loadModelCatalog();
+    // 若删除的是当前选中字体，则回退到系统字体
+    const stillExists = modelCatalog.value.fonts.some((e) => e.path && e.path.replace(/\\/g, "/").toLowerCase() === normalized);
+    if (!stillExists) {
+      console.info("[SettingsPage] deleteSelectedFont: deleted font was selected, resetting to system", { deleted: current });
+      modelFontPath.value = null;
+      setSettingsFeedback("success", "已删除该字体并切回系统字体，点击“保存设置”生效。");
+    } else {
+      setSettingsFeedback("success", "已删除该字体。");
+    }
+    console.info("[SettingsPage] deleteSelectedFont: deleted successfully", { deleted: current, remaining: modelCatalog.value.fonts.length });
+  } catch (error) {
+    console.error("[SettingsPage] deleteSelectedFont: failed", { error: error instanceof Error ? error.message : String(error), current });
+    setSettingsFeedback("error", error instanceof Error ? error.message : "无法删除字体。");
   } finally {
     dialogSaving.value = false;
   }
@@ -405,9 +466,28 @@ onMounted(() => {
                 @update:value="selectFontModel"
                 aria-label="标注字体"
               />
+              <n-popconfirm
+                :show-icon="false"
+                positive-text="删除"
+                negative-text="取消"
+                @positive-click="deleteSelectedFont"
+              >
+                <template #trigger>
+                  <n-button
+                    secondary
+                    size="small"
+                    :disabled="!modelFontPath || dialogSaving"
+                    :loading="dialogSaving"
+                    aria-label="删除选中字体"
+                  >
+                    删除
+                  </n-button>
+                </template>
+                确定删除「{{ modelFontPath ? pathBaseName(modelFontPath) : '' }}」？删除后需保存设置生效。
+              </n-popconfirm>
               <n-tooltip v-if="modelFontPath" trigger="hover">
                 <template #trigger>
-                  <span class="settings-model-help" :title="modelFontPath" style="max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom">{{ modelFontPath }}</span>
+                  <span class="settings-model-help" :title="modelFontPath" style="max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom">{{ modelFontPath }}</span>
                 </template>
                 {{ modelFontPath }}
               </n-tooltip>
