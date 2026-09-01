@@ -59,13 +59,20 @@ function pathBaseName(path: string): string {
 }
 
 const SYSTEM_FONT_VALUE = "__system__";
-const fontModelOptions = computed(() => [
-  { label: "系统自动匹配", value: SYSTEM_FONT_VALUE },
-  ...modelCatalog.value.fonts.map((option) => ({
-    label: `${option.name}（${option.path ? pathBaseName(option.path) : ""}）`,
-    value: option.path ?? SYSTEM_FONT_VALUE,
-  })),
-]);
+const fontModelOptions = computed(() => {
+  const opts = [
+    { label: "系统自动匹配", value: SYSTEM_FONT_VALUE },
+    ...modelCatalog.value.fonts.map((option) => ({
+      label: `${option.name}（${option.path ? pathBaseName(option.path) : ""}）`,
+      value: option.path ?? SYSTEM_FONT_VALUE,
+    })),
+  ];
+  const current = modelFontPath.value;
+  if (current && !opts.some((o) => o.value === current)) {
+    opts.push({ label: `${pathBaseName(current)}（当前生效）`, value: current });
+  }
+  return opts;
+});
 const selectedFontValue = computed(() => modelFontPath.value ?? SYSTEM_FONT_VALUE);
 
 async function loadModelCatalog(): Promise<void> {
@@ -358,11 +365,18 @@ async function saveSettings() {
     return;
   }
 
-  const status = backendStatus.value;
+  let status = backendStatus.value;
   if (!status) {
-    console.error("[SettingsPage] saveSettings: backend status not ready");
-    setSettingsFeedback("error", "后端状态未就绪，请先刷新。");
-    return;
+    console.info("[SettingsPage] saveSettings: backend status not cached, fetching", { isDesktopRuntime });
+    try {
+      status = await fetchSharedBackendStatus();
+      applyBackendStatus(status);
+      console.info("[SettingsPage] saveSettings: fetched backend status for save", { fontPath: status.fontPath, device: status.device });
+    } catch (error) {
+      console.error("[SettingsPage] saveSettings: fetch status failed", { error: error instanceof Error ? error.message : String(error) });
+      setSettingsFeedback("error", error instanceof Error ? error.message : "后端状态未就绪，请先刷新。");
+      return;
+    }
   }
 
   const settings: BackendSettingsUpdate = {
@@ -446,7 +460,7 @@ onMounted(() => {
         <div class="settings-card-heading">
           <div>
             <p class="panel-kicker">Fonts</p>
-            <h2>标注字体</h2>
+            <h2>OCR标注字体</h2>
           </div>
           <n-button secondary size="small" @click="openFontDialog">导入字体…</n-button>
         </div>

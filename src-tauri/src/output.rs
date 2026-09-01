@@ -261,12 +261,12 @@ fn resolve_font(path: Option<&Path>, texts: &[String]) -> Result<FontArc, Backen
         match fs::read(path) {
             Ok(bytes) => match FontVec::try_from_vec(bytes).map(FontArc::from) {
                 Ok(font) => {
-                    if covers(&font, texts) {
-                        tracing::info!(target: "output", font_path = ?path, "explicit font resolved and covers text");
-                        return Ok(font);
+                    if !covers(&font, texts) {
+                        tracing::warn!(target: "output", font_path = ?path, "explicit font does not cover all characters, still using it");
                     } else {
-                        tracing::warn!(target: "output", font_path = ?path, "explicit font does not cover all characters, falling back to system font");
+                        tracing::info!(target: "output", font_path = ?path, "explicit font resolved and covers text");
                     }
+                    return Ok(font);
                 }
                 Err(_) => {
                     tracing::warn!(target: "output", font_path = ?path, "explicit font invalid, falling back to system font");

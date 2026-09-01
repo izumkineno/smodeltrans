@@ -90,9 +90,9 @@ pub(crate) struct BackendEngine {
 }
 
 impl BackendEngine {
-    #[tracing::instrument(level = "info", skip(settings), fields(device_kind = ?settings.device_kind, region_parallelism = settings.region_parallelism, idle_unload_seconds = settings.idle_unload_seconds))]
+    #[tracing::instrument(level = "info", skip(settings), fields(device_kind = ?settings.device_kind, region_parallelism = settings.region_parallelism, idle_unload_seconds = settings.idle_unload_seconds, font_path = ?settings.font_path.as_ref().map(|p| p.display().to_string())))]
     pub(crate) fn new(mut settings: BackendSettings) -> Result<Self, BackendFailure> {
-        tracing::info!(target: "backend::engine", device_kind = ?settings.device_kind, region_parallelism = settings.region_parallelism, "BackendEngine::new entry");
+        tracing::info!(target: "backend::engine", device_kind = ?settings.device_kind, region_parallelism = settings.region_parallelism, font_path = ?settings.font_path.as_ref().map(|p| p.display().to_string()), "BackendEngine::new entry");
         let __start = std::time::Instant::now();
         let device = create_device(settings.device_kind).inspect_err(|e| {
             tracing::error!(target: "backend::engine", error = %e, duration_ms = __start.elapsed().as_millis() as u64, "BackendEngine::new create_device failed");
@@ -126,7 +126,7 @@ impl BackendEngine {
             hy: None,
             translator_memory: None,
         };
-        tracing::info!(target: "backend::engine", duration_ms = __start.elapsed().as_millis() as u64, gpu_policy = out.gpu_policy.label(), region_parallelism = out.settings.region_parallelism, "BackendEngine::new success");
+        tracing::info!(target: "backend::engine", duration_ms = __start.elapsed().as_millis() as u64, gpu_policy = out.gpu_policy.label(), region_parallelism = out.settings.region_parallelism, font_path = ?out.settings.font_path.as_ref().map(|p| p.display().to_string()), "BackendEngine::new success");
         Ok(out)
     }
 
