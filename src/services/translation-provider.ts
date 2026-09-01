@@ -46,8 +46,11 @@ export interface BackendMemorySettings {
 }
 
 export interface BackendPromptSettings {
-  system: string;
-  user: string;
+  template: string;
+  // 兼容旧持久化：`prompt`/`system`/`user` 仅用于读取旧数据
+  prompt?: string;
+  system?: string;
+  user?: string;
 }
 
 export interface BackendStatus {

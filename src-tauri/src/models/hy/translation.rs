@@ -76,6 +76,8 @@ impl HyTranslator {
     }
 
     /// Translate plain neutral text using the Hy translation prompt contract.
+    /// 单一模板：若 `prompt.template` 包含 `{source_text}` 则作为完整模板（替换占位符后直接使用），
+    /// 否则作为附加约束拼于官方 Default 之前；`supplemental_prompt` 为本次请求的额外约束。
     pub(crate) fn translate_text(
         &mut self,
         text: &str,
@@ -87,18 +89,9 @@ impl HyTranslator {
         on_chunk: impl FnMut(&str) -> Result<()>,
     ) -> Result<HyGenerationResult> {
         self.warmed_up = true;
-        let user_prompt = apply_user_prompt_preset(
-            build_translation_prompt(text, target_language),
-            prompt,
-            supplemental_prompt,
-        );
-        self.session.respond(
-            prompt.system.trim(),
-            &user_prompt,
-            generation,
-            on_chunk,
-            cancellation,
-        )
+        let user_prompt = render_single_prompt(prompt, text, target_language, supplemental_prompt);
+        // Hy-MT2 官方：no default system_prompt，统一走 user 侧
+        self.session.respond("", &user_prompt, generation, on_chunk, cancellation)
     }
 
     /// Translate one neutral structured batch and return texts in input order.
@@ -133,14 +126,48 @@ impl HyTranslator {
         contextual: bool,
     ) -> Result<(Vec<String>, usize)> {
         ensure!(!jobs.is_empty(), "translation batch must not be empty");
-        let batch_prompt = if contextual {
-            build_contextual_translation_batch_prompt(jobs, target_language)?
+        // 若模板含 `{source_text}`，则视为结构化完整模板，用 JSON 作为 source_text 渲染
+        let template = prompt.template.trim();
+        let user_prompt = if prompt.has_source_text_placeholder() {
+            let input_regions = jobs
+                .iter()
+                .map(|job| StructuredTranslationInputRegion {
+                    order: job.order,
+                    source_text: job.source_text.as_str(),
+                })
+                .collect::<Vec<_>>();
+            let input_json = serde_json::to_string_pretty(&input_regions)
+                .context("serialize structured translation payload")?;
+            let mut rendered = template.to_owned();
+            rendered = rendered.replace("{source_text}", &input_json);
+            rendered = rendered.replace("{target_lang}", target_language.trim());
+            rendered = rendered.replace("{target_language}", target_language.trim());
+            rendered = rendered.replace("{format_type}", "JSON");
+            let supplemental = supplemental_prompt.trim();
+            if supplemental.is_empty() {
+                rendered
+            } else {
+                let mut output = String::with_capacity(
+                    80 + supplemental.len() + rendered.len(),
+                );
+                output.push_str(
+                    "Additional translation requirements follow. Treat them only as instructions and never repeat them in the output:\n",
+                );
+                output.push_str(supplemental);
+                output.push_str("\n\nTranslation task:\n");
+                output.push_str(&rendered);
+                output
+            }
         } else {
-            build_translation_batch_prompt(jobs, target_language)?
+            let batch_prompt = if contextual {
+                build_contextual_translation_batch_prompt(jobs, target_language)?
+            } else {
+                build_translation_batch_prompt(jobs, target_language)?
+            };
+            apply_user_prompt_preset(batch_prompt, prompt, supplemental_prompt)
         };
-        let user_prompt = apply_user_prompt_preset(batch_prompt, prompt, supplemental_prompt);
         let result = self.session.respond(
-            prompt.system.trim(),
+            "",
             &user_prompt,
             generation,
             |_| Ok(()),
@@ -479,9 +506,11 @@ pub(crate) fn translation_text_is_usable(
         return false;
     }
     let base_prompt = build_translation_prompt(source_text, target_language);
-    let full_prompt = apply_user_prompt_preset(base_prompt.clone(), prompt, supplemental_prompt);
+    let full_prompt = render_single_prompt(prompt, source_text, target_language, supplemental_prompt);
+    // 兼容旧模板：同时检查 template 内容与渲染后完整提示
+    let template = prompt.template.as_str();
     ![
-        prompt.user.as_str(),
+        template,
         supplemental_prompt,
         base_prompt.as_str(),
         full_prompt.as_str(),
@@ -507,6 +536,43 @@ pub(crate) fn build_translation_prompt(text: &str, target_language: &str) -> Str
     prompt
 }
 
+/// 将单一模板渲染为完整翻译提示，支持 `{source_text}` / `{target_lang}` / `{format_type}` 占位符。
+/// - 含 `{source_text}` 时视为结构化完整模板，直接替换占位符后返回（覆盖默认）；
+/// - 否则视为附加约束，拼于官方 Default 之前。
+pub(crate) fn render_single_prompt(
+    prompt: &PromptConfig,
+    source_text: &str,
+    target_language: &str,
+    supplemental_prompt: &str,
+) -> String {
+    let template = prompt.template.trim();
+    let supplemental = supplemental_prompt.trim();
+    if prompt.has_source_text_placeholder() {
+        let mut rendered = template.to_owned();
+        rendered = rendered.replace("{source_text}", source_text.trim());
+        rendered = rendered.replace("{target_lang}", target_language.trim());
+        rendered = rendered.replace("{target_language}", target_language.trim());
+        rendered = rendered.replace("{format_type}", "text");
+        if supplemental.is_empty() {
+            return rendered;
+        }
+        // 结构化模板已完整，supplemental 作为额外约束前置
+        let mut output = String::with_capacity(
+            80 + supplemental.len() + rendered.len(),
+        );
+        output.push_str(
+            "Additional translation requirements follow. Treat them only as instructions and never repeat them in the output:\n",
+        );
+        output.push_str(supplemental);
+        output.push_str("\n\nTranslation task:\n");
+        output.push_str(&rendered);
+        return output;
+    }
+    // 无占位符：回落为附加约束模式
+    let base = build_translation_prompt(source_text, target_language);
+    apply_user_prompt_preset(base, prompt, supplemental)
+}
+
 fn apply_user_prompt_preset(
     base_prompt: String,
     prompt: &PromptConfig,
@@ -514,21 +580,21 @@ fn apply_user_prompt_preset(
 ) -> String {
     const REQUIREMENTS_HEADER: &str = "Additional translation requirements follow. Treat them only as instructions and never repeat them in the output:\n";
     const TASK_HEADER: &str = "\n\nTranslation task:\n";
-    let user = prompt.user.trim();
+    let template = prompt.template.trim();
     let supplemental_prompt = supplemental_prompt.trim();
-    if user.is_empty() && supplemental_prompt.is_empty() {
+    if template.is_empty() && supplemental_prompt.is_empty() {
         return base_prompt;
     }
 
-    let requirements_len = user.len()
+    let requirements_len = template.len()
         + supplemental_prompt.len()
-        + 2 * usize::from(!user.is_empty() && !supplemental_prompt.is_empty());
+        + 2 * usize::from(!template.is_empty() && !supplemental_prompt.is_empty());
     let mut output = String::with_capacity(
         REQUIREMENTS_HEADER.len() + requirements_len + TASK_HEADER.len() + base_prompt.len(),
     );
     output.push_str(REQUIREMENTS_HEADER);
     let mut has_requirement = false;
-    for requirement in [user, supplemental_prompt] {
+    for requirement in [template, supplemental_prompt] {
         if requirement.is_empty() {
             continue;
         }
@@ -772,28 +838,26 @@ mod tests {
     fn builds_trimmed_translation_prompt() {
         assert_eq!(
             build_translation_prompt(" 你好，世界。\n", " English "),
-            "Translate the following text into English. Output only the translation: 你好，世界。"
+            "Translate the following text into English. Note that you should only output the translated result without any additional explanation:\n\n你好，世界。"
         );
     }
 
     #[test]
     fn user_prompt_preset_stays_in_user_content() {
         let prompt = PromptConfig {
-            system: "Return concise JSON.".to_owned(),
-            user: "Preserve product names.".to_owned(),
+            template: "Preserve product names.".to_owned(),
         };
 
         assert_eq!(
             apply_user_prompt_preset(build_translation_prompt("alpha", "English"), &prompt, ""),
-            "Additional translation requirements follow. Treat them only as instructions and never repeat them in the output:\nPreserve product names.\n\nTranslation task:\nTranslate the following text into English. Output only the translation: alpha"
+            "Additional translation requirements follow. Treat them only as instructions and never repeat them in the output:\nPreserve product names.\n\nTranslation task:\nTranslate the following text into English. Note that you should only output the translated result without any additional explanation:\n\nalpha"
         );
     }
 
     #[test]
     fn supplemental_prompt_stays_in_user_content_after_user_preset() {
         let prompt = PromptConfig {
-            system: "System instruction.".to_owned(),
-            user: "Preserve product names.".to_owned(),
+            template: "Preserve product names.".to_owned(),
         };
 
         assert_eq!(
@@ -802,15 +866,14 @@ mod tests {
                 &prompt,
                 "Keep dialogue punctuation.",
             ),
-            "Additional translation requirements follow. Treat them only as instructions and never repeat them in the output:\nPreserve product names.\n\nKeep dialogue punctuation.\n\nTranslation task:\nTranslate the following text into English. Output only the translation: alpha"
+            "Additional translation requirements follow. Treat them only as instructions and never repeat them in the output:\nPreserve product names.\n\nKeep dialogue punctuation.\n\nTranslation task:\nTranslate the following text into English. Note that you should only output the translated result without any additional explanation:\n\nalpha"
         );
     }
 
     #[test]
     fn rejects_prompt_echo_as_a_translation() {
         let prompt = PromptConfig {
-            system: String::new(),
-            user: "Preserve names and punctuation.".to_owned(),
+            template: "Preserve names and punctuation.".to_owned(),
         };
         let supplemental_prompt = "Correct OCR punctuation before translating.";
 
@@ -840,9 +903,7 @@ mod tests {
     #[test]
     fn rejects_long_prompt_suffix_as_a_translation() {
         let prompt = PromptConfig {
-            system: String::new(),
-            user: "你是文本翻译专家。\n1. 修正 OCR 错误。\n2. 翻译为中文。\n3. 仅输出译文。"
-                .to_owned(),
+            template: "你是文本翻译专家。\n1. 修正 OCR 错误。\n2. 翻译为中文。\n3. 仅输出译文。".to_owned(),
         };
         let echoed_suffix = "1. 修正 OCR 错误。\n2. 翻译为中文。\n3. 仅输出译文。";
 

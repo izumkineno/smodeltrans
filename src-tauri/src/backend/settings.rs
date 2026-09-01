@@ -184,28 +184,45 @@ impl BackendMemorySettings {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BackendPromptSettings {
-    pub(crate) system: String,
-    #[serde(default)]
-    pub(crate) user: String,
+    #[serde(default, alias = "prompt")]
+    pub(crate) template: String,
+    // 兼容旧持久化：`system`/`user` 仅用于读取旧文件，写入时仅保留 `template`
+    #[serde(default, skip_serializing)]
+    pub(crate) system: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub(crate) user: Option<String>,
 }
 
 impl BackendPromptSettings {
     fn from_config(config: &PromptConfig) -> Self {
         Self {
-            system: config.system.clone(),
-            user: config.user.clone(),
+            template: config.template.clone(),
+            system: None,
+            user: None,
         }
     }
 
     fn into_config(self) -> Result<PromptConfig, String> {
-        let config = PromptConfig {
-            system: self.system.trim().to_owned(),
-            user: self.user.trim().to_owned(),
+        // 迁移旧 `system`/`user`/`prompt`：若新 `template` 为空且旧字段有值，则合并为模板
+        let template = if !self.template.trim().is_empty() {
+            self.template.trim().to_owned()
+        } else {
+            let mut merged = String::new();
+            if let Some(s) = self.system.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                merged.push_str(s);
+            }
+            if let Some(u) = self.user.as_deref().map(|u| u.trim()).filter(|u| !u.is_empty()) {
+                if !merged.is_empty() {
+                    merged.push_str("\n\n");
+                }
+                merged.push_str(u);
+            }
+            merged
         };
+        let config = PromptConfig { template };
         validate_prompt(config)
     }
 }
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BackendSettingsUpdate {
@@ -394,17 +411,38 @@ impl PersistedMemorySettings {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PersistedPromptSettings {
+    pub(crate) prompt: Option<String>,
     pub(crate) system: Option<String>,
     pub(crate) user: Option<String>,
 }
 
 impl PersistedPromptSettings {
     fn into_config(self, mut config: PromptConfig) -> Result<PromptConfig, String> {
+        // 优先新字段 `prompt`，否则迁移旧 `system`/`user`
+        if let Some(value) = self.prompt {
+            let v = value.trim().to_owned();
+            if !v.is_empty() {
+                config.template = v;
+                return validate_prompt(config);
+            }
+        }
         if let Some(value) = self.system {
-            config.system = value.trim().to_owned();
+            let v = value.trim().to_owned();
+            if !v.is_empty() {
+                if !config.template.trim().is_empty() {
+                    config.template.push_str("\n\n");
+                }
+                config.template.push_str(&v);
+            }
         }
         if let Some(value) = self.user {
-            config.user = value.trim().to_owned();
+            let v = value.trim().to_owned();
+            if !v.is_empty() {
+                if !config.template.trim().is_empty() {
+                    config.template.push_str("\n\n");
+                }
+                config.template.push_str(&v);
+            }
         }
         validate_prompt(config)
     }
@@ -1010,8 +1048,9 @@ impl From<&MemoryConfig> for PersistedMemorySettings {
 impl From<&PromptConfig> for PersistedPromptSettings {
     fn from(config: &PromptConfig) -> Self {
         Self {
-            system: Some(config.system.clone()),
-            user: Some(config.user.clone()),
+            prompt: Some(config.template.clone()),
+            system: None,
+            user: None,
         }
     }
 }
@@ -1104,10 +1143,25 @@ fn normalize_target_language(value: &str) -> Option<String> {
         return None;
     }
     let lower = trimmed.to_ascii_lowercase();
+    // 兼容常见中文别名：简体中文/简中/zh-CN 等均归一为 Chinese；繁中/zh-TW 等归一为 Traditional Chinese
+    let lower_no_hyphen = lower.replace(['-', '_'], "");
+    match lower_no_hyphen.as_str() {
+        "jiantizhongwen" | "jianzhong" | "zhcn" | "zhhans" | "zhhanscn" => return Some("Chinese".to_owned()),
+        "fantizhongwen" | "fanzhong" | "zhtw" | "zhhant" | "zhhanttw" => return Some("Traditional Chinese".to_owned()),
+        _ => {}
+    }
+    // 直接匹配中文别名（需精确匹配原始 trimmed，因含中文字符大小写不敏感无意义）
+    match trimmed {
+        "简体中文" | "简中" | "简体" | "中文(简体)" | "中文（简体）" => return Some("Chinese".to_owned()),
+        "繁中" | "繁體中文" | "繁體" => return Some("Traditional Chinese".to_owned()),
+        "英文" => return Some("English".to_owned()),
+        _ => {}
+    }
     for (en, zh, abbr) in SUPPORTED_TARGET_LANGUAGES {
         if lower == en.to_ascii_lowercase()
             || trimmed == *zh
             || lower == abbr.to_ascii_lowercase()
+            || lower_no_hyphen == abbr.to_ascii_lowercase().replace(['-', '_'], "")
         {
             return Some(en.to_string());
         }
@@ -1290,8 +1344,7 @@ mod tests {
         generation_from_persisted,
     };
     use crate::model_config::{
-        GenerationConfig, MAX_SYSTEM_PROMPT_CHARS, MAX_USER_PROMPT_CHARS, MemoryConfig,
-        PromptConfig,
+        GenerationConfig, MAX_PROMPT_CHARS, MemoryConfig, PromptConfig,
     };
     use std::path::PathBuf;
 
@@ -1344,8 +1397,9 @@ mod tests {
                 max_turns: 4,
             },
             prompt: BackendPromptSettings {
-                system: "Return JSON.".to_owned(),
-                user: "Preserve product names.".to_owned(),
+                template: "Preserve product names.".to_owned(),
+                system: None,
+                user: None,
             },
         }
     }
@@ -1380,8 +1434,7 @@ mod tests {
         assert!(updated.memory.enabled);
         assert_eq!(updated.memory.max_tokens, 1024);
         assert_eq!(updated.memory.max_turns, 4);
-        assert_eq!(updated.prompt.system, "Return JSON.");
-        assert_eq!(updated.prompt.user, "Preserve product names.");
+        assert_eq!(updated.prompt.template, "Preserve product names.");
     }
 
     #[test]
@@ -1442,11 +1495,11 @@ mod tests {
         assert!(current.update_from_request(invalid).is_err());
 
         let mut invalid = full_update();
-        invalid.prompt.system = "x".repeat(MAX_SYSTEM_PROMPT_CHARS + 1);
+        invalid.prompt.template = "x".repeat(MAX_PROMPT_CHARS + 1);
         assert!(current.update_from_request(invalid).is_err());
 
         let mut invalid = full_update();
-        invalid.prompt.user = "x".repeat(MAX_USER_PROMPT_CHARS + 1);
+        invalid.prompt.template = "x".repeat(MAX_PROMPT_CHARS + 1);
         assert!(current.update_from_request(invalid).is_err());
     }
 

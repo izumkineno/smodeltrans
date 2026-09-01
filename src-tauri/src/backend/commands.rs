@@ -852,8 +852,7 @@ mod tests {
                 "maxTurns": 4
             },
             "prompt": {
-                "system": "Return concise JSON.",
-                "user": "Preserve product names."
+                "template": "Preserve product names."
             }
         }))
         .expect("full settings request");
@@ -866,8 +865,7 @@ mod tests {
         assert_eq!(request.generation.seed, Some("42".to_owned()));
         assert_eq!(request.generation.stop_tokens, vec![120020]);
         assert!(request.memory.enabled);
-        assert_eq!(request.prompt.system, "Return concise JSON.");
-        assert_eq!(request.prompt.user, "Preserve product names.");
+        assert_eq!(request.prompt.template, "Preserve product names.");
     }
     #[test]
     fn ocr_region_response_serializes_selectable_character_boxes() {

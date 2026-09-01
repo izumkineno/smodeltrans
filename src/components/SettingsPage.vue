@@ -25,8 +25,7 @@ import OpenAiCompatCard from "./OpenAiCompatCard.vue";
 type TagType = "default" | "success" | "warning" | "error" | "info";
 
 const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-const systemPrompt = ref("");
-const userPrompt = ref("");
+const promptTemplate = ref("");
 const settingsMessage = ref("");
 const settingsMessageType = ref<WorkspaceToastType>("info");
 const settingsLoading = ref(false);
@@ -125,10 +124,10 @@ function applyBackendStatus(status: BackendStatus) {
   if (status.targetLanguage) {
     targetLanguage.value = status.targetLanguage;
   }
-  systemPrompt.value = status.prompt.system;
-  userPrompt.value = status.prompt.user;
+  // 兼容旧字段：优先 `template`，回退 `prompt`/`system`+`user`
+  const p: any = status.prompt as any;
+  promptTemplate.value = p.template ?? p.prompt ?? [p.system, p.user].filter(Boolean).join("\n\n") ?? "";
 }
-
 async function refreshBackendStatus(notify = true) {
   if (!isDesktopRuntime) {
     setSettingsFeedback("warning", "设置状态仅在 Tauri 桌面端可读取。", notify);
@@ -153,14 +152,9 @@ async function saveSettings() {
     return;
   }
 
-  const trimmedSystemPrompt = systemPrompt.value.trim();
-  if (Array.from(trimmedSystemPrompt).length > 4096) {
-    setSettingsFeedback("error", "system 预设提示词最多 4096 个字符。");
-    return;
-  }
-  const trimmedUserPrompt = userPrompt.value.trim();
-  if (Array.from(trimmedUserPrompt).length > 4096) {
-    setSettingsFeedback("error", "user 预设提示词最多 4096 个字符。");
+  const trimmedPromptTemplate = promptTemplate.value.trim();
+  if (Array.from(trimmedPromptTemplate).length > 8192) {
+    setSettingsFeedback("error", "提示词模板最多 8192 个字符。");
     return;
   }
 
@@ -194,8 +188,7 @@ async function saveSettings() {
     generation: status.generation,
     memory: status.memory,
     prompt: {
-      system: trimmedSystemPrompt,
-      user: trimmedUserPrompt,
+      template: trimmedPromptTemplate,
     },
   };
 
@@ -294,9 +287,9 @@ onMounted(() => {
         </div>
         <p class="settings-card-copy">
           目标语言决定 Hy-MT2 的 <code>target_lang</code>（需使用<strong>完整语言名</strong>，English prompt 用英文名，中文 prompt 用中文名）。
-          本地翻译默认使用官方 Default 模板：<code>Translate the following text into {target}. Note that you should only output the translated result without any additional explanation: {text}</code>，
+          本地翻译默认使用官方 Default 模板：<code>Translate the following text into {target_language}. Note that you should only output the translated result without any additional explanation:\n\n{source_text}</code>，
           参考 <a href="https://github.com/Tencent-Hunyuan/Hy-MT2#hy-mt2-translation-task-instruction-examples-chinese-english-comparison" target="_blank">Hy-MT2 官方指令示例</a>。
-          模型无默认 system prompt，建议留空；术语/风格等高级指令请写入 User 预设。
+          单模板支持 <code>{source_text}</code> / <code>{target_lang}</code> / <code>{target_language}</code> / <code>{format_type}</code> 占位符。
         </p>
         <div class="settings-field-grid">
           <label class="settings-field">
@@ -310,29 +303,17 @@ onMounted(() => {
           </label>
           <span class="settings-help" style="grid-column: 1 / -1">仅支持 Hy-MT2 官方 38 语言，已自动归一化英文全称；不支持的语言将校验失败。</span>
           <label class="settings-field settings-field-wide settings-textarea">
-            <span>System 预设提示词</span>
+            <span>翻译提示词模板</span>
             <n-input
-              v-model:value="systemPrompt"
+              v-model:value="promptTemplate"
               type="textarea"
-              maxlength="4096"
-              placeholder="建议留空（Hy-MT2 官方：no default system_prompt）。如需角色约束，例如：You are a professional translator."
+              maxlength="8192"
+              placeholder="可选：单模板，支持 {source_text} / {target_lang} / {target_language} / {format_type} 占位符。留空则使用官方 Default：Translate the following text into {target}. Note that you should only output the translated result without any additional explanation: {text}"
               :autosize="{ minRows: 3, maxRows: 6 }"
-              aria-label="Hy system prompt"
+              aria-label="Hy prompt template"
             />
           </label>
-          <span class="settings-help" style="grid-column: 1 / -1">Hy-MT2 推理推荐 system 为空，1.8B/7B 官方参数 temperature 0.7 / top_p 0.6 / top_k 20 已在后端生效。</span>
-          <label class="settings-field settings-field-wide settings-textarea">
-            <span>User 预设提示词</span>
-            <n-input
-              v-model:value="userPrompt"
-              type="textarea"
-              maxlength="4096"
-              placeholder="可选：术语示例 'apple translates to 苹果'；风格示例 '风格要严格符合【商务正式】'；分隔符示例 '保留等量分隔符'。将追加于官方 Default 模板之前。"
-              :autosize="{ minRows: 3, maxRows: 6 }"
-              aria-label="Hy user preset prompt"
-            />
-          </label>
-          <span class="settings-help" style="grid-column: 1 / -1">User 预设将作为 Additional requirements 拼于翻译任务前，参考官方 Terminology / Style / Delimiters 等模板。</span>
+          <span class="settings-help" style="grid-column: 1 / -1">留空使用官方 Default 模板；若模板包含 {source_text} 则视为完整模板并直接替换占位符后使用（覆盖 Default）；否则视为附加约束拼于 Default 之前。支持批量 {format_type}。</span>
         </div>
       </n-card>
 

@@ -405,8 +405,7 @@ describe("backend settings commands", () => {
         maxTurns: 4,
       },
       prompt: {
-        system: "Return concise JSON.",
-        user: "Preserve product names.",
+        template: "Preserve product names.",
       },
       message: "ready",
     };
@@ -418,8 +417,7 @@ describe("backend settings commands", () => {
 
     expect(result.generation.seed).toBe("42");
     expect(result.memory.enabled).toBe(true);
-    expect(result.prompt.system).toBe("Return concise JSON.");
-    expect(result.prompt.user).toBe("Preserve product names.");
+    expect(result.prompt.template).toBe("Preserve product names.");
     expect(calls).toEqual([{ command: "get_backend_status", args: undefined }]);
   });
 
@@ -452,8 +450,7 @@ describe("backend settings commands", () => {
         maxTurns: 4,
       },
       prompt: {
-        system: "Return concise JSON.",
-        user: "Preserve product names.",
+        template: "Preserve product names.",
       },
     };
     const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];

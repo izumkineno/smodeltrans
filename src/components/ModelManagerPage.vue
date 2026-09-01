@@ -722,8 +722,7 @@ async function saveModelSettings() {
       maxTurns: memoryTurns,
     },
     prompt: {
-      system: status.prompt.system,
-      user: status.prompt.user,
+      template: (status.prompt as any).template ?? (status.prompt as any).prompt ?? [(status.prompt as any).system, (status.prompt as any).user].filter(Boolean).join("\n\n") ?? "",
     },
   };
 
