@@ -40,8 +40,47 @@ const themeModeLabels: Record<ThemeMode, string> = {
   light: "浅色（手动）",
   dark: "深色（手动）",
 };
+const targetLanguageOptions: Array<{ label: string; value: string }> = [
+  { label: "中文 (Chinese · zh)", value: "Chinese" },
+  { label: "英语 (English · en)", value: "English" },
+  { label: "法语 (French · fr)", value: "French" },
+  { label: "葡萄牙语 (Portuguese · pt)", value: "Portuguese" },
+  { label: "西班牙语 (Spanish · es)", value: "Spanish" },
+  { label: "日语 (Japanese · ja)", value: "Japanese" },
+  { label: "土耳其语 (Turkish · tr)", value: "Turkish" },
+  { label: "俄语 (Russian · ru)", value: "Russian" },
+  { label: "阿拉伯语 (Arabic · ar)", value: "Arabic" },
+  { label: "韩语 (Korean · ko)", value: "Korean" },
+  { label: "泰语 (Thai · th)", value: "Thai" },
+  { label: "意大利语 (Italian · it)", value: "Italian" },
+  { label: "德语 (German · de)", value: "German" },
+  { label: "越南语 (Vietnamese · vi)", value: "Vietnamese" },
+  { label: "马来语 (Malay · ms)", value: "Malay" },
+  { label: "印尼语 (Indonesian · id)", value: "Indonesian" },
+  { label: "菲律宾语 (Filipino · tl)", value: "Filipino" },
+  { label: "印地语 (Hindi · hi)", value: "Hindi" },
+  { label: "繁体中文 (Traditional Chinese · zh-Hant)", value: "Traditional Chinese" },
+  { label: "波兰语 (Polish · pl)", value: "Polish" },
+  { label: "捷克语 (Czech · cs)", value: "Czech" },
+  { label: "荷兰语 (Dutch · nl)", value: "Dutch" },
+  { label: "高棉语 (Khmer · km)", value: "Khmer" },
+  { label: "缅甸语 (Burmese · my)", value: "Burmese" },
+  { label: "波斯语 (Persian · fa)", value: "Persian" },
+  { label: "古吉拉特语 (Gujarati · gu)", value: "Gujarati" },
+  { label: "乌尔都语 (Urdu · ur)", value: "Urdu" },
+  { label: "泰卢固语 (Telugu · te)", value: "Telugu" },
+  { label: "马拉地语 (Marathi · mr)", value: "Marathi" },
+  { label: "希伯来语 (Hebrew · he)", value: "Hebrew" },
+  { label: "孟加拉语 (Bengali · bn)", value: "Bengali" },
+  { label: "泰米尔语 (Tamil · ta)", value: "Tamil" },
+  { label: "乌克兰语 (Ukrainian · uk)", value: "Ukrainian" },
+  { label: "藏语 (Tibetan · bo)", value: "Tibetan" },
+  { label: "哈萨克语 (Kazakh · kk)", value: "Kazakh" },
+  { label: "蒙古语 (Mongolian · mn)", value: "Mongolian" },
+  { label: "维吾尔语 (Uyghur · ug)", value: "Uyghur" },
+  { label: "粤语 (Cantonese · yue)", value: "Cantonese" },
+];
 const toast = useMessage();
-
 function setSettingsFeedback(
   type: WorkspaceToastType,
   message: string,
@@ -106,11 +145,11 @@ async function refreshBackendStatus(notify = true) {
     settingsLoading.value = false;
   }
 }
-
 async function saveSettings() {
   const nextLanguage = targetLanguage.value.trim();
-  if (Array.from(nextLanguage).length < 1 || Array.from(nextLanguage).length > 64) {
-    setSettingsFeedback("error", "目标语言长度必须为 1 到 64 个字符。");
+  const isSupported = targetLanguageOptions.some((opt) => opt.value === nextLanguage);
+  if (!isSupported) {
+    setSettingsFeedback("error", "目标语言不在 Hy-MT2 支持列表内，请从下拉选择（38 种）。");
     return;
   }
 
@@ -253,39 +292,47 @@ onMounted(() => {
             <h2>目标语言与提示词</h2>
           </div>
         </div>
-        <p class="settings-card-copy">先设置目标语言；system 和 user 预设提示词会作为下一次翻译请求的默认模型上下文。</p>
+        <p class="settings-card-copy">
+          目标语言决定 Hy-MT2 的 <code>target_lang</code>（需使用<strong>完整语言名</strong>，English prompt 用英文名，中文 prompt 用中文名）。
+          本地翻译默认使用官方 Default 模板：<code>Translate the following text into {target}. Note that you should only output the translated result without any additional explanation: {text}</code>，
+          参考 <a href="https://github.com/Tencent-Hunyuan/Hy-MT2#hy-mt2-translation-task-instruction-examples-chinese-english-comparison" target="_blank">Hy-MT2 官方指令示例</a>。
+          模型无默认 system prompt，建议留空；术语/风格等高级指令请写入 User 预设。
+        </p>
         <div class="settings-field-grid">
           <label class="settings-field">
             <span>目标语言</span>
-            <n-input
+            <n-select
               v-model:value="targetLanguage"
-              maxlength="64"
-              placeholder="例如：Chinese"
+              :options="targetLanguageOptions"
+              placeholder="选择目标语言（Hy-MT2 支持 38 种）"
               aria-label="目标语言"
             />
           </label>
+          <span class="settings-help" style="grid-column: 1 / -1">仅支持 Hy-MT2 官方 38 语言，已自动归一化英文全称；不支持的语言将校验失败。</span>
           <label class="settings-field settings-field-wide settings-textarea">
             <span>System 预设提示词</span>
             <n-input
               v-model:value="systemPrompt"
               type="textarea"
               maxlength="4096"
-              placeholder="可选：例如 Return concise JSON."
+              placeholder="建议留空（Hy-MT2 官方：no default system_prompt）。如需角色约束，例如：You are a professional translator."
               :autosize="{ minRows: 3, maxRows: 6 }"
               aria-label="Hy system prompt"
             />
           </label>
+          <span class="settings-help" style="grid-column: 1 / -1">Hy-MT2 推理推荐 system 为空，1.8B/7B 官方参数 temperature 0.7 / top_p 0.6 / top_k 20 已在后端生效。</span>
           <label class="settings-field settings-field-wide settings-textarea">
             <span>User 预设提示词</span>
             <n-input
               v-model:value="userPrompt"
               type="textarea"
               maxlength="4096"
-              placeholder="可选：例如 Preserve product names and translate only visible text."
+              placeholder="可选：术语示例 'apple translates to 苹果'；风格示例 '风格要严格符合【商务正式】'；分隔符示例 '保留等量分隔符'。将追加于官方 Default 模板之前。"
               :autosize="{ minRows: 3, maxRows: 6 }"
               aria-label="Hy user preset prompt"
             />
           </label>
+          <span class="settings-help" style="grid-column: 1 / -1">User 预设将作为 Additional requirements 拼于翻译任务前，参考官方 Terminology / Style / Delimiters 等模板。</span>
         </div>
       </n-card>
 

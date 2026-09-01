@@ -16,6 +16,49 @@ const DEFAULT_REGION_PARALLELISM: usize = 16;
 const DEFAULT_TRANSLATION_BATCH_SIZE: usize = 4;
 const MAX_TARGET_LANGUAGE_CHARS: usize = 64;
 
+/// Hy-MT2 官方支持的完整语言名称（English prompt 使用 English 名称，中文 prompt 使用中文名称）。
+/// 来源：https://github.com/Tencent-Hunyuan/Hy-MT2#supported-languages
+/// 英文名为 canonical 值，校验时对中文名/缩写做归一化。
+pub(crate) const SUPPORTED_TARGET_LANGUAGES: &[(&str, &str, &str)] = &[
+    ("Chinese", "中文", "zh"),
+    ("English", "英语", "en"),
+    ("French", "法语", "fr"),
+    ("Portuguese", "葡萄牙语", "pt"),
+    ("Spanish", "西班牙语", "es"),
+    ("Japanese", "日语", "ja"),
+    ("Turkish", "土耳其语", "tr"),
+    ("Russian", "俄语", "ru"),
+    ("Arabic", "阿拉伯语", "ar"),
+    ("Korean", "韩语", "ko"),
+    ("Thai", "泰语", "th"),
+    ("Italian", "意大利语", "it"),
+    ("German", "德语", "de"),
+    ("Vietnamese", "越南语", "vi"),
+    ("Malay", "马来语", "ms"),
+    ("Indonesian", "印尼语", "id"),
+    ("Filipino", "菲律宾语", "tl"),
+    ("Hindi", "印地语", "hi"),
+    ("Traditional Chinese", "繁体中文", "zh-Hant"),
+    ("Polish", "波兰语", "pl"),
+    ("Czech", "捷克语", "cs"),
+    ("Dutch", "荷兰语", "nl"),
+    ("Khmer", "高棉语", "km"),
+    ("Burmese", "缅甸语", "my"),
+    ("Persian", "波斯语", "fa"),
+    ("Gujarati", "古吉拉特语", "gu"),
+    ("Urdu", "乌尔都语", "ur"),
+    ("Telugu", "泰卢固语", "te"),
+    ("Marathi", "马拉地语", "mr"),
+    ("Hebrew", "希伯来语", "he"),
+    ("Bengali", "孟加拉语", "bn"),
+    ("Tamil", "泰米尔语", "ta"),
+    ("Ukrainian", "乌克兰语", "uk"),
+    ("Tibetan", "藏语", "bo"),
+    ("Kazakh", "哈萨克语", "kk"),
+    ("Mongolian", "蒙古语", "mn"),
+    ("Uyghur", "维吾尔语", "ug"),
+    ("Cantonese", "粤语", "yue"),
+];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeviceKind {
     Cpu,
@@ -1044,9 +1087,32 @@ fn unique_trimmed_strings(values: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::with_capacity(values.len());
     values
         .into_iter()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| seen.insert(value.clone()))
+        .filter_map(|value| {
+            let trimmed = value.trim().to_owned();
+            if trimmed.is_empty() || !seen.insert(trimmed.clone()) {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
         .collect()
+}
+
+fn normalize_target_language(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for (en, zh, abbr) in SUPPORTED_TARGET_LANGUAGES {
+        if lower == en.to_ascii_lowercase()
+            || trimmed == *zh
+            || lower == abbr.to_ascii_lowercase()
+        {
+            return Some(en.to_string());
+        }
+    }
+    None
 }
 
 fn validate_target_language(value: &str) -> Result<String, String> {
@@ -1057,7 +1123,18 @@ fn validate_target_language(value: &str) -> Result<String, String> {
             "targetLanguage must contain 1..={MAX_TARGET_LANGUAGE_CHARS} characters"
         ));
     }
-    Ok(value.to_owned())
+    if let Some(canonical) = normalize_target_language(value) {
+        return Ok(canonical);
+    }
+    let supported = SUPPORTED_TARGET_LANGUAGES
+        .iter()
+        .map(|(en, _, _)| *en)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "targetLanguage '{}' 不在 Hy-MT2 支持列表内，支持：{supported}",
+        value
+    ))
 }
 
 fn parse_device(value: &str) -> Result<DeviceKind, String> {
@@ -1234,6 +1311,7 @@ mod tests {
             memory: MemoryConfig::default(),
             model_root: PathBuf::from("C:\\models"),
             catalog: ModelCatalog::default(),
+            openai_compat: Default::default(),
         }
     }
 

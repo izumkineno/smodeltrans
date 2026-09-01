@@ -493,8 +493,11 @@ pub(crate) fn translation_text_is_usable(
 pub(crate) fn build_translation_prompt(text: &str, target_language: &str) -> String {
     let target_language = target_language.trim();
     let text = text.trim();
+    // Hy-MT2 官方 Default Translation（English）：
+    // "Translate the following text into {target_lang}. Note that you should only output the translated result without any additional explanation:\n\n{source_text}"
+    // 中文 prompt 需用中文全称，English prompt 用英文全称；此处为 English prompt，target_language 已归一化为英文全称。
     let prefix = "Translate the following text into ";
-    let middle = ". Output only the translation: ";
+    let middle = ". Note that you should only output the translated result without any additional explanation:\n\n";
     let mut prompt =
         String::with_capacity(prefix.len() + target_language.len() + middle.len() + text.len());
     prompt.push_str(prefix);

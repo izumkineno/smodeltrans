@@ -730,6 +730,7 @@ mod tests {
             memory: MemoryConfig::default(),
             model_root: PathBuf::from("models"),
             catalog: Default::default(),
+            openai_compat: Default::default(),
         }
     }
 
@@ -808,6 +809,7 @@ mod tests {
             memory: MemoryConfig::default(),
             model_root: model_root.clone(),
             catalog: Default::default(),
+            openai_compat: Default::default(),
         };
         let mut engine = BackendEngine::new(settings).expect("CUDA engine");
         let image = decode_image(
