@@ -984,13 +984,26 @@ fn encode_followup_prompt(tokenizer: &Tokenizer, user_prompt: &str) -> Result<En
     encode_turn(tokenizer, "", user_prompt, false)
 }
 
-/// 按 Hy 1.8B 官方首轮/续轮模板拼接角色提示词。
+/// 按 Hy 1.8B/7B 官方首轮/续轮模板拼接角色提示词。
+/// 为防 prompt 注入，对用户输入中的 Hy 控制符做转义，避免其被解析为伪造的角色分隔。
+fn sanitize_user_prompt(prompt: &str) -> String {
+    // Hy 模板使用全宽 `｜` + `▁` 的特殊 token，需转义用户侧同形输入
+    // 插入零宽空格或空格使其不再被 tokenizer 识别为控制符，同时保留可读性
+    let mut s = prompt.replace("<｜hy_", "<｜\u{200B}hy_");
+    s = s.replace("<|hy_", "<|\u{200B}hy_");
+    s = s.replace("＜｜hy_", "＜｜\u{200B}hy_");
+    s = s.replace("｜>", "｜\u{200B}>");
+    s = s.replace("|>", "|\u{200B}>");
+    s
+}
+
 fn format_turn_prompt(system_prompt: &str, user_prompt: &str, first_turn: bool) -> String {
     const BEGIN: &str = "<｜hy_begin▁of▁sentence｜>";
     const SYSTEM_SUFFIX: &str = "<｜hy_place▁holder▁no▁3｜>";
     const USER_PREFIX: &str = "<｜hy_User｜>";
     const ASSISTANT_PREFIX: &str = "<｜hy_Assistant｜>";
 
+    let sanitized_user = sanitize_user_prompt(user_prompt);
     let system_len = if first_turn && !system_prompt.is_empty() {
         system_prompt.len() + SYSTEM_SUFFIX.len()
     } else {
@@ -1000,7 +1013,7 @@ fn format_turn_prompt(system_prompt: &str, user_prompt: &str, first_turn: bool) 
         if first_turn { BEGIN.len() } else { 0 }
             + system_len
             + USER_PREFIX.len()
-            + user_prompt.len()
+            + sanitized_user.len()
             + ASSISTANT_PREFIX.len(),
     );
     if first_turn {
@@ -1011,7 +1024,7 @@ fn format_turn_prompt(system_prompt: &str, user_prompt: &str, first_turn: bool) 
         }
     }
     formatted.push_str(USER_PREFIX);
-    formatted.push_str(user_prompt);
+    formatted.push_str(&sanitized_user);
     formatted.push_str(ASSISTANT_PREFIX);
     formatted
 }

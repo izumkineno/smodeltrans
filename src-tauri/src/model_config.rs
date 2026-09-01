@@ -37,7 +37,15 @@ impl Default for GenerationConfig {
             repetition_penalty: 1.05,
             frequency_penalty: 0.0,
             stop_tokens: Vec::new(),
-            stop_strings: Vec::new(),
+            // Hy 角色分隔符：模型若尝试续写下一轮对话应立即截断，避免 7B 等模型在长输出末尾伪造 <｜hy_User｜> 等
+            stop_strings: vec![
+                "<｜hy_User｜>".to_owned(),
+                "<｜hy_Assistant｜>".to_owned(),
+                "<｜hy_begin▁of▁sentence｜>".to_owned(),
+                "<｜hy_place▁holder▁no▁3｜>".to_owned(),
+                "<|hy_User|>".to_owned(),
+                "<|hy_Assistant|>".to_owned(),
+            ],
         }
     }
 }
