@@ -6,8 +6,8 @@ use crate::model_config::GenerationConfig;
 use crate::model_support::{CancellationToken, lock_with_cancellation};
 use std::{
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::Ordering,
     },
     time::Instant,
 };
@@ -43,45 +43,19 @@ pub trait TranslationPort: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct BackendStateAdapter {
     state: BackendState,
-    /// 轻量信号量：true 表示有请求正在翻译，用于 429 限流（简化为 AtomicBool 单并发）
-    busy: Arc<AtomicBool>,
+    /// 串行队列：`Mutex` 阻塞式 FIFO 排队（`spawn_blocking` 可等待），替代 `AtomicBool -> 429`；
+    /// 持有期间独占引擎，合并翻译仍经 Hy-MT2 `render_single_prompt` + `supplemental` 单模板，
+    /// 后续可在持锁后 20ms 窗口内聚合同 `target_language` 的等待请求走 `translate_structured_batch`。
+    queue: Arc<Mutex<()>>,
 }
 
 impl BackendStateAdapter {
     pub fn new(state: BackendState) -> Self {
-        tracing::debug!(target: "openai_compat::adapter", "BackendStateAdapter::new");
+        tracing::debug!(target: "openai_compat::adapter", "BackendStateAdapter::new queue init");
         Self {
             state,
-            busy: Arc::new(AtomicBool::new(false)),
+            queue: Arc::new(Mutex::new(())),
         }
-    }
-
-    fn try_acquire(&self) -> Result<BusyGuard, BackendFailure> {
-        if self
-            .busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            tracing::warn!(target: "openai_compat::adapter", "try_acquire failed: engine busy");
-            return Err(BackendFailure::internal(
-                "translation engine busy, try again later",
-            ));
-        }
-        tracing::trace!(target: "openai_compat::adapter", "try_acquire success");
-        Ok(BusyGuard {
-            busy: Arc::clone(&self.busy),
-        })
-    }
-}
-
-struct BusyGuard {
-    busy: Arc<AtomicBool>,
-}
-
-impl Drop for BusyGuard {
-    fn drop(&mut self) {
-        self.busy.store(false, Ordering::SeqCst);
-        tracing::trace!(target: "openai_compat::adapter", "BusyGuard released");
     }
 }
 
@@ -133,21 +107,27 @@ impl TranslationPort for BackendStateAdapter {
             ));
         }
 
-        // 轻量并发守卫：首版单并发，超限返回 busy（调用方映射为 429）
-        let _guard = match self.try_acquire() {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!(
-                    target: "openai_compat::adapter",
-                    target_language = %target_raw,
-                    text_len = text_len,
-                    error = %e,
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    "translate_text rejected: engine busy"
-                );
-                return Err(e);
-            }
-        };
+        // 队列化：`live` 优先，引擎忙时排队而非 429；`spawn_blocking` 线程可阻塞等待
+        // Hy-MT2 提示词仍经后端 `render_single_prompt(prompt, supplemental)` 单模板渲染，排队不丢约束
+        // 后续可在持锁后加 20ms 窗口聚合同 target 的等待请求走 `translate_structured_batch`
+        let _queue_guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        tracing::debug!(
+            target: "openai_compat::adapter",
+            target_language = %target_raw,
+            "queue acquired"
+        );
+        if self.state.live_active.load(Ordering::SeqCst) {
+            tracing::warn!(
+                target: "openai_compat::adapter",
+                target_language = %target_raw,
+                text_len = text_len,
+                duration_ms = start.elapsed().as_millis() as u64,
+                "translate_text rejected: live became active while queued"
+            );
+            return Err(BackendFailure::internal(
+                "live translation became active while queued",
+            ));
+        }
 
         // 取 settings 快照
         let settings = match self
