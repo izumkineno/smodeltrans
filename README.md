@@ -210,6 +210,7 @@ tauri-mcp driver-session stop
 - 工程边界与首版工作流：[`docs/ENGINEERING_PLAN.md`](docs/ENGINEERING_PLAN.md)
 - 实时 OCR 完整链路：[`docs/LIVE_OCR_PIPELINE.md`](docs/LIVE_OCR_PIPELINE.md)
 - 选区翻译研究：[`docs/SELECTED_TEXT_TRANSLATION_RESEARCH.md`](docs/SELECTED_TEXT_TRANSLATION_RESEARCH.md)
+- OpenAI 兼容 API（文本+Vision 图片 OCR-翻译）：[`docs/OPENAI_COMPAT_API.md`](docs/OPENAI_COMPAT_API.md)
 - UI 体系：[`docs/UI_REDESIGN_SYSTEM.md`](docs/UI_REDESIGN_SYSTEM.md) / [`docs/UI_REDESIGN_PAGES.md`](docs/UI_REDESIGN_PAGES.md)
 - 下载器原理：[`simple_downloader` docs](https://github.com/izumkineno/simple_downloader/tree/main/docs)（`usage.md`/`architecture.md`/`configuration.md`）
 
