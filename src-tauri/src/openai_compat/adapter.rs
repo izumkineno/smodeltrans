@@ -1,7 +1,7 @@
 //! 解耦适配层：唯一允许触碰 `BackendState` 的文件。
 //! 禁止在 `openai_compat` 其他文件中 `use crate::backend::engine` 或 `crate::models::hy`.
 
-use crate::backend::{commands::BackendState, failure::BackendFailure};
+use crate::backend::{commands::BackendState, contracts::TranslationOutput, failure::BackendFailure};
 use crate::model_config::GenerationConfig;
 use crate::model_support::{CancellationToken, lock_with_cancellation};
 use std::{
@@ -33,6 +33,15 @@ pub trait TranslationPort: Send + Sync + 'static {
         // 默认回落：忽略 supplemental，保持兼容
         self.translate_text(text, target_language, generation_override)
     }
+    fn translate_image(
+        &self,
+        image_base64: String,
+        file_name: String,
+        target_language: String,
+        supplemental_prompt: String,
+        generation_override: Option<GenerationConfig>,
+    ) -> Result<TranslationOutput, BackendFailure>;
+
     fn is_ready(&self) -> bool;
 
     fn model_states(&self) -> Result<(bool, bool), BackendFailure>;
@@ -355,6 +364,307 @@ impl TranslationPort for BackendStateAdapter {
         result
     }
 
+    fn translate_image(
+        &self,
+        image_base64: String,
+        file_name: String,
+        target_language: String,
+        supplemental_prompt: String,
+        generation_override: Option<GenerationConfig>,
+    ) -> Result<TranslationOutput, BackendFailure> {
+        let start = Instant::now();
+        let image_base64_len = image_base64.len();
+        let file_name_raw = file_name.clone();
+        let target_raw = target_language.clone();
+        let supplemental_len = supplemental_prompt.chars().count();
+        let has_override = generation_override.is_some();
+        tracing::debug!(
+            target: "openai_compat::adapter",
+            target_language = %target_raw,
+            file_name = %file_name_raw,
+            image_base64_len = image_base64_len,
+            supplemental_len = supplemental_len,
+            has_generation_override = has_override,
+            "translate_image called"
+        );
+        self.state.touch_activity();
+        if self.state.live_active.load(Ordering::SeqCst) {
+            tracing::warn!(
+                target: "openai_compat::adapter",
+                target_language = %target_raw,
+                file_name = %file_name_raw,
+                image_base64_len = image_base64_len,
+                duration_ms = start.elapsed().as_millis() as u64,
+                "translate_image rejected: live active at entry"
+            );
+            return Err(BackendFailure::internal(
+                "live translation is active, openai compat busy",
+            ));
+        }
+        let _queue_guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        tracing::debug!(
+            target: "openai_compat::adapter",
+            target_language = %target_raw,
+            file_name = %file_name_raw,
+            "translate_image queue acquired"
+        );
+        if self.state.live_active.load(Ordering::SeqCst) {
+            tracing::warn!(
+                target: "openai_compat::adapter",
+                target_language = %target_raw,
+                file_name = %file_name_raw,
+                image_base64_len = image_base64_len,
+                duration_ms = start.elapsed().as_millis() as u64,
+                "translate_image rejected: live became active while queued"
+            );
+            return Err(BackendFailure::internal(
+                "live translation became active while queued",
+            ));
+        }
+        let settings = match self
+            .state
+            .settings
+            .lock()
+            .map_err(|_| BackendFailure::internal("后端配置锁已损坏"))
+            .and_then(|guard| guard.clone().map_err(BackendFailure::arguments))
+        {
+            Ok(s) => {
+                tracing::debug!(
+                    target: "openai_compat::adapter",
+                    target_language = %target_raw,
+                    file_name = %file_name_raw,
+                    "translate_image settings snapshot acquired"
+                );
+                s
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "openai_compat::adapter",
+                    target_language = %target_raw,
+                    file_name = %file_name_raw,
+                    error = %e,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "translate_image failed: settings lock error"
+                );
+                return Err(e);
+            }
+        };
+        let target_language = target_language.trim().to_owned();
+        if target_language.is_empty() || target_language.len() > 64 {
+            tracing::warn!(
+                target: "openai_compat::adapter",
+                target_language = %target_language,
+                original = %target_raw,
+                file_name = %file_name_raw,
+                duration_ms = start.elapsed().as_millis() as u64,
+                "translate_image rejected: invalid target_language"
+            );
+            return Err(BackendFailure::arguments("target_language 非法"));
+        }
+        if image_base64.is_empty() {
+            tracing::warn!(
+                target: "openai_compat::adapter",
+                target_language = %target_language,
+                file_name = %file_name_raw,
+                image_base64_len = image_base64_len,
+                duration_ms = start.elapsed().as_millis() as u64,
+                "translate_image rejected: empty image_base64"
+            );
+            return Err(BackendFailure::arguments(
+                "imageBase64 must be non-empty ASCII",
+            ));
+        }
+        tracing::debug!(
+            target: "openai_compat::adapter",
+            target_language = %target_language,
+            file_name = %file_name_raw,
+            supplemental_len = supplemental_len,
+            supplemental_ignored = true,
+            "translate_image supplemental_prompt ignored for image pipeline, reserved for future engine.translate_with_supplemental"
+        );
+        let _ = supplemental_prompt;
+        let token = CancellationToken::new();
+        let result = {
+            let mut engine_guard = match lock_with_cancellation(&self.state.engine, &token) {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::error!(
+                        target: "openai_compat::adapter",
+                        target_language = %target_language,
+                        file_name = %file_name_raw,
+                        error = %e,
+                        duration_ms = start.elapsed().as_millis() as u64,
+                        "translate_image failed: engine lock error"
+                    );
+                    return Err(e);
+                }
+            };
+            if engine_guard.is_none() {
+                tracing::info!(
+                    target: "openai_compat::adapter",
+                    target_language = %target_language,
+                    file_name = %file_name_raw,
+                    "translate_image engine uninitialized, creating BackendEngine"
+                );
+                let engine_init_start = Instant::now();
+                match crate::backend::engine::BackendEngine::new(settings.clone()) {
+                    Ok(engine) => {
+                        tracing::info!(
+                            target: "openai_compat::adapter",
+                            target_language = %target_language,
+                            file_name = %file_name_raw,
+                            duration_ms = engine_init_start.elapsed().as_millis() as u64,
+                            "BackendEngine created"
+                        );
+                        *engine_guard = Some(engine);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "openai_compat::adapter",
+                            target_language = %target_language,
+                            file_name = %file_name_raw,
+                            error = %e,
+                            duration_ms = engine_init_start.elapsed().as_millis() as u64,
+                            "BackendEngine creation failed"
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+            if self.state.live_active.load(Ordering::SeqCst) {
+                tracing::warn!(
+                    target: "openai_compat::adapter",
+                    target_language = %target_language,
+                    file_name = %file_name_raw,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "translate_image rejected: live became active while waiting for engine"
+                );
+                return Err(BackendFailure::internal(
+                    "live translation became active while waiting for engine",
+                ));
+            }
+            self.state.touch_activity();
+            let engine = engine_guard
+                .as_mut()
+                .ok_or_else(|| {
+                    tracing::error!(target: "openai_compat::adapter", target_language = %target_language, file_name = %file_name_raw, "translate_image failed: Candle backend not initialized");
+                    BackendFailure::internal("Candle 后端未初始化")
+                })?;
+            let decoded = match crate::backend::input::decode_image(&image_base64, file_name.clone(), target_language.clone()) {
+                Ok(d) => {
+                    tracing::debug!(
+                        target: "openai_compat::adapter",
+                        target_language = %target_language,
+                        file_name = %file_name_raw,
+                        width = d.canvas().width(),
+                        height = d.canvas().height(),
+                        "translate_image decode_image succeeded"
+                    );
+                    d
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "openai_compat::adapter",
+                        target_language = %target_language,
+                        file_name = %file_name_raw,
+                        error = %e,
+                        duration_ms = start.elapsed().as_millis() as u64,
+                        "translate_image failed: decode_image error"
+                    );
+                    return Err(e);
+                }
+            };
+            let original_generation = engine.settings.generation.clone();
+            let has_override = generation_override.is_some();
+            if let Some(ov) = generation_override.clone() {
+                tracing::debug!(
+                    target: "openai_compat::adapter",
+                    target_language = %target_language,
+                    file_name = %file_name_raw,
+                    temperature = ov.temperature,
+                    top_p = ov.top_p,
+                    top_k = ov.top_k,
+                    max_new_tokens = ov.max_new_tokens,
+                    "translate_image applying generation override"
+                );
+                engine.settings.generation = ov;
+            }
+            let translate_start = Instant::now();
+            tracing::debug!(
+                target: "openai_compat::adapter",
+                target_language = %target_language,
+                file_name = %file_name_raw,
+                has_override = has_override,
+                "engine.translate started"
+            );
+            let out_res = engine.translate(&decoded, &token, |_, _| {});
+            if has_override {
+                engine.settings.generation = original_generation;
+                tracing::trace!(target: "openai_compat::adapter", target_language = %target_language, file_name = %file_name_raw, "generation override restored");
+            }
+            match &out_res {
+                Ok(output) => {
+                    tracing::debug!(
+                        target: "openai_compat::adapter",
+                        target_language = %target_language,
+                        file_name = %file_name_raw,
+                        text_len = output.text.len(),
+                        text_chars = output.text.chars().count(),
+                        is_translated = output.is_translated,
+                        annotated_png_len = output.annotated_png.len(),
+                        engine_duration_ms = translate_start.elapsed().as_millis() as u64,
+                        total_duration_ms = start.elapsed().as_millis() as u64,
+                        "engine.translate succeeded"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "openai_compat::adapter",
+                        target_language = %target_language,
+                        file_name = %file_name_raw,
+                        error = %e,
+                        engine_duration_ms = translate_start.elapsed().as_millis() as u64,
+                        total_duration_ms = start.elapsed().as_millis() as u64,
+                        "engine.translate failed"
+                    );
+                }
+            }
+            out_res
+        };
+        self.state.touch_activity();
+        match &result {
+            Ok(output) => {
+                tracing::info!(
+                    target: "openai_compat::adapter",
+                    target_language = %target_language,
+                    file_name = %file_name_raw,
+                    image_base64_len = image_base64_len,
+                    text_len = output.text.len(),
+                    text_chars = output.text.chars().count(),
+                    annotated_png_len = output.annotated_png.len(),
+                    is_translated = output.is_translated,
+                    has_generation_override = has_override,
+                    supplemental_len = supplemental_len,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "translate_image success"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "openai_compat::adapter",
+                    target_language = %target_language,
+                    file_name = %file_name_raw,
+                    image_base64_len = image_base64_len,
+                    has_generation_override = has_override,
+                    error = %e,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "translate_image failed"
+                );
+            }
+        }
+        result
+    }
+
     fn is_ready(&self) -> bool {
         let ready = self.model_states()
             .map(|(ocr, hy)| ocr || hy)
@@ -414,6 +724,23 @@ pub mod mock {
         ) -> Result<String, BackendFailure> {
             tracing::debug!(target: "openai_compat::adapter", mock_text_len = _text.len(), mock_lang = %_lang, "MockPort translate_text called");
             Ok(self.return_text.clone())
+        }
+        fn translate_image(
+            &self,
+            _image_base64: String,
+            _file_name: String,
+            _target_language: String,
+            _supplemental_prompt: String,
+            _generation_override: Option<GenerationConfig>,
+        ) -> Result<TranslationOutput, BackendFailure> {
+            tracing::debug!(target: "openai_compat::adapter", mock_file = %_file_name, mock_lang = %_target_language, "MockPort translate_image called");
+            Ok(TranslationOutput {
+                annotated_png: vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+                markdown: String::new(),
+                text: self.return_text.clone(),
+                provider_label: "mock".into(),
+                is_translated: true,
+            })
         }
         fn is_ready(&self) -> bool {
             tracing::trace!(target: "openai_compat::adapter", "MockPort is_ready");

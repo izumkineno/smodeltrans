@@ -142,6 +142,47 @@ impl ChatCompletionRequest {
     pub fn is_stream(&self) -> bool {
         self.stream.unwrap_or(false)
     }
+
+    pub fn image_urls(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for msg in &self.messages {
+            if let MessageContent::Parts(parts) = &msg.content {
+                for p in parts {
+                    if let ContentPart::ImageUrl { image_url } = p {
+                        out.push(image_url.url.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn has_image(&self) -> bool {
+        !self.image_urls().is_empty()
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.image_urls().len()
+    }
+}
+
+pub fn peel_data_url(url: &str) -> Result<String, String> {
+    let t = url.trim();
+    if t.is_empty() {
+        return Err("empty url".into());
+    }
+    if t.len() >= 5 && t[..5].eq_ignore_ascii_case("data:") {
+        let comma = t.find(',').ok_or_else(|| "malformed data URL".to_string())?;
+        let meta = &t[..comma];
+        if !meta.to_ascii_lowercase().contains(";base64") {
+            return Err("data URL missing ;base64".into());
+        }
+        return Ok(t[comma + 1..].to_owned());
+    }
+    if t.contains("://") || t.contains(':') {
+        return Err("remote url not supported".into());
+    }
+    Ok(t.to_owned())
 }
 
 fn parse_translate_prefix(text: &str) -> Option<String> {
@@ -180,9 +221,48 @@ pub struct Choice {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum MessageContentOut {
+    Text(String),
+    Parts(Vec<ContentPartOut>),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum ContentPartOut {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlOut },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageUrlOut {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatMessageOut {
     pub role: String,
-    pub content: String,
+    pub content: MessageContentOut,
+}
+
+impl ChatMessageOut {
+    pub fn with_image(text: String, image_data_url: Option<String>) -> Self {
+        let content = match image_data_url {
+            Some(url) if !url.trim().is_empty() => MessageContentOut::Parts(vec![
+                ContentPartOut::Text { text: text.clone() },
+                ContentPartOut::ImageUrl {
+                    image_url: ImageUrlOut { url },
+                },
+            ]),
+            _ => MessageContentOut::Text(text),
+        };
+        Self {
+            role: "assistant".to_owned(),
+            content,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -249,8 +329,34 @@ pub fn new_chat_response(model: &str, content: &str, prompt_tokens: usize, compl
             index: 0,
             message: ChatMessageOut {
                 role: "assistant".to_owned(),
-                content: content.to_owned(),
+                content: MessageContentOut::Text(content.to_owned()),
             },
+            finish_reason: "stop".to_owned(),
+        }],
+        usage: Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        },
+    }
+}
+
+pub fn new_chat_response_with_image(
+    model: &str,
+    text: String,
+    image_opt: Option<String>,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> ChatCompletionResponse {
+    let id = format!("chatcmpl-{}", &uuid_simple());
+    ChatCompletionResponse {
+        id,
+        object: "chat.completion".to_owned(),
+        created: now_secs(),
+        model: model.to_owned(),
+        choices: vec![Choice {
+            index: 0,
+            message: ChatMessageOut::with_image(text, image_opt),
             finish_reason: "stop".to_owned(),
         }],
         usage: Usage {
@@ -280,4 +386,238 @@ fn uuid_simple() -> String {
         .hash(&mut hasher);
     std::thread::current().id().hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn peel_data_url_png() {
+        let url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+        assert_eq!(peel_data_url(url).unwrap(), "iVBORw0KGgoAAAANSUhEUg==");
+    }
+
+    #[test]
+    fn peel_data_url_jpeg() {
+        let url = "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+        assert_eq!(peel_data_url(url).unwrap(), "/9j/4AAQSkZJRg==");
+    }
+
+    #[test]
+    fn peel_data_url_jpeg_uppercase() {
+        let url = "DATA:IMAGE/JPEG;BASE64,/9j/4AAQSkZJRg==";
+        assert_eq!(peel_data_url(url).unwrap(), "/9j/4AAQSkZJRg==");
+    }
+
+    #[test]
+    fn peel_data_url_webp() {
+        let url = "data:image/webp;base64,UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoB";
+        assert_eq!(
+            peel_data_url(url).unwrap(),
+            "UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoB"
+        );
+    }
+
+    #[test]
+    fn peel_data_url_charset() {
+        let url = "data:image/png;charset=utf-8;base64,iVBORw0KGgoAAAANSUhEUg==";
+        assert_eq!(peel_data_url(url).unwrap(), "iVBORw0KGgoAAAANSUhEUg==");
+    }
+
+    #[test]
+    fn peel_data_url_charset_webp() {
+        let url = "data:image/webp;charset=utf-8;base64,UklGRxxx";
+        assert_eq!(peel_data_url(url).unwrap(), "UklGRxxx");
+    }
+
+    #[test]
+    fn peel_data_url_bare() {
+        let url = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
+        assert_eq!(peel_data_url(url).unwrap(), url);
+    }
+
+    #[test]
+    fn peel_data_url_https_reject() {
+        let url = "https://example.com/image.png";
+        assert_eq!(
+            peel_data_url(url).unwrap_err(),
+            "remote url not supported"
+        );
+    }
+
+    #[test]
+    fn peel_data_url_http_reject() {
+        let url = "http://example.com/x.jpg";
+        assert!(peel_data_url(url).is_err());
+        assert_eq!(peel_data_url(url).unwrap_err(), "remote url not supported");
+    }
+
+    #[test]
+    fn peel_data_url_blob_reject() {
+        let url = "blob:https://example.com/uuid";
+        assert_eq!(
+            peel_data_url(url).unwrap_err(),
+            "remote url not supported"
+        );
+    }
+
+    #[test]
+    fn peel_data_url_data_missing_base64() {
+        let url = "data:image/png,hello";
+        assert_eq!(
+            peel_data_url(url).unwrap_err(),
+            "data URL missing ;base64"
+        );
+    }
+
+    #[test]
+    fn peel_data_url_malformed_no_comma() {
+        let url = "data:image/png;base64";
+        assert_eq!(peel_data_url(url).unwrap_err(), "malformed data URL");
+    }
+
+    #[test]
+    fn peel_data_url_empty() {
+        assert_eq!(peel_data_url("").unwrap_err(), "empty url");
+        assert_eq!(peel_data_url("   ").unwrap_err(), "empty url");
+    }
+
+    #[test]
+    fn image_urls_extract() {
+        let req = ChatCompletionRequest {
+            model: "hy-mt2:Chinese".into(),
+            messages: vec![
+                ChatMessage {
+                    role: "user".into(),
+                    content: MessageContent::Parts(vec![
+                        ContentPart::Text {
+                            text: "hello".into(),
+                        },
+                        ContentPart::ImageUrl {
+                            image_url: ImageUrl {
+                                url: "data:image/png;base64,AAA".into(),
+                            },
+                        },
+                        ContentPart::ImageUrl {
+                            image_url: ImageUrl {
+                                url: "data:image/jpeg;base64,BBB".into(),
+                            },
+                        },
+                    ]),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: MessageContent::Text("ignore".into()),
+                },
+            ],
+            stream: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            seed: None,
+            target_language: None,
+            language: None,
+            extra: None,
+        };
+        assert_eq!(
+            req.image_urls(),
+            vec![
+                "data:image/png;base64,AAA".to_string(),
+                "data:image/jpeg;base64,BBB".to_string()
+            ]
+        );
+        assert!(req.has_image());
+        assert_eq!(req.image_count(), 2);
+    }
+
+    #[test]
+    fn image_urls_empty_when_text_only() {
+        let req = ChatCompletionRequest {
+            model: "hy-mt2".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: MessageContent::Text("hello".into()),
+            }],
+            stream: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            seed: None,
+            target_language: None,
+            language: None,
+            extra: None,
+        };
+        assert!(req.image_urls().is_empty());
+        assert!(!req.has_image());
+        assert_eq!(req.image_count(), 0);
+    }
+
+    #[test]
+    fn message_content_out_text_serializes_as_string() {
+        let msg = ChatMessageOut {
+            role: "assistant".into(),
+            content: MessageContentOut::Text("hi".into()),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["content"], json!("hi"));
+    }
+
+    #[test]
+    fn message_content_out_parts_serializes_as_array() {
+        let msg = ChatMessageOut::with_image(
+            "translated".into(),
+            Some("data:image/png;base64,AAA".into()),
+        );
+        let v = serde_json::to_value(&msg).unwrap();
+        assert!(v["content"].is_array());
+        assert_eq!(v["content"][0]["type"], json!("text"));
+        assert_eq!(v["content"][0]["text"], json!("translated"));
+        assert_eq!(v["content"][1]["type"], json!("image_url"));
+        assert_eq!(
+            v["content"][1]["image_url"]["url"],
+            json!("data:image/png;base64,AAA")
+        );
+    }
+
+    #[test]
+    fn new_chat_response_still_text() {
+        let resp = new_chat_response("hy-mt2", "hello", 10, 20);
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], json!("hello"));
+    }
+
+    #[test]
+    fn new_chat_response_with_image_parts() {
+        let resp = new_chat_response_with_image(
+            "hy-mt2",
+            "hi".into(),
+            Some("data:image/png;base64,AAA".into()),
+            10,
+            20,
+        );
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(v["choices"][0]["message"]["content"].is_array());
+        assert_eq!(
+            v["choices"][0]["message"]["content"][1]["image_url"]["url"],
+            json!("data:image/png;base64,AAA")
+        );
+    }
+
+    #[test]
+    fn new_chat_response_with_image_none_is_text() {
+        let resp = new_chat_response_with_image("hy-mt2", "hi".into(), None, 10, 20);
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], json!("hi"));
+    }
+
+    #[test]
+    fn with_image_empty_string_is_text() {
+        let msg = ChatMessageOut::with_image("hi".into(), Some("   ".into()));
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["content"], json!("hi"));
+    }
 }
