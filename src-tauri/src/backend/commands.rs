@@ -415,7 +415,7 @@ pub(crate) fn get_model_runtime_status(
     tracing::debug!(target: "backend::commands", "get_model_runtime_status called");
     let result = current_model_runtime_status(state.inner());
     match &result {
-        Ok(status) => tracing::info!(
+        Ok(status) => tracing::debug!(
             target: "backend::commands",
             ocr_loaded = status.ocr_loaded,
             translator_loaded = status.translator_loaded,

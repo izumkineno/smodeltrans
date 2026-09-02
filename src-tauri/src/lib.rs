@@ -119,9 +119,10 @@ pub fn run() {
             backend::live::pause_live_session,
             backend::live::resume_live_session,
             backend::live::interrupt_live_translation,
-            backend::live::stop_live_session,
             openai_compat::commands::get_openai_status,
-            openai_compat::commands::update_openai_config
+            openai_compat::commands::update_openai_config,
+            openai_compat::commands::get_openai_history,
+            openai_compat::commands::clear_openai_history
         ])
         .run(tauri::generate_context!())
         .expect("error while running smodeltrans application");

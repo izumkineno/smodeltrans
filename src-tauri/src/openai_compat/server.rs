@@ -1,18 +1,37 @@
-use crate::openai_compat::{adapter::TranslationPort, config::OpenAiCompatConfig, routes::{AppState, build_router}};
-use std::{net::SocketAddr, sync::{Arc, atomic::{AtomicU16, Ordering}}, time::Instant};
+use crate::openai_compat::{
+    adapter::TranslationPort,
+    config::OpenAiCompatConfig,
+    history::OpenAiHistoryStore,
+    routes::{AppState, build_router},
+};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, atomic::{AtomicU16, Ordering}},
+    time::Instant,
+};
 use tokio::{sync::RwLock, task::JoinHandle};
 
 pub struct OpenAiServerHandle {
     pub config: Arc<RwLock<OpenAiCompatConfig>>,
     pub bound_port: Arc<AtomicU16>,
+    pub history: OpenAiHistoryStore,
     handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
 }
-
 impl OpenAiServerHandle {
     pub fn new(initial: OpenAiCompatConfig) -> Self {
         Self {
             config: Arc::new(RwLock::new(initial)),
             bound_port: Arc::new(AtomicU16::new(0)),
+            history: OpenAiHistoryStore::default(),
+            handle: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    pub fn with_history(initial: OpenAiCompatConfig, history: OpenAiHistoryStore) -> Self {
+        Self {
+            config: Arc::new(RwLock::new(initial)),
+            bound_port: Arc::new(AtomicU16::new(0)),
+            history,
             handle: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -164,6 +183,7 @@ impl OpenAiServerHandle {
             let app_state = AppState {
                 port: Arc::clone(&port),
                 config: Arc::clone(&config_shared),
+                history: self.history.clone(),
             };
             let router = build_router(app_state);
             let router = if cfg.enabled {
@@ -237,6 +257,7 @@ impl Clone for OpenAiServerHandle {
         Self {
             config: Arc::clone(&self.config),
             bound_port: Arc::clone(&self.bound_port),
+            history: self.history.clone(),
             handle: Arc::clone(&self.handle),
         }
     }

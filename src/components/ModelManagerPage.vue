@@ -657,7 +657,7 @@ async function saveModelSettings() {
     return;
   }
 
-  // 保留当前的语言与提示词，不在此页修改
+  // 保留当前的语言与提示词，不在此处修改
   const status = backendStatus.value;
   if (!status) {
     console.error("[ModelManagerPage] saveModelSettings: backend status not ready");
@@ -1245,7 +1245,7 @@ onBeforeUnmount(() => {
           </div>
           <p class="settings-scope-note">
             <strong>Stop tokens / stop strings：</strong>适用于文本、OCR、实时翻译。
-            <strong>记忆开关、token 预算、轮数：</strong>仅适用于文本翻译和 OCR 翻译；实时翻译使用实时翻译页的独立上下文配置。
+            <strong>记忆开关、token 预算、轮数：</strong>仅适用于文本翻译和 OCR 翻译；实时翻译使用独立上下文配置。
           </p>
           <div class="settings-field-grid">
             <label class="settings-field settings-field-wide settings-textarea">

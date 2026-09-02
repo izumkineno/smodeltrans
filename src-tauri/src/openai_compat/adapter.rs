@@ -13,6 +13,7 @@ use std::{
 };
 
 /// 对外暴露的最小翻译能力。Send + Sync + 'static 以便跨 axum 线程共享。
+/// 复用 Hy-MT2 官方模板：后端 `build_translation_prompt` 为主，`supplemental_prompt` 仅作附加约束（对应 `render_single_prompt` 的 Additional requirements）。
 #[allow(dead_code)]
 pub trait TranslationPort: Send + Sync + 'static {
     fn translate_text(
@@ -22,6 +23,16 @@ pub trait TranslationPort: Send + Sync + 'static {
         generation_override: Option<GenerationConfig>,
     ) -> Result<String, BackendFailure>;
 
+    fn translate_text_with_supplemental(
+        &self,
+        text: String,
+        target_language: String,
+        _supplemental_prompt: String,
+        generation_override: Option<GenerationConfig>,
+    ) -> Result<String, BackendFailure> {
+        // 默认回落：忽略 supplemental，保持兼容
+        self.translate_text(text, target_language, generation_override)
+    }
     fn is_ready(&self) -> bool;
 
     fn model_states(&self) -> Result<(bool, bool), BackendFailure>;
@@ -81,17 +92,29 @@ impl TranslationPort for BackendStateAdapter {
         target_language: String,
         generation_override: Option<GenerationConfig>,
     ) -> Result<String, BackendFailure> {
+        self.translate_text_with_supplemental(text, target_language, String::new(), generation_override)
+    }
+
+    fn translate_text_with_supplemental(
+        &self,
+        text: String,
+        target_language: String,
+        supplemental_prompt: String,
+        generation_override: Option<GenerationConfig>,
+    ) -> Result<String, BackendFailure> {
         let start = Instant::now();
         let text_len = text.len();
         let text_chars = text.chars().count();
+        let supplemental_len = supplemental_prompt.chars().count();
         let has_override = generation_override.is_some();
         // keep original for logging after trim
         let target_raw = target_language.clone();
-        tracing::info!(
+        tracing::debug!(
             target: "openai_compat::adapter",
             target_language = %target_raw,
             text_len = text_len,
             text_chars = text_chars,
+            supplemental_len = supplemental_len,
             has_generation_override = has_override,
             "translate_text called"
         );
@@ -277,13 +300,14 @@ impl TranslationPort for BackendStateAdapter {
                 target: "openai_compat::adapter",
                 target_language = %target_language,
                 text_len = text_len,
+                supplemental_len = supplemental_len,
                 has_override = has_override,
                 "engine.translate_text started"
             );
             let res = engine.translate_text(
                 &text,
                 &target_language,
-                "",
+                &supplemental_prompt,
                 &token,
                 |_, _| {},
                 |_| {},
@@ -331,6 +355,7 @@ impl TranslationPort for BackendStateAdapter {
                     output_len = translated.len(),
                     output_chars = translated.chars().count(),
                     has_generation_override = has_override,
+                    supplemental_len = supplemental_len,
                     duration_ms = start.elapsed().as_millis() as u64,
                     "translate_text success"
                 );

@@ -1,9 +1,8 @@
 use crate::backend::commands::BackendState;
-use crate::openai_compat::{config::OpenAiCompatConfig, server::OpenAiServerHandle};
+use crate::openai_compat::{config::OpenAiCompatConfig, history::OpenAiHistoryEntry, server::OpenAiServerHandle};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
 use tauri::State;
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenAiStatusResponse {
@@ -220,4 +219,17 @@ pub async fn update_openai_config(
         "update_openai_config completed"
     );
     Ok(resp)
+}
+
+#[tauri::command]
+pub fn get_openai_history(handle: State<'_, OpenAiServerHandle>) -> Vec<OpenAiHistoryEntry> {
+    let list = handle.history.list();
+    tracing::debug!(target: "openai_compat::history", len = list.len(), "get_openai_history");
+    list
+}
+
+#[tauri::command]
+pub fn clear_openai_history(handle: State<'_, OpenAiServerHandle>) {
+    handle.history.clear();
+    tracing::info!(target: "openai_compat::history", "clear_openai_history called");
 }

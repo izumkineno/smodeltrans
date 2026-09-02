@@ -173,25 +173,25 @@ impl BackendEngine {
         Ok(())
     }
 
-    #[tracing::instrument(level = "info", skip(self), fields(target_language = %target_language, memory_present = self.translator_memory.is_some()))]
+    #[tracing::instrument(level = "debug", skip(self), fields(target_language = %target_language, memory_present = self.translator_memory.is_some()))]
     pub(crate) fn load_translator(&mut self, target_language: &str) -> Result<(), BackendFailure> {
-        tracing::info!(target: "backend::engine", target_language = %target_language, "load_translator entry");
+        tracing::debug!(target: "backend::engine", target_language = %target_language, "load_translator entry");
         let __start = std::time::Instant::now();
         let res = self.load_translator_with_memory(target_language, self.settings.memory.clone());
         match &res {
-            Ok(_) => tracing::info!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, translator_loaded = self.hy.is_some(), "load_translator success"),
+            Ok(_) => tracing::debug!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, translator_loaded = self.hy.is_some(), "load_translator success"),
             Err(e) => tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, duration_ms = __start.elapsed().as_millis() as u64, "load_translator failed"),
         }
         res
     }
 
-    #[tracing::instrument(level = "info", skip(self, memory), fields(target_language = %target_language, gpu_policy = self.gpu_policy.label()))]
+    #[tracing::instrument(level = "debug", skip(self, memory), fields(target_language = %target_language, gpu_policy = self.gpu_policy.label()))]
     fn load_translator_with_memory(
         &mut self,
         target_language: &str,
         memory: MemoryConfig,
     ) -> Result<(), BackendFailure> {
-        tracing::info!(target: "backend::engine", target_language = %target_language, "load_translator_with_memory entry (ensure_model_loaded)");
+        tracing::debug!(target: "backend::engine", target_language = %target_language, "load_translator_with_memory entry (ensure_model_loaded)");
         let __start = std::time::Instant::now();
         tracing::debug!(target: "backend::engine", target_language = %target_language, "load_translator_with_memory: building ModelConfig");
         let config = ModelConfig::from_parts(
@@ -229,11 +229,11 @@ impl BackendEngine {
             })?;
             self.hy = Some(translator);
             self.translator_memory = Some(memory);
-            tracing::info!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, "load_translator_with_memory: translator loaded");
+            tracing::debug!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, "load_translator_with_memory: translator loaded");
         } else {
             tracing::debug!(target: "backend::engine", target_language = %target_language, "load_translator_with_memory: translator already loaded");
         }
-        tracing::info!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, translator_loaded = self.hy.is_some(), "load_translator_with_memory success");
+        tracing::debug!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, translator_loaded = self.hy.is_some(), "load_translator_with_memory success");
         Ok(())
     }
 
@@ -696,7 +696,7 @@ impl BackendEngine {
         Ok(())
     }
 
-    #[tracing::instrument(level = "info", skip(self, cancellation, report_progress, on_chunk), fields(target_language = %target_language, text_len = text.chars().count(), supplemental_len = supplemental_prompt.chars().count()))]
+    #[tracing::instrument(level = "debug", skip(self, cancellation, report_progress, on_chunk), fields(target_language = %target_language, text_len = text.chars().count(), supplemental_len = supplemental_prompt.chars().count()))]
     pub(crate) fn translate_text(
         &mut self,
         text: &str,
@@ -706,9 +706,9 @@ impl BackendEngine {
         mut report_progress: impl FnMut(u8, &'static str),
         mut on_chunk: impl FnMut(&str),
     ) -> Result<String, BackendFailure> {
-        let __span = tracing::info_span!(target: "backend::engine", "translate_text_request", target_language = %target_language, text_len = text.chars().count());
+        let __span = tracing::debug_span!(target: "backend::engine", "translate_text_request", target_language = %target_language, text_len = text.chars().count());
         let _guard = __span.enter();
-        tracing::info!(target: "backend::engine", target_language = %target_language, text_len = text.chars().count(), supplemental_len = supplemental_prompt.chars().count(), "translate_text entry");
+        tracing::debug!(target: "backend::engine", target_language = %target_language, text_len = text.chars().count(), supplemental_len = supplemental_prompt.chars().count(), "translate_text entry");
         let __start = std::time::Instant::now();
         cancellation.check().inspect_err(|e| {
             tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, "translate_text: cancelled at entry");
@@ -761,7 +761,7 @@ impl BackendEngine {
             tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, "translate_text: validation failed");
         })?;
         report_progress(100, "翻译完成");
-        tracing::info!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, text_len = text.chars().count(), "translate_text success");
+        tracing::debug!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, text_len = text.chars().count(), "translate_text success");
         Ok(text)
     }
 

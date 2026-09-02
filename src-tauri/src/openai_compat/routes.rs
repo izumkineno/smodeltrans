@@ -1,6 +1,6 @@
 use crate::openai_compat::{
-    adapter::TranslationPort,
     config::OpenAiCompatConfig,
+    history::{OpenAiHistoryEntry, OpenAiHistoryStore},
     types::{
         ChatCompletionChunk, ChatCompletionRequest, ChunkChoice, Delta, HealthResponse, ModelInfo,
         ModelList, new_chat_response, now_secs,
@@ -27,30 +27,39 @@ use std::{
 };
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
-
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn next_request_id() -> String {
-    let ctr = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    format!("oai-{:08x}-{:04x}", (nanos & 0xFFFF_FFFF) as u32, ctr & 0xFFFF)
+    let id = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("oai-{:08x}-{:04x}", id >> 16, id & 0xffff)
 }
 
 #[derive(Clone)]
 pub struct AppState {
-    pub port: Arc<dyn TranslationPort>,
+    pub port: Arc<dyn crate::openai_compat::adapter::TranslationPort>,
     pub config: Arc<RwLock<OpenAiCompatConfig>>,
+    pub history: OpenAiHistoryStore,
 }
 
 impl AppState {
     #[allow(dead_code)]
-    pub fn new(port: Arc<dyn TranslationPort>, config: OpenAiCompatConfig) -> Self {
+    pub fn new(port: Arc<dyn crate::openai_compat::adapter::TranslationPort>, config: OpenAiCompatConfig) -> Self {
         Self {
             port,
             config: Arc::new(RwLock::new(config)),
+            history: OpenAiHistoryStore::default(),
+        }
+    }
+
+    pub fn with_history(
+        port: Arc<dyn crate::openai_compat::adapter::TranslationPort>,
+        config: OpenAiCompatConfig,
+        history: OpenAiHistoryStore,
+    ) -> Self {
+        Self {
+            port,
+            config: Arc::new(RwLock::new(config)),
+            history,
         }
     }
 }
@@ -147,7 +156,7 @@ async fn list_models(
         return e.into_response();
     }
     let models = vec![ModelInfo {
-        id: "hy2-mt".to_owned(),
+        id: "hy-mt2".to_owned(),
         object: "model".to_owned(),
         created: now_secs(),
         owned_by: "smodeltrans".to_owned(),
@@ -267,6 +276,8 @@ async fn chat_completions(
     }
 
     let generation = build_generation_override(&req);
+    let supplemental = req.supplemental_prompt();
+    let supplemental_len = supplemental.chars().count();
     tracing::debug!(
         target: "openai_compat::routes",
         request_id = %request_id,
@@ -276,13 +287,16 @@ async fn chat_completions(
         streaming = is_stream,
         target_language = %target_language,
         has_generation_override = generation.is_some(),
+        supplemental_len = supplemental_len,
         "chat_completions validated, dispatching"
     );
 
     if !is_stream {
         let port = Arc::clone(&state.port);
+        let history = state.history.clone();
         let text = source.clone();
         let lang = target_language.clone();
+        let supp = supplemental.clone();
         let r#gen = generation.clone();
         tracing::debug!(
             target: "openai_compat::routes",
@@ -291,14 +305,28 @@ async fn chat_completions(
             prompt_len = prompt_len,
             streaming = is_stream,
             target_language = %lang,
+            supplemental_len = supplemental_len,
             "chat_completions non-stream blocking dispatch"
         );
-        let blocking = tokio::task::spawn_blocking(move || port.translate_text(text, lang, r#gen));
+        let blocking = tokio::task::spawn_blocking(move || port.translate_text_with_supplemental(text, lang, supp, r#gen));
         match blocking.await {
             Ok(Ok(translated)) => {
                 let prompt_tokens = estimate_tokens(&source);
                 let completion_tokens = estimate_tokens(&translated);
                 let resp = new_chat_response(&model, &translated, prompt_tokens, completion_tokens);
+                let duration_ms = start.elapsed().as_millis() as u64;
+                // 远程历史：复用已验证的翻译结果，记录至环形存储
+                let entry = OpenAiHistoryEntry::new(
+                    model.clone(),
+                    source.clone(),
+                    translated.clone(),
+                    target_language.clone(),
+                    duration_ms,
+                    prompt_tokens,
+                    completion_tokens,
+                    false,
+                );
+                history.push(entry);
                 tracing::info!(
                     target: "openai_compat::routes",
                     request_id = %request_id,
@@ -311,7 +339,9 @@ async fn chat_completions(
                     completion_tokens = completion_tokens,
                     streaming = is_stream,
                     target_language = %target_language,
-                    duration_ms = start.elapsed().as_millis() as u64,
+                    supplemental_len = supplemental_len,
+                    duration_ms = duration_ms,
+                    history_len = history.len(),
                     "chat_completions non-stream success"
                 );
                 (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
@@ -346,10 +376,14 @@ async fn chat_completions(
         }
     } else {
         let port = Arc::clone(&state.port);
+        let history = state.history.clone();
         let text = source.clone();
         let lang = target_language.clone();
+        let supp = supplemental.clone();
         let r#gen = generation.clone();
         let model_clone = model.clone();
+        let source_clone = source.clone();
+        let lang_clone = lang.clone();
         let request_id_clone = request_id.clone();
 
         tracing::info!(
@@ -360,6 +394,7 @@ async fn chat_completions(
             prompt_bytes = prompt_bytes,
             streaming = is_stream,
             target_language = %target_language,
+            supplemental_len = supplemental_len,
             "chat_completions streaming response initiated"
         );
 
@@ -373,12 +408,28 @@ async fn chat_completions(
                 prompt_len = prompt_len,
                 streaming = true,
                 target_language = %lang,
+                supplemental_len = supp.chars().count(),
                 "stream worker started"
             );
-            let res = tokio::task::spawn_blocking(move || port.translate_text(text, lang, r#gen)).await;
+            let res = tokio::task::spawn_blocking(move || port.translate_text_with_supplemental(text, lang, supp, r#gen)).await;
             match res {
                 Ok(Ok(full)) => {
                     let chunk_count = split_for_stream(&full).len();
+                    let duration_ms = stream_start.elapsed().as_millis() as u64;
+                    let prompt_tokens = estimate_tokens(&source_clone);
+                    let completion_tokens = estimate_tokens(&full);
+                    // 流式亦复用 Hy2 官方结果入历史
+                    let entry = OpenAiHistoryEntry::new(
+                        model_clone.clone(),
+                        source_clone.clone(),
+                        full.clone(),
+                        lang_clone.clone(),
+                        duration_ms,
+                        prompt_tokens,
+                        completion_tokens,
+                        true,
+                    );
+                    history.push(entry);
                     tracing::info!(
                         target: "openai_compat::routes",
                         request_id = %request_id_clone,
@@ -386,8 +437,11 @@ async fn chat_completions(
                         completion_len = full.chars().count(),
                         completion_bytes = full.len(),
                         chunk_count = chunk_count,
-                        duration_ms = stream_start.elapsed().as_millis() as u64,
+                        duration_ms = duration_ms,
+                        prompt_tokens = prompt_tokens,
+                        completion_tokens = completion_tokens,
                         streaming = true,
+                        history_len = history.len(),
                         "stream translation success, starting SSE"
                     );
                     let id = format!("chatcmpl-{}", now_secs());

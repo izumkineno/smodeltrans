@@ -5215,9 +5215,9 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simple_downloader"
-version = "0.3.1"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0edac5f79d5bc1f6d7212460e9fad63361d3bd59e27ed87d8d5881087e967912"
+checksum = "938ade472e959e60b88bb925058f7f0a3c2a487461b348ebaf1e6bdaf4bbe618"
 dependencies = [
  "bitcode",
  "bytes",
@@ -5226,6 +5226,8 @@ dependencies = [
  "reqwest",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5257,7 +5259,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smodeltrans"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -6411,6 +6413,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6420,6 +6432,8 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
@@ -6427,6 +6441,7 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]

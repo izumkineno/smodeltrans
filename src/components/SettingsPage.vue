@@ -26,8 +26,8 @@ import type { ThemeMode } from "../services/theme-settings";
 import { showWorkspaceToast, type WorkspaceToastType } from "../services/workspace-toast";
 import { isSupportedTargetLanguage } from "../constants/targetLanguageOptions";
 import OpenAiCompatCard from "./OpenAiCompatCard.vue";
+import OpenAiRequestHistory from "./OpenAiRequestHistory.vue";
 import TargetLanguageSelect from "./TargetLanguageSelect.vue";
-
 const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const promptTemplate = ref("");
 const settingsMessage = ref("");
@@ -543,8 +543,8 @@ onMounted(() => {
           <span class="settings-help" style="grid-column: 1 / -1">留空使用官方 Default 模板；若模板包含 {source_text} 则视为完整模板并直接替换占位符后使用（覆盖 Default）；否则视为附加约束拼于 Default 之前。支持批量 {format_type}。</span>
         </div>
       </n-card>
-
       <OpenAiCompatCard />
+      <OpenAiRequestHistory />
       <div class="settings-card-actions settings-page-actions settings-card-wide">
         <n-alert v-if="settingsMessage" class="settings-actions-feedback" :type="settingsMessageType" :show-icon="false">
           {{ settingsMessage }}

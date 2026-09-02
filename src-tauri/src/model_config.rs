@@ -37,7 +37,7 @@ impl Default for GenerationConfig {
             repetition_penalty: 1.05,
             frequency_penalty: 0.0,
             stop_tokens: Vec::new(),
-            // Hy 角色分隔符：模型若尝试续写下一轮对话应立即截断，避免 7B 等模型在长输出末尾伪造 <｜hy_User｜> 等
+            // Hy 角色边界符：模型若尝试续写下一轮对话应立即截断，避免 7B 等模型在长输出末尾伪造 <｜hy_User｜> 等
             stop_strings: vec![
                 "<｜hy_User｜>".to_owned(),
                 "<｜hy_Assistant｜>".to_owned(),
@@ -96,7 +96,7 @@ impl GenerationConfig {
             }
             let _ = seen.insert(trimmed);
         }
-        tracing::info!(target: "config", max_new_tokens = self.max_new_tokens, "GenerationConfig::validate succeeded");
+        tracing::debug!(target: "config", max_new_tokens = self.max_new_tokens, "GenerationConfig::validate succeeded");
         Ok(())
     }
 }
@@ -127,7 +127,7 @@ impl MemoryConfig {
         if !(1..=MAX_MEMORY_TURNS).contains(&self.max_turns) {
             bail!("memory.max_turns must be in 1..={MAX_MEMORY_TURNS}");
         }
-        tracing::info!(target: "config", enabled = self.enabled, "MemoryConfig::validate succeeded");
+        tracing::debug!(target: "config", enabled = self.enabled, "MemoryConfig::validate succeeded");
         Ok(())
     }
 }
@@ -146,7 +146,7 @@ impl PromptConfig {
         if self.template.trim().chars().count() > MAX_PROMPT_CHARS {
             bail!("prompt.template must contain at most {MAX_PROMPT_CHARS} characters");
         }
-        tracing::info!(target: "config", "PromptConfig::validate succeeded");
+        tracing::debug!(target: "config", "PromptConfig::validate succeeded");
         Ok(())
     }
 
@@ -170,8 +170,8 @@ impl ModelConfig {
         generation: GenerationConfig,
         memory: MemoryConfig,
     ) -> Result<Self> {
-        let _span = tracing::info_span!(target: "config", "ModelConfig::from_parts", target_language = %target_language).entered();
-        tracing::info!(target: "config", target_language = %target_language, prompt_len = prompt.template.chars().count(), max_new_tokens = generation.max_new_tokens, memory_enabled = memory.enabled, "ModelConfig::from_parts started");
+        let _span = tracing::debug_span!(target: "config", "ModelConfig::from_parts", target_language = %target_language).entered();
+        tracing::debug!(target: "config", target_language = %target_language, prompt_len = prompt.template.chars().count(), max_new_tokens = generation.max_new_tokens, memory_enabled = memory.enabled, "ModelConfig::from_parts started");
         let target_language = target_language.trim();
         ensure!(
             !target_language.is_empty(),
@@ -180,7 +180,7 @@ impl ModelConfig {
         prompt.validate()?;
         generation.validate()?;
         memory.validate()?;
-        tracing::info!(target: "config", target_language = %target_language, "ModelConfig::from_parts validation passed");
+        tracing::debug!(target: "config", target_language = %target_language, "ModelConfig::from_parts validation passed");
         Ok(Self {
             target_language: target_language.to_owned(),
             prompt,

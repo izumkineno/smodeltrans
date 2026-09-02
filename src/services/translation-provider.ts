@@ -437,11 +437,11 @@ export async function saveModelCatalog(
 export async function getModelRuntimeStatus(
   invokeFn: InvokeFn = invoke,
 ): Promise<ModelRuntimeStatus> {
-  console.info(`${LOG_PREFIX} getModelRuntimeStatus start`);
+  console.debug(`${LOG_PREFIX} getModelRuntimeStatus start`);
   const start = Date.now();
   try {
     const status = await invokeFn<ModelRuntimeStatus>("get_model_runtime_status");
-    console.info(`${LOG_PREFIX} getModelRuntimeStatus success`, {
+    console.debug(`${LOG_PREFIX} getModelRuntimeStatus success`, {
       ocrLoaded: status.ocrLoaded,
       translatorLoaded: status.translatorLoaded,
       busy: status.busy,

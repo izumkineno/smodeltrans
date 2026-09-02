@@ -124,6 +124,21 @@ impl ChatCompletionRequest {
         text
     }
 
+    pub fn supplemental_prompt(&self) -> String {
+        // 复用 Hy-MT2 官方附加约束：收集 system/developer 消息作为 supplemental_prompt，透传至 render_single_prompt::Additional requirements
+        let parts: Vec<String> = self
+            .messages
+            .iter()
+            .filter(|m| {
+                let role = m.role.trim().to_lowercase();
+                role == "system" || role == "developer"
+            })
+            .map(|m| m.content.as_text().trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        parts.join("\n\n")
+    }
+
     pub fn is_stream(&self) -> bool {
         self.stream.unwrap_or(false)
     }

@@ -176,14 +176,14 @@ export function savePersistedTargetLanguage(): string | null {
 }
 
 export function applySharedBackendStatus(status: BackendStatus) {
-  console.info(`${WS_LOG_PREFIX} applySharedBackendStatus`, { targetLanguage: status.targetLanguage, ready: status.ready, device: status.device, translatorLoaded: status.translatorLoaded, message: status.message });
+  console.debug(`${WS_LOG_PREFIX} applySharedBackendStatus`, { targetLanguage: status.targetLanguage, ready: status.ready, device: status.device, translatorLoaded: status.translatorLoaded, message: status.message });
   console.debug(`${WS_LOG_PREFIX} applySharedBackendStatus detail`, { detectorModelDir: status.detectorModelDir, recognizerModelDir: status.recognizerModelDir, hyModel: status.hyModel });
   backendStatus.value = status;
   targetLanguage.value = status.targetLanguage;
 }
 
 export function applySharedModelRuntimeStatus(status: ModelRuntimeStatus) {
-  console.info(`${WS_LOG_PREFIX} applySharedModelRuntimeStatus`, { ocrLoaded: status.ocrLoaded, translatorLoaded: status.translatorLoaded, busy: status.busy });
+  console.debug(`${WS_LOG_PREFIX} applySharedModelRuntimeStatus`, { ocrLoaded: status.ocrLoaded, translatorLoaded: status.translatorLoaded, busy: status.busy });
   console.debug(`${WS_LOG_PREFIX} applySharedModelRuntimeStatus backend`, { ready: status.backend.ready, targetLanguage: status.backend.targetLanguage });
   modelRuntimeStatus.value = status;
   applySharedBackendStatus(status.backend);
