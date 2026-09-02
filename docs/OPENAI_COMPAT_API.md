@@ -157,7 +157,35 @@ const j = await r.json()
 
 ---
 
-## 5. 可观测与约束
+## 5. 排障：Failed to fetch / 无法连接 http://127.0.0.1:11438/v1
+
+> 常见于 `smodeltrans` 未启动、`openaiCompat.enabled=false`、错用 `http://127.0.0.1:11438/v1`（该路径不存在）或端口被占。服务仅在 Tauri 桌面端启动后监听，`bun run dev` 网页预览不含后端。
+
+**1. 启动与配置**
+* 启动桌面端：`bun run tauri dev`（或已安装 exe）。`设置 → OpenAI 兼容` 打开 `enabled`，确认 `host=127.0.0.1 port=11438` 后点保存；或直接改 `%APPDATA%/smodeltrans/model-settings.json` 的 `openaiCompat: {enabled:true, host:"127.0.0.1", port:11438}` 后重启。
+* 端口递增：若 `11438` 被占，`server.rs` 自动试 `+1` 三次，实际以 `health.port` 为准。
+
+**2. 正确路径**
+* `http://127.0.0.1:11438/v1` 不是接口，单独请求必失败。健康检查：`GET http://127.0.0.1:11438/health` 或 `GET http://127.0.0.1:11438/v1/health`（`routes.rs:109` 双路由）。
+* 模型列表：`GET http://127.0.0.1:11438/v1/models`
+* 翻译/图片：`POST http://127.0.0.1:11438/v1/chat/completions`
+
+**3. Windows 自检**
+```powershell
+netstat -ano | findstr 11438          # 应见 LISTENING + Tauri PID
+curl -i http://127.0.0.1:11438/health  # 期望 200 + {"status":"ok","port":11438,"model_loaded":...}
+curl -i http://127.0.0.1:11438/v1/models
+# 浏览器 fetch 失败而 curl 通，多为 CORS/前端代理；Tauri 内 fetch不受限，外部网页需经 Tauri 侧中转而非直连
+```
+若 `curl /health` 不通：未启动 / `enabled:false` / 防火墙拦截（`wf.msc` 放行 `smodeltrans.exe`）/ 端口被占后落在 `11439/11440`（以 `health.port` 为准）。
+
+**4. 模型未就绪**
+* `health.model_loaded==false` 仍可联通但翻译为空转。需在 `模型管理` 下载 `Hy-MT2 Q4_K_M` + `PP-OCR V5/V6` 任一档，日志 `tracing` 目标 `openai_compat::routes` 可见 `model_loaded/hy/ocr`。
+* `503 service_unavailable` 表示 `live_active==true`（实时翻译占用引擎），关掉实时翻译重试。
+
+---
+
+## 6. 可观测与约束
 
 * 解耦：`openai_compat` 除 `adapter.rs` 头部 `use crate::backend::{commands::BackendState, contracts::TranslationOutput, failure::BackendFailure}` 外，`rg "BackendEngine|crate::models::hy" src-tauri/src/openai_compat --glob '!adapter.rs'` 必须 `0`；`cargo test openai_compat` 以 `mock::MockPort` 在无 CUDA 环境通过。
 * 日志：图片分支 `tracing::info!(target:"openai_compat::routes", request_id, image_count, image_bytes_est, target_language, duration_ms)`，`history.push(OpenAiHistoryEntry::new("[N images] ..."))` 不存 base64（SF-4）。
@@ -166,7 +194,7 @@ const j = await r.json()
 
 ---
 
-## 6. 规格与计划
+## 7. 规格与计划
 
 * 访谈：`.omc/specs/deep-interview-img-ocr-translate.md` 142L 18.0% PASSED（5轮+Round0，4 active+1 deferred，6实体100%收敛）
 * 计划：`.omc/plans/deep-interview-img-ocr-translate-plan.md` 826L **APPROVED**（Architect 4 MF + 6 SF 固化，Critic 10/10 AC 可测 PASS，`pending approval` 已执行于 `fa55fda`）
