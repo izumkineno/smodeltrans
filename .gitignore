@@ -30,3 +30,5 @@ dist-ssr
 .omx
 tmp
 .serena
+scripts/_synth_mod_error.png
+scripts/_vision_annotated.png
