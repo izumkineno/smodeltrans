@@ -51,15 +51,13 @@ Content-Type: application/json
 }
 ```
 
-* `content` 为 `MessageContent::Parts(Vec<ContentPart>)`（`types.rs:39`），`ContentPart::ImageUrl{image_url: ImageUrl{url}}`（`types.rs:61`）。`url` 接受 `data:image/png;base64,...` / `data:image/jpeg;base64,...` / `data:image/webp;base64,...`（`charset=utf-8;base64` 兼容，大小写不敏感）或裸 `base64`；`peel_data_url`（`types.rs:169`）剥离 `data:` 前缀后取 `,` 后纯 b64，`http://`/`https://`/`blob:` 等一律 `400 remote url not supported`。
-* `types.rs:146 image_urls()` 按 `messages[]` 原序收集，`has_image()`/`image_count()` 供路由分支。
-* 多图：同一 `content` 内放 `N` 个 `image_url`（`<=8`，`routes.rs:172` 超限 `400 too many images, max 8`），服务端单 `spawn_blocking` 内逐图串行 `port.translate_image("openai-image-001.png"..)` 竞争同一 `queue: Arc<Mutex<()>>` FIFO，文本按 `\n\n` 有序拼接，标注图取首图；队列等待期阻塞等待（`spawn_blocking` 语义）。
-* `stream:true + image_url` 显式 `400 stream with image_url not supported`（SF-1），文本 `stream:true` 仍走 SSE。
+* `content` 为 `MessageContent::Parts(Vec<ContentPart>)`（`types.rs:39`），`ContentPart::ImageUrl{image_url: ImageUrl{url, headers?, referer?, user_agent?, detail?}}`（`types.rs:61 ImageUrl` 已扩展 `headers: Option<HashMap<String,String>>` + `referer`/`user_agent` 快捷）。`url` 接受 `data:image/png;base64,...` / `data:image/jpeg;base64,...` / `data:image/webp;base64,...`（`charset=utf-8;base64` 兼容，大小写不敏感）或裸 `base64` **或 `http://`/`https://` 远端 URL（服务端 `reqwest` 拉取，跳过前端 CORS）**；`peel_data_url`（`types.rs:210`）剥离 `data:` 前缀后取 `,` 后纯 b64，`is_http_url`（`types.rs:197`）识别远端后 `routes.rs:46 fetch_image_as_base64(url, &ImageUrl)`（`HTTP_CLIENT: LazyLock<reqwest::Client>`，浏览器 UA `Chrome/124`、超时 15s、限 10 MiB、最多 5 重定向）先于队列拉取再进 `decode_image`，`blob:` 等非 http(s) 仍 `400 remote url not supported`。**为防 403/热链，可在 `image_url` 内附加 `headers: {"Authorization":"Bearer xxx"|"Basic ...","Cookie":"...","Referer":"https://...","X-Custom":"..."}` 或快捷 `referer`/`user_agent`，服务端原样透传（过滤 `Host/Content-Length` 等危险头），未提供 `User-Agent` 时自动使用浏览器 UA。**
+* `types.rs:146 image_urls()` / `173 image_inputs()` 按 `messages[]` 原序收集，`has_image()`/`image_count()` 供路由分支；远端分支以 `image_inputs()` 保留认证头。
+* 多图：同一 `content` 内放 `N` 个 `image_url`（`<=8`，`routes.rs:172` 超限 `400 too many images, max 8`），远端与 `data:` 可混用且可各自独立携带认证头，服务端先在 `async` 上下文逐条拉取（`is_http_url` 分支，逐条应用 `headers/referer/user_agent`）再进单 `spawn_blocking` 逐图串行 `port.translate_image("openai-image-001.png"..)` 竞争同一 `queue: Arc<Mutex<()>>` FIFO，文本按 `\n\n` 有序拼接，标注图取首图；队列等待期阻塞等待（`spawn_blocking` 语义）。
 
 ### 3.2 流水线
 
-`decode_image(base64, file_name, target_language)`（`backend/input.rs:88`，`MAX_BASE64_CHARS=14M / MAX_ENCODED_BYTES=10MiB / MAX_IMAGE_SIDE=8192 / MAX_IMAGE_PIXELS=33M / MAX_CANVAS_BYTES=128MiB / MAX_REGIONS=256`）→ `BackendEngine::translate(&DecodedImage, &CancellationToken)`（`engine.rs:391`：`recognize → translate_regions_with_progress → ImageOutput::render`）→ `TranslationOutput{ text, markdown, annotated_png, is_translated }`。`adapter.rs:367 translate_image` 复刻 `translate_text_with_supplemental` 的 `touch_activity` → live 入口 → `queue` → live 队列后 → `settings` 快照 → `generation` 临时替换（`out_res` 先捕获后恢复防毒化 MF-1）→ `lock_with_cancellation` → `BackendEngine::new` 按需 → live 第三检 → `engine.translate`。
-
+`is_http_url` 分支 `fetch_image_as_base64(url, &ImageUrl)`（`routes.rs:46`，`reqwest` 携带 `headers/referer/user_agent` + `Accept:image/*` 拉取转 `BASE64.encode`，超时 15s/10 MiB/5重定向，默认浏览器 UA 防 403）或 `peel_data_url`（`data:` 裸 b64）得 `base64` → `decode_image(base64, file_name, target_language)`（`backend/input.rs:88`，`MAX_BASE64_CHARS=14M / MAX_ENCODED_BYTES=10MiB / MAX_IMAGE_SIDE=8192 / MAX_IMAGE_PIXELS=33M / MAX_CANVAS_BYTES=128MiB / MAX_REGIONS=256`）→ `BackendEngine::translate(&DecodedImage, &CancellationToken)`（`engine.rs:391`：`recognize → translate_regions_with_progress → ImageOutput::render`）→ `TranslationOutput{ text, markdown, annotated_png, is_translated }`。`adapter.rs:367 translate_image` 复刻 `translate_text_with_supplemental` 的 `touch_activity` → live 入口 → `queue` → live 队列后 → `settings` 快照 → `generation` 临时替换（`out_res` 先捕获后恢复防毒化 MF-1）→ `lock_with_cancellation` → `BackendEngine::new` 按需 → live 第三检 → `engine.translate`。
 `supplemental_prompt`（`messages` 中 `system/developer` 拼接）对图片分支暂忽略并 `debug!(supplemental_ignored=true)`（MF-4），预留未来 `engine.translate_with_supplemental`。
 
 ### 3.3 回传
@@ -92,13 +90,13 @@ Content-Type: application/json
 
 | 场景 | 状态 | `error.type` | 触发 |
 |------|------|--------------|------|
-| 非 `data:` 远端 / 坏 `data:` / 空 url | 400 | `invalid_request_error` | `peel_data_url → Err("remote url not supported"/"malformed data URL") → BackendFailure::arguments` |
+| 非 http(s) 远端 / 坏 `data:` / 空 url | 400 | `invalid_request_error` | `peel_data_url → Err("remote url not supported"/"malformed data URL") → BackendFailure::arguments` |
+| `http(s)` 拉取失败 / 非 2xx（含 403 需补 `headers`/`referer`）/ 空 / >10 MiB | 400 | `invalid_request_error` | `fetch_image_as_base64 → Err("failed to fetch image url: status 403/404 ..."/"remote image exceeds 10 MiB limit"/"remote image is empty")` — 403 常见于热链/鉴权，补 `headers: {Authorization, Cookie, Referer}` 或 `referer` 快捷 |
 | `>14M base64 / >10MiB / >8192 / >33M像素` | 400 | `invalid_request_error` | `input.rs:111,120,142` 透传含 `imageBase64`/`dimensions` |
 | `>8 张` | 400 | `invalid_request_error` | `too many images, max 8` |
 | `live_active` | 503 | `service_unavailable` | `routes:216` 入口 + `adapter:97/119/241` 三处 |
 | `stream:true + image` | 400 | `invalid_request_error` | `stream with image_url not supported` |
 | OCR零区域 | 200 | — | `content[0].text==""` 且 `content[1].image_url` 仍在 |
-
 `target_language` 优先级：`model:hy-mt2:English` 后缀 > `target_language` 字段 > `language` 字段 > `Translate to X:` 前缀 > 默认 `Chinese`（`types.rs:86 target_language()`）。
 
 ---
@@ -141,6 +139,44 @@ text = j["choices"][0]["message"]["content"][0]["text"]                 # 纯文
 img_data_url = j["choices"][0]["message"]["content"][1]["image_url"]["url"]  # <img src=img_data_url>
 ```
 
+### curl 远端 URL（跳过前端 CORS，前端直接传 http(s)）
+
+```bash
+# 基础（无鉴权）：服务端复用浏览器 UA + Accept 拉取
+curl -X POST http://127.0.0.1:11438/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"hy-mt2:Chinese","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/shot.png"}}]}]}' | jq
+# 回传同为 data:image/png;base64, + 文本
+```
+
+```bash
+# 403 热链/鉴权：附加 Referer / Authorization / Cookie / 自定义头
+curl -X POST http://127.0.0.1:11438/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"hy-mt2:Chinese",
+    "messages":[{"role":"user","content":[
+      {"type":"image_url","image_url":{"url":"https://cdn.example.com/img.jpg","referer":"https://example.com/","headers":{"Authorization":"Bearer <token>","Cookie":"session=xxx"}}},
+      {"type":"image_url","image_url":{"url":"https://private.example.com/a.png","headers":{"Authorization":"Basic dXNlcjpwYXNz"},"user_agent":"Mozilla/5.0"}}
+    ]}]
+  }' | jq
+# headers 透传（过滤 Host/Content-Length），未提供 UA 时自动用 Chrome/124，Accept:image/* 已内置
+```
+
+### Python 远端 URL 混用 + data: + 认证头
+
+```python
+import requests
+r = requests.post("http://127.0.0.1:11438/v1/chat/completions", json={
+  "model":"hy-mt2:English",
+  "messages":[{"role":"user","content":[
+    {"type":"image_url","image_url":{"url":"https://example.com/a.jpg","headers":{"Referer":"https://example.com/","Authorization":"Bearer MY_TOKEN"}}},
+    {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo..."}} # 本地
+  ]}]
+})
+print(r.json()["choices"][0]["message"]["content"][0]["text"])
+```
+
 ### JS / 截图接入（后续）
 
 ```js
@@ -151,6 +187,13 @@ const r = await fetch("http://127.0.0.1:11438/v1/chat/completions", {
   body: JSON.stringify({model:"hy-mt2:Chinese", messages:[{role:"user", content:[{type:"image_url", image_url:{url:dataUrl}}]}]})
 })
 const j = await r.json()
+// 远端跳 CORS + 防 403：前端不再 fetch+FileReader 转 base64，直接透传 URL + 认证头由服务端拉取
+// const r2 = await fetch("http://127.0.0.1:11438/v1/chat/completions", {
+//   method:"POST", headers:{"Content-Type":"application/json"},
+//   body: JSON.stringify({model:"hy-mt2:Chinese", messages:[{role:"user", content:[
+//     {type:"image_url", image_url:{url:"https://cdn.example.com/img.jpg", referer:"https://example.com/", headers:{Authorization:"Bearer xxx", Cookie:"session=yyy"}}}
+//   ]}]})
+// })
 // 后续截图模块直接复用同一端口：
 // Rust 侧截图捕获 base64 后 `port.translate_image(b64, "screenshot-20250902-001.png", lang, supp, gen)`
 ```

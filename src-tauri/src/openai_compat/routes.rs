@@ -2,8 +2,8 @@ use crate::openai_compat::{
     config::OpenAiCompatConfig,
     history::{OpenAiHistoryEntry, OpenAiHistoryStore},
     types::{
-        ChatCompletionChunk, ChatCompletionRequest, ChunkChoice, Delta, HealthResponse, ModelInfo,
-        ModelList, new_chat_response, new_chat_response_with_image, now_secs, peel_data_url,
+        ChatCompletionChunk, ChatCompletionRequest, ChunkChoice, Delta, HealthResponse, ImageUrl, ModelInfo,
+        ModelList, is_http_url, new_chat_response, new_chat_response_with_image, now_secs, peel_data_url,
     },
 };
 use base64::Engine as _;
@@ -19,6 +19,7 @@ use axum::{
 };
 use serde_json::json;
 use std::{
+    collections::HashMap,
     convert::Infallible,
     sync::{
         Arc,
@@ -29,6 +30,66 @@ use std::{
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .expect("reqwest client build")
+});
+
+fn http_client() -> &'static reqwest::Client {
+    &HTTP_CLIENT
+}
+
+async fn fetch_image_as_base64(url: &str, image: &ImageUrl) -> Result<String, String> {
+    let client = http_client();
+    let mut req = client.get(url.trim());
+    // 默认 Accept，便于部分 CDN 校验
+    req = req.header(reqwest::header::ACCEPT, "image/avif,image/webp,image/apng,image/*,*/*;q=0.8");
+    // applied headers: headers 透传 + referer/user_agent 快捷
+    // 先处理 headers map，再覆盖 referer/user_agent 显式 shortcut（headers 优先则反过来，这里让 shortcut 覆盖 headers 的同名，显式更精确）
+    let mut applied: HashMap<String, String> = HashMap::new();
+    if let Some(hs) = &image.headers {
+        for (k, v) in hs {
+            let lk = k.trim().to_ascii_lowercase();
+            // 过滤危险/非透传头，防止 SSRF 滥用 Host/Content-Length 等
+            if matches!(lk.as_str(), "host" | "content-length" | "content-type" | "transfer-encoding") {
+                continue;
+            }
+            applied.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(r) = &image.referer {
+        applied.insert("Referer".into(), r.clone());
+    }
+    if let Some(ua) = &image.user_agent {
+        applied.insert("User-Agent".into(), ua.clone());
+    }
+    // 若未提供 UA，LazyLock 已设浏览器 UA，无需再设；但若 applied 已含 UA 则覆盖
+    for (k, v) in applied {
+        req = req.header(k, v);
+    }
+    // 若未显式提供 Referer 且 headers 未含，部分防盗链 403，尝试用 url 的 origin 作为回退？默认不设，避免误判
+    let resp = req.send().await.map_err(|e| format!("failed to fetch image url: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("failed to fetch image url: status {}", resp.status()));
+    }
+    if let Some(len) = resp.content_length() {
+        if len > 10 * 1024 * 1024 {
+            return Err("remote image exceeds 10 MiB limit".into());
+        }
+    }
+    let bytes = resp.bytes().await.map_err(|e| format!("failed to read image bytes: {e}"))?;
+    if bytes.is_empty() {
+        return Err("remote image is empty".into());
+    }
+    if bytes.len() > 10 * 1024 * 1024 {
+        return Err("remote image exceeds 10 MiB limit".into());
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
 
 fn next_request_id() -> String {
     let id = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -253,8 +314,8 @@ async fn chat_completions(
     let generation = build_generation_override(&req);
     let supplemental = req.supplemental_prompt();
     let supplemental_len = supplemental.chars().count();
-    let image_urls = req.image_urls();
-    let has_image = !image_urls.is_empty();
+    let image_inputs = req.image_inputs();
+    let has_image = !image_inputs.is_empty();
     if has_image {
         if is_stream {
             tracing::warn!(
@@ -262,27 +323,27 @@ async fn chat_completions(
                 request_id = %request_id,
                 model = %model,
                 streaming = is_stream,
-                image_count = image_urls.len(),
+                image_count = image_inputs.len(),
                 duration_ms = start.elapsed().as_millis() as u64,
                 "chat_completions rejected: stream with image_url not supported"
             );
             return (StatusCode::BAD_REQUEST, error_json("stream with image_url not supported", "invalid_request_error")).into_response();
         }
-        if image_urls.len() > 8 {
+        if image_inputs.len() > 8 {
             tracing::warn!(
                 target: "openai_compat::routes",
                 request_id = %request_id,
                 model = %model,
                 streaming = is_stream,
-                image_count = image_urls.len(),
+                image_count = image_inputs.len(),
                 duration_ms = start.elapsed().as_millis() as u64,
                 "chat_completions rejected: too many images"
             );
             return (StatusCode::BAD_REQUEST, error_json("too many images, max 8", "invalid_request_error")).into_response();
         }
-        let image_bytes_est: usize = image_urls
+        let image_bytes_est: usize = image_inputs
             .iter()
-            .map(|u| peel_data_url(u).map(|b| b.len()).unwrap_or(u.len()))
+            .map(|img| peel_data_url(&img.url).map(|b| b.len()).unwrap_or(img.url.len()))
             .sum();
         tracing::info!(
             target: "openai_compat::routes",
@@ -290,7 +351,7 @@ async fn chat_completions(
             model = %model,
             streaming = is_stream,
             target_language = %target_language,
-            image_count = image_urls.len(),
+            image_count = image_inputs.len(),
             image_bytes_est = image_bytes_est,
             supplemental_len = supplemental_len,
             has_generation_override = generation.is_some(),
@@ -304,27 +365,75 @@ async fn chat_completions(
             target_language = %target_language,
             supplemental_len = supplemental_len,
             has_generation_override = generation.is_some(),
-            image_count = image_urls.len(),
+            image_count = image_inputs.len(),
             image_bytes_est = image_bytes_est,
             "chat_completions validated, dispatching image translation"
         );
+        // 解析：data:/裸 b64 直接 peel；http(s) 由服务端 reqwest 拉取（带认证头防 403，跳过前端 CORS）
+        let mut resolved_b64s: Vec<String> = Vec::with_capacity(image_inputs.len());
+        for img in &image_inputs {
+            let url = &img.url;
+            if is_http_url(url) {
+                match fetch_image_as_base64(url, img).await {
+                    Ok(b64) => resolved_b64s.push(b64),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "openai_compat::routes",
+                            request_id = %request_id,
+                            model = %model,
+                            streaming = is_stream,
+                            image_count = image_inputs.len(),
+                            duration_ms = start.elapsed().as_millis() as u64,
+                            error = %e,
+                            "chat_completions rejected: fetch remote image failed"
+                        );
+                        return (StatusCode::BAD_REQUEST, error_json(&e, "invalid_request_error")).into_response();
+                    }
+                }
+            } else {
+                match peel_data_url(url) {
+                    Ok(b64) => resolved_b64s.push(b64),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "openai_compat::routes",
+                            request_id = %request_id,
+                            model = %model,
+                            streaming = is_stream,
+                            image_count = image_inputs.len(),
+                            duration_ms = start.elapsed().as_millis() as u64,
+                            error = %e,
+                            "chat_completions rejected: invalid image url"
+                        );
+                        return (StatusCode::BAD_REQUEST, error_json(&e, "invalid_request_error")).into_response();
+                    }
+                }
+            }
+        }
+        let image_bytes_est_resolved: usize = resolved_b64s.iter().map(|b| b.len()).sum();
+        tracing::debug!(
+            target: "openai_compat::routes",
+            request_id = %request_id,
+            model = %model,
+            image_count = image_inputs.len(),
+            image_bytes_est_resolved = image_bytes_est_resolved,
+            "chat_completions remote fetch resolved"
+        );
         let port = Arc::clone(&state.port);
         let history = state.history.clone();
-        let urls = image_urls.clone();
+        let b64s = resolved_b64s;
         let lang = target_language.clone();
         let supp = supplemental.clone();
         let r#gen = generation.clone();
         let model_clone = model.clone();
         let request_id_clone = request_id.clone();
         let target_language_clone = target_language.clone();
-        let image_count = image_urls.len();
+        let image_count = image_inputs.len();
         let blocking = tokio::task::spawn_blocking(move || -> Result<(String, Option<String>), crate::backend::failure::BackendFailure> {
-            let mut texts = Vec::with_capacity(urls.len());
+            let mut texts = Vec::with_capacity(b64s.len());
             let mut first_image_data_url: Option<String> = None;
-            for (idx, url) in urls.iter().enumerate() {
-                let b64 = peel_data_url(url).map_err(crate::backend::failure::BackendFailure::arguments)?;
+            for (idx, b64) in b64s.iter().enumerate() {
                 let file_name = format!("openai-image-{:03}.png", idx + 1);
-                let out = port.translate_image(b64, file_name, lang.clone(), supp.clone(), r#gen.clone())?;
+                let out = port.translate_image(b64.clone(), file_name, lang.clone(), supp.clone(), r#gen.clone())?;
                 texts.push(out.text.clone());
                 if first_image_data_url.is_none() && !out.annotated_png.is_empty() {
                     let b64png = base64::engine::general_purpose::STANDARD.encode(&out.annotated_png);
@@ -378,7 +487,7 @@ async fn chat_completions(
                     model = %model,
                     streaming = is_stream,
                     target_language = %target_language,
-                    image_count = image_urls.len(),
+                    image_count = image_count,
                     image_bytes_est = image_bytes_est,
                     error = %e,
                     duration_ms = start.elapsed().as_millis() as u64,
@@ -392,7 +501,7 @@ async fn chat_completions(
                     request_id = %request_id,
                     model = %model,
                     streaming = is_stream,
-                    image_count = image_urls.len(),
+                    image_count = image_count,
                     image_bytes_est = image_bytes_est,
                     error = %e,
                     duration_ms = start.elapsed().as_millis() as u64,
@@ -793,5 +902,77 @@ mod tests {
             extra: None,
         };
         assert!(build_generation_override(&req).is_none());
+    }
+
+    fn test_image(url: String, headers: Option<HashMap<String, String>>, referer: Option<String>) -> ImageUrl {
+        ImageUrl { url, headers, referer, user_agent: None, detail: None }
+    }
+
+    #[tokio::test]
+    async fn fetch_remote_image_success() {
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
+        let png_bytes = base64::engine::general_purpose::STANDARD.decode(png_b64).unwrap();
+        let app = axum::Router::new().route(
+            "/img.png",
+            axum::routing::get({
+                let bytes = png_bytes.clone();
+                move || {
+                    let b = bytes.clone();
+                    async move { ([(axum::http::header::CONTENT_TYPE, "image/png")], b) }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{addr}/img.png");
+        let fetched = fetch_image_as_base64(&url, &test_image(url.clone(), None, None)).await.unwrap();
+        assert_eq!(fetched, png_b64);
+    }
+
+    #[tokio::test]
+    async fn fetch_remote_image_404() {
+        let app = axum::Router::new().route(
+            "/missing.png",
+            axum::routing::get(|| async { (axum::http::StatusCode::NOT_FOUND, "not found") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{addr}/missing.png");
+        let err = fetch_image_as_base64(&url, &test_image(url.clone(), None, None)).await.unwrap_err();
+        assert!(err.contains("status 404"), "err={err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_remote_image_with_bearer_and_referer() {
+        // 模拟需 Authorization + Referer 的热链/CDN：缺一即 403
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
+        let png_bytes = base64::engine::general_purpose::STANDARD.decode(png_b64).unwrap();
+        let app = axum::Router::new().route(
+            "/secure.png",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                let auth_ok = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()) == Some("Bearer secret");
+                let ref_ok = headers.get(axum::http::header::REFERER).and_then(|v| v.to_str().ok()) == Some("https://example.com/");
+                if !auth_ok || !ref_ok {
+                    return (axum::http::StatusCode::FORBIDDEN, vec![0u8]);
+                }
+                (axum::http::StatusCode::OK, png_bytes.clone())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{addr}/secure.png");
+        // 无认证 → 403
+        let err = fetch_image_as_base64(&url, &test_image(url.clone(), None, None)).await.unwrap_err();
+        assert!(err.contains("status 403"), "err={err}");
+        // 带 Bearer + Referer → 200
+        let mut hs = HashMap::new();
+        hs.insert("Authorization".into(), "Bearer secret".into());
+        let ok = fetch_image_as_base64(&url, &test_image(url.clone(), Some(hs), Some("https://example.com/".into())))
+            .await
+            .unwrap();
+        assert_eq!(ok, png_b64);
     }
 }

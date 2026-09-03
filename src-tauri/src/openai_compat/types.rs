@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -68,9 +69,21 @@ pub enum ContentPart {
     Other,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ImageUrl {
     pub url: String,
+    /// 可选透传请求头，覆盖 Referer/User-Agent/Authorization/Cookie 等，防 403/热链
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+    /// 快捷 Referer，优先级：headers.Referer > referer
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referer: Option<String>,
+    /// 快捷 User-Agent
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    /// OpenAI 兼容 detail 字段，忽略但保留以免反序列化失败
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl ChatCompletionRequest {
@@ -143,6 +156,7 @@ impl ChatCompletionRequest {
         self.stream.unwrap_or(false)
     }
 
+    #[allow(dead_code)]
     pub fn image_urls(&self) -> Vec<String> {
         let mut out = Vec::new();
         for msg in &self.messages {
@@ -157,13 +171,42 @@ impl ChatCompletionRequest {
         out
     }
 
+    /// 保留 url+认证头的完整输入，供服务端拉取时透传 Referer/UA/Authorization 等
+    pub fn image_inputs(&self) -> Vec<ImageUrl> {
+        let mut out = Vec::new();
+        for msg in &self.messages {
+            if let MessageContent::Parts(parts) = &msg.content {
+                for p in parts {
+                    if let ContentPart::ImageUrl { image_url } = p {
+                        out.push(image_url.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+    #[allow(dead_code)]
     pub fn has_image(&self) -> bool {
         !self.image_urls().is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn image_count(&self) -> usize {
         self.image_urls().len()
     }
+}
+
+/// 是否为服务端可拉取的 http/https 远端 URL（用于跳过前端 CORS + 防 403）。
+/// 仅 `http://` / `https://` 视为可 fetch，其它 `://` / `:` 仍走 `peel_data_url` 的 400。
+pub fn is_http_url(url: &str) -> bool {
+    let t = url.trim();
+    if t.len() >= 7 && t[..7].eq_ignore_ascii_case("http://") {
+        return true;
+    }
+    if t.len() >= 8 && t[..8].eq_ignore_ascii_case("https://") {
+        return true;
+    }
+    false
 }
 
 pub fn peel_data_url(url: &str) -> Result<String, String> {
@@ -498,11 +541,13 @@ mod tests {
                         ContentPart::ImageUrl {
                             image_url: ImageUrl {
                                 url: "data:image/png;base64,AAA".into(),
+                                ..Default::default()
                             },
                         },
                         ContentPart::ImageUrl {
                             image_url: ImageUrl {
                                 url: "data:image/jpeg;base64,BBB".into(),
+                                ..Default::default()
                             },
                         },
                     ]),
@@ -619,5 +664,64 @@ mod tests {
         let msg = ChatMessageOut::with_image("hi".into(), Some("   ".into()));
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["content"], json!("hi"));
+    }
+
+    #[test]
+    fn is_http_url_true() {
+        assert!(is_http_url("http://example.com/a.png"));
+        assert!(is_http_url("https://example.com/a.jpg"));
+        assert!(is_http_url("HTTPS://example.com/x.webp"));
+        assert!(is_http_url("  https://example.com/img.png  "));
+    }
+
+    #[test]
+    fn is_http_url_false() {
+        assert!(!is_http_url("data:image/png;base64,AAA"));
+        assert!(!is_http_url("iVBORw0KGgoAAAANSUhEUg=="));
+        assert!(!is_http_url("blob:https://example.com/uuid"));
+        assert!(!is_http_url("ftp://example.com/img.png"));
+        assert!(!is_http_url(""));
+    }
+
+    #[test]
+    fn image_url_with_headers_deser() {
+        let j = json!({"url":"https://example.com/img.jpg","headers":{"Authorization":"Bearer tok","Referer":"https://example.com/"},"referer":"https://ref.example.com/","user_agent":"MyAgent/1.0"});
+        let iu: ImageUrl = serde_json::from_value(j).unwrap();
+        assert_eq!(iu.url, "https://example.com/img.jpg");
+        assert_eq!(iu.headers.as_ref().unwrap().get("Authorization").unwrap(), "Bearer tok");
+        assert_eq!(iu.referer.as_deref().unwrap(), "https://ref.example.com/");
+        assert_eq!(iu.user_agent.as_deref().unwrap(), "MyAgent/1.0");
+    }
+
+    #[test]
+    fn image_inputs_with_auth() {
+        let req = ChatCompletionRequest {
+            model: "hy-mt2:Chinese".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/secure.png".into(),
+                        headers: Some([("Authorization".into(), "Bearer abc".into())].into_iter().collect()),
+                        referer: Some("https://example.com/".into()),
+                        ..Default::default()
+                    },
+                }]),
+            }],
+            stream: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            seed: None,
+            target_language: None,
+            language: None,
+            extra: None,
+        };
+        let inputs = req.image_inputs();
+        assert_eq!(inputs.len(), 1);
+        assert!(is_http_url(&inputs[0].url));
+        assert_eq!(inputs[0].headers.as_ref().unwrap().get("Authorization").unwrap(), "Bearer abc");
+        assert_eq!(inputs[0].referer.as_deref().unwrap(), "https://example.com/");
     }
 }
