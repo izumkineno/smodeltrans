@@ -337,6 +337,8 @@ pub(crate) struct ModelRuntimeStatus {
     pub(crate) ocr_loaded: bool,
     pub(crate) translator_loaded: bool,
     pub(crate) busy: bool,
+    /// 本进程工作集（MiB），Windows 下取值；其它平台为 None。用于验证卸载是否回落。
+    pub(crate) process_memory_mib: Option<u64>,
 }
 
 impl From<BackendFailure> for BackendError {
@@ -369,7 +371,33 @@ fn current_model_runtime_status(state: &BackendState) -> Result<ModelRuntimeStat
         ocr_loaded,
         translator_loaded,
         busy: state.runs.is_busy()? || state.live_active.load(Ordering::SeqCst),
+        process_memory_mib: process_memory_mib(),
     })
+}
+
+/// 当前进程工作集；Windows 经 GetProcessMemoryInfo 取，其它平台 None。
+fn process_memory_mib() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::{
+            ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+            Threading::GetCurrentProcess,
+        };
+        unsafe {
+            let mut counters = PROCESS_MEMORY_COUNTERS::default();
+            GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters,
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            )
+            .ok()?;
+            Some(counters.WorkingSetSize as u64 / 1024 / 1024)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 fn ensure_live_inactive(state: &BackendState) -> Result<(), BackendFailure> {
@@ -602,7 +630,7 @@ pub(crate) fn save_model_catalog(
     result
 }
 
-fn persist_backend_settings(
+pub(crate) fn persist_backend_settings(
     config_path: &Path,
     settings: &BackendSettings,
 ) -> Result<(), BackendFailure> {

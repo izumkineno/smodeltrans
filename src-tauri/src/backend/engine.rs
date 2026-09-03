@@ -81,7 +81,8 @@ pub(crate) struct GpuResourceInfo {
 
 pub(crate) struct BackendEngine {
     pub(crate) settings: BackendSettings,
-    device: CandleDevice,
+    /// 计算设备句柄：双模型都卸载时置空以销毁 CUDA context，释放驱动侧常驻内存；下次加载按需重建
+    device: Option<CandleDevice>,
     gpu_policy: GpuExecutionPolicy,
     ocr: Option<PpOcrProvider>,
     hy: Option<hy::HyTranslator>,
@@ -120,7 +121,7 @@ impl BackendEngine {
         let out = Self {
             output: ImageOutput::new(settings.font_path.clone()),
             settings,
-            device,
+            device: Some(device),
             gpu_policy,
             ocr: None,
             hy: None,
@@ -142,6 +143,24 @@ impl BackendEngine {
         (self.ocr_loaded(), self.translator_loaded())
     }
 
+    /// 获取可用设备句柄；卸载后置空过则按当前配置重建（含 CUDA context 重建开销）。
+    fn device_handle(&mut self) -> Result<CandleDevice, BackendFailure> {
+        if self.device.is_none() {
+            let kind = self.settings.device_kind;
+            tracing::info!(target: "backend::engine", device_kind = ?kind, "device was released, recreating on demand");
+            self.device = Some(create_device(kind)?);
+        }
+        Ok(self.device.clone().expect("device ensured above"))
+    }
+
+    /// 双模型皆空时释放设备句柄；candle 张量自带设备引用，已加载模型的 context 不受影响。
+    fn release_device_if_idle(&mut self) {
+        if self.ocr.is_none() && self.hy.is_none() && self.device.is_some() {
+            self.device = None;
+            tracing::info!(target: "backend::engine", "device released with last model, CUDA context dropped");
+        }
+    }
+
     #[tracing::instrument(level = "info", skip(self), fields(gpu_policy = self.gpu_policy.label(), region_parallelism = self.settings.region_parallelism, ocr_loaded_before = self.ocr.is_some()))]
     pub(crate) fn load_ocr(&mut self) -> Result<(), BackendFailure> {
         tracing::info!(target: "backend::engine", gpu_policy = self.gpu_policy.label(), ocr_loaded_before = self.ocr.is_some(), "load_ocr entry");
@@ -154,10 +173,11 @@ impl BackendEngine {
                 self.translator_memory = None;
             }
             tracing::debug!(target: "backend::engine", detector = %self.settings.detector_model_dir.display(), recognizer = %self.settings.recognizer_model_dir.display(), region_parallelism = self.settings.region_parallelism, batch_pixels = self.gpu_policy.recognizer_batch_pixels(), "load_ocr: loading PpOcrProvider");
+            let device = self.device_handle()?;
             let provider = PpOcrProvider::load(
                 &self.settings.detector_model_dir,
                 &self.settings.recognizer_model_dir,
-                &self.device,
+                &device,
                 self.settings.region_parallelism,
                 self.gpu_policy.recognizer_batch_pixels(),
             )
@@ -216,9 +236,10 @@ impl BackendEngine {
                 self.ocr = None;
             }
             tracing::debug!(target: "backend::engine", hy_model = %self.settings.hy_model.display(), target_language = %target_language, "load_translator_with_memory: loading Hy translator");
+            let device = self.device_handle()?;
             let translator = hy::load_with_config(
                 &self.settings.hy_model,
-                &self.device,
+                &device,
                 config.memory,
                 config.generation,
                 config.prompt,
@@ -292,10 +313,13 @@ impl BackendEngine {
         Ok(())
     }
 
-    #[tracing::instrument(level = "info", skip(self))]
     pub(crate) fn gpu_resource_info(&self) -> Result<Option<GpuResourceInfo>, BackendFailure> {
         tracing::debug!(target: "backend::engine", "gpu_resource_info entry");
-        let resources = query_gpu_memory(&self.device).inspect_err(|e| {
+        let Some(device) = self.device.as_ref() else {
+            tracing::debug!(target: "backend::engine", "gpu_resource_info: device released, no info");
+            return Ok(None);
+        };
+        let resources = query_gpu_memory(device).inspect_err(|e| {
             tracing::warn!(target: "backend::engine", error = %e, "gpu_resource_info: query_gpu_memory failed");
         }).ok().flatten();
         let out = Ok(resources
@@ -327,6 +351,7 @@ impl BackendEngine {
     pub(crate) fn unload_ocr(&mut self) {
         tracing::info!(target: "backend::engine", ocr_loaded_before = self.ocr.is_some(), "unload_ocr entry");
         self.ocr = None;
+        self.release_device_if_idle();
         tracing::info!(target: "backend::engine", "unload_ocr completed");
     }
 
@@ -335,6 +360,7 @@ impl BackendEngine {
         tracing::info!(target: "backend::engine", translator_loaded_before = self.hy.is_some(), "unload_translator entry");
         self.hy = None;
         self.translator_memory = None;
+        self.release_device_if_idle();
         tracing::info!(target: "backend::engine", "unload_translator completed");
     }
 
@@ -1066,6 +1092,7 @@ mod tests {
             model_root: PathBuf::from("models"),
             catalog: Default::default(),
             openai_compat: Default::default(),
+            lightweight_mode: true,
         }
     }
 
@@ -1145,6 +1172,7 @@ mod tests {
             model_root: model_root.clone(),
             catalog: Default::default(),
             openai_compat: Default::default(),
+            lightweight_mode: true,
         };
         let mut engine = BackendEngine::new(settings).expect("CUDA engine");
         let image = decode_image(

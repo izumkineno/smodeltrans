@@ -117,6 +117,8 @@ export interface ModelRuntimeStatus {
   ocrLoaded: boolean;
   translatorLoaded: boolean;
   busy: boolean;
+  /** 本进程工作集 MiB（Windows），其它平台 null/缺失 */
+  processMemoryMib?: number | null;
 }
 
 export interface BackendSettingsUpdate {

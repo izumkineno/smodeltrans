@@ -161,6 +161,10 @@ onBeforeUnmount(stopPolling);
             <dt>自动刷新</dt>
             <dd>2,000 ms</dd>
           </div>
+          <div v-if="runtimeStatus.processMemoryMib != null">
+            <dt>进程内存</dt>
+            <dd>{{ runtimeStatus.processMemoryMib }} MiB</dd>
+          </div>
         </dl>
       </div>
 
