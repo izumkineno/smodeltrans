@@ -99,24 +99,23 @@ impl BackendEngine {
             tracing::error!(target: "backend::engine", error = %e, duration_ms = __start.elapsed().as_millis() as u64, "BackendEngine::new create_device failed");
         })?;
         tracing::debug!(target: "backend::engine", device_kind = ?settings.device_kind, "device created, querying GPU memory");
-        let fallback_policy = if settings.device_kind == DeviceKind::Cuda {
-            GpuExecutionPolicy::Balanced
+        // 纯 GPU 实验：CUDA 下强制常驻（PP-OCR 与 Hy 同时在显存），消除 Balanced/Constrained
+        // 档每次调用互踢重载。显存不足时会直接 OOM 报错而非变慢；以 for_memory 档位仅记日志。
+        let queried = query_gpu_memory(&device)
+            .inspect_err(|e| {
+                tracing::warn!(target: "backend::engine", error = %e, "query_gpu_memory failed, proceeding with forced resident policy");
+            })
+            .ok()
+            .flatten();
+        if let Some((_, total_mib, free_mib)) = queried {
+            let tier = GpuExecutionPolicy::for_memory(total_mib, free_mib);
+            tracing::info!(target: "backend::engine", total_mib, free_mib, tier = tier.label(), "GPU memory (pure-GPU: policy forced to gpu_resident regardless of tier)");
+        }
+        let gpu_policy = if settings.device_kind == DeviceKind::Cuda {
+            GpuExecutionPolicy::Resident
         } else {
             GpuExecutionPolicy::Cpu
         };
-        let gpu_policy = query_gpu_memory(&device)
-            .inspect_err(|e| {
-                tracing::warn!(target: "backend::engine", error = %e, "query_gpu_memory failed, using fallback policy");
-            })
-            .ok()
-            .flatten()
-            .map(|(_, total_mib, free_mib)| {
-                let policy = GpuExecutionPolicy::for_memory(total_mib, free_mib);
-                tracing::debug!(target: "backend::engine", total_mib, free_mib, policy = policy.label(), "GPU memory queried, resolved policy");
-                policy
-            })
-            .unwrap_or(fallback_policy);
-        tracing::debug!(target: "backend::engine", gpu_policy = gpu_policy.label(), "resolved gpu_policy");
         settings.region_parallelism = gpu_policy.region_parallelism(settings.region_parallelism);
         let out = Self {
             output: ImageOutput::new(settings.font_path.clone()),
@@ -409,8 +408,11 @@ impl BackendEngine {
                 "OCR region count exceeds the supported bound",
             ));
         }
-        tracing::info!(target: "backend::engine", request_id = %image.file_name(), duration_ms = __start.elapsed().as_millis() as u64, region_count = document.regions.len(), "recognize_regions success");
-        Ok(document.regions)
+        let mut regions = document.regions;
+        // OCR 路径同样阅读排序+气泡行合并：前端选词/标注图按 order 展示，检测顺序错乱同样影响阅读。
+        sort_static_reading_order(&mut regions);
+        tracing::info!(target: "backend::engine", request_id = %image.file_name(), duration_ms = __start.elapsed().as_millis() as u64, region_count = regions.len(), "recognize_regions success");
+        Ok(regions)
     }
 
     #[tracing::instrument(level = "info", skip(self, image, cancellation, report_progress), fields(request_id = %image.file_name(), target_language = %image.target_language(), width = image.canvas().width(), height = image.canvas().height(), file_name = %image.file_name()))]
@@ -457,6 +459,8 @@ impl BackendEngine {
         }
 
         let mut records = document.regions;
+        // 主流对齐：先阅读排序+同行碎片合并为气泡行再送译；此前顺序=检测轮廓发现顺序。
+        sort_static_reading_order(&mut records);
         if records.is_empty() {
             tracing::debug!(target: "backend::engine", request_id = %image.file_name(), "translate: no regions, rendering empty output");
             let output = self
@@ -476,7 +480,8 @@ impl BackendEngine {
             &mut records,
             image.target_language(),
             cancellation,
-            false,
+            // 气泡级上下文批译（整页送译对齐主流），此前逐框独立翻译断裂对话。
+            true,
             "",
             &mut report_progress,
         ).inspect_err(|e| {
@@ -1061,6 +1066,247 @@ fn query_gpu_memory(
 ) -> Result<Option<(String, usize, usize)>, BackendFailure> {
     tracing::debug!(target: "backend::engine", "query_gpu_memory: non-cuda build, returning None");
     Ok(None)
+}
+
+/// 静态图阅读排序+气泡级合并（主流气泡级处理对齐）。
+///
+/// PP-OCR 检测顺序=轮廓发现顺序，多气泡时错乱；同行碎片割裂句子、同气泡多行堆叠割裂对话。
+/// 主流（BallonsTranslator 气泡区排版、comic-translate 气泡框包裹）按气泡级处理，
+/// 这里做轻量对齐：行容差排序（竖排栏从右到左） + 同行碎片合并 + 纵向同气泡行合并，不引入新模型。
+/// 日漫页级右→左气泡排序暂不支持（manga-image-translator 同样列为开放问题），保持上→下、左→右。
+fn sort_static_reading_order(records: &mut Vec<RegionRecord>) {
+    if records.len() < 2 {
+        if let Some(first) = records.first_mut() {
+            first.order = 1;
+        }
+        return;
+    }
+    let median_height = {
+        let mut heights = records
+            .iter()
+            .map(|record| quad_height(record.quad_points))
+            .collect::<Vec<_>>();
+        heights.sort_unstable();
+        heights[heights.len() / 2].max(1)
+    };
+    // 行容差=中位高一半：同行上下抖动仍从左到右，不同行从上到下。
+    let line_tolerance = (median_height / 2).max(1);
+    records.sort_by(|left, right| {
+        let (left_top, left_left) = (quad_top(left.quad_points), quad_left(left.quad_points));
+        let (right_top, right_left) = (quad_top(right.quad_points), quad_left(right.quad_points));
+        if (left_top - right_top).abs() <= line_tolerance {
+            // 竖排两栏（高≥2倍宽且同带）按从右到左读；其余从左到右。
+            if is_vertical_column(left.quad_points) && is_vertical_column(right.quad_points) {
+                right_left.cmp(&left_left).then_with(|| left_top.cmp(&right_top))
+            } else {
+                left_left.cmp(&right_left).then_with(|| left_top.cmp(&right_top))
+            }
+        } else {
+            left_top.cmp(&right_top)
+        }
+    });
+    // Phase 2 同行小间隙碎片合并为行：阈值与实时 scheduler 同款
+    // （垂直重叠≥45% 或中心偏移≤45%，水平间隙≤字宽*1.65 且 ≤行高*2）。
+    let mut lines: Vec<RegionRecord> = Vec::with_capacity(records.len());
+    for record in records.drain(..) {
+        let join = lines
+            .last()
+            .is_some_and(|previous| static_fragments_belong_together(previous, &record));
+        if join {
+            let previous = lines.last_mut().expect("join checked");
+            let joined = join_static_fragments(&previous.source_text, &record.source_text);
+            absorb_region(previous, record, joined);
+        } else {
+            lines.push(record);
+        }
+    }
+    // Phase 3 纵向气泡合并：同一对话框内多行纵向堆叠（漫画气泡常见），必须按气泡一次送译，
+    // 否则逐行独立翻译必然碎片化。行间隙≤1.0×行高且水平交叠≥40%才视为同气泡，行间用换行保留段落。
+    let mut merged: Vec<RegionRecord> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let join = merged
+            .last()
+            .is_some_and(|bubble| static_lines_belong_to_bubble(bubble, &line));
+        if join {
+            let bubble = merged.last_mut().expect("join checked");
+            let joined = join_static_bubble_lines(&bubble.source_text, &line.source_text);
+            absorb_region(bubble, line, joined);
+        } else {
+            merged.push(line);
+        }
+    }
+    *records = merged;
+    for (index, record) in records.iter_mut().enumerate() {
+        record.order = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        record.translated_text.clear();
+        record.characters.sort_by_key(|character| character.order);
+        for (character_index, character) in record.characters.iter_mut().enumerate() {
+            character.order = u32::try_from(character_index + 1).unwrap_or(u32::MAX);
+        }
+    }
+}
+
+fn quad_aabb(quad: [[i32; 2]; 4]) -> (i32, i32, i32, i32) {
+    let (mut left, mut top, mut right, mut bottom) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for [x, y] in quad {
+        left = left.min(x);
+        top = top.min(y);
+        right = right.max(x);
+        bottom = bottom.max(y);
+    }
+    (left, top, right, bottom)
+}
+
+fn quad_top(quad: [[i32; 2]; 4]) -> i32 {
+    quad_aabb(quad).1
+}
+
+fn quad_left(quad: [[i32; 2]; 4]) -> i32 {
+    quad_aabb(quad).0
+}
+
+fn quad_height(quad: [[i32; 2]; 4]) -> i32 {
+    let (_, top, _, bottom) = quad_aabb(quad);
+    (bottom - top).max(0)
+}
+
+fn static_fragments_belong_together(left: &RegionRecord, right: &RegionRecord) -> bool {
+    let (left_l, left_t, left_r, left_b) = quad_aabb(left.quad_points);
+    let (right_l, right_t, right_r, right_b) = quad_aabb(right.quad_points);
+    let left_h = (left_b - left_t).max(1);
+    let right_h = (right_b - right_t).max(1);
+    let reference_height = left_h.min(right_h);
+    let overlap = (left_b.min(right_b) - left_t.max(right_t)).max(0);
+    let center_delta = ((left_t + left_b) / 2 - (right_t + right_b) / 2).abs();
+    if !((overlap as f32 / reference_height as f32) >= 0.45
+        || (center_delta as f32 / reference_height as f32) <= 0.45)
+    {
+        return false;
+    }
+    // 竖排两栏按从右到左排序，邻接方向随之反转；其余按从左到右。
+    let both_vertical =
+        is_vertical_column(left.quad_points) && is_vertical_column(right.quad_points);
+    let gap = if both_vertical {
+        left_l - right_r
+    } else {
+        right_l - left_r
+    };
+    if gap < -(reference_height / 3).max(2) {
+        return false;
+    }
+    let char_width = |text: &str, width: i32| {
+        width as f32
+            / text
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .count()
+                .max(1) as f32
+    };
+    let maximum_gap = char_width(&left.source_text, left_r - left_l)
+        .max(char_width(&right.source_text, right_r - right_l))
+        * 1.65;
+    let maximum_gap = maximum_gap
+        .max(reference_height as f32 * 1.25)
+        .round()
+        .clamp(4.0, (reference_height.saturating_mul(2)).max(4) as f32) as i32;
+    gap.max(0) <= maximum_gap
+}
+
+fn absorb_region(bubble: &mut RegionRecord, next: RegionRecord, joined_text: String) {
+    let (left, top, right, bottom) = quad_aabb(bubble.quad_points);
+    let (next_left, next_top, next_right, next_bottom) = quad_aabb(next.quad_points);
+    bubble.quad_points = [
+        [left.min(next_left), top.min(next_top)],
+        [right.max(next_right), top.min(next_top)],
+        [right.max(next_right), bottom.max(next_bottom)],
+        [left.min(next_left), bottom.max(next_bottom)],
+    ];
+    bubble.source_text = joined_text;
+    if next.confidence_milli > 0 {
+        bubble.confidence_milli = if bubble.confidence_milli == 0 {
+            next.confidence_milli
+        } else {
+            bubble.confidence_milli.min(next.confidence_milli)
+        };
+    }
+    bubble.characters.extend(next.characters);
+}
+
+/// 高≥2倍宽的窄高框视为竖排栏（竖排对话框按栏切分时常见）。
+fn is_vertical_column(quad: [[i32; 2]; 4]) -> bool {
+    let (left, top, right, bottom) = quad_aabb(quad);
+    bottom - top >= (right - left).max(1) * 2
+}
+
+/// 纵向同气泡判定：上下行水平交叠≥40%最小框宽、中心偏移≤1框宽、
+/// 行间隙≤1.0×行高（重叠太多则不是上下行关系）。
+fn static_lines_belong_to_bubble(upper: &RegionRecord, lower: &RegionRecord) -> bool {
+    let (upper_l, _, upper_r, upper_b) = quad_aabb(upper.quad_points);
+    let (lower_l, lower_t, lower_r, _) = quad_aabb(lower.quad_points);
+    let reference_height = quad_height(upper.quad_points)
+        .max(1)
+        .min(quad_height(lower.quad_points).max(1));
+    let min_width = (upper_r - upper_l).min(lower_r - lower_l).max(1);
+    let overlap_width = (upper_r.min(lower_r) - upper_l.max(lower_l)).max(0);
+    if overlap_width < min_width * 2 / 5 {
+        return false;
+    }
+    let center_dx = ((upper_l + upper_r) / 2 - (lower_l + lower_r) / 2).abs();
+    if center_dx > min_width {
+        return false;
+    }
+    let gap = lower_t - upper_b;
+    if gap < -(reference_height / 3).max(2) {
+        return false;
+    }
+    gap.max(0) <= reference_height.max(4)
+}
+
+fn join_static_bubble_lines(bubble: &str, line: &str) -> String {
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if bubble.is_empty() {
+        return line;
+    }
+    if line.is_empty() {
+        return bubble.to_owned();
+    }
+    format!("{bubble}\n{line}")
+}
+
+fn join_static_fragments(left: &str, right: &str) -> String {
+    join_static_fragment_parts([left, right])
+}
+
+fn join_static_fragment_parts<'a>(fragments: impl IntoIterator<Item = &'a str>) -> String {
+    let mut result = String::new();
+    for fragment in fragments {
+        let fragment = fragment.split_whitespace().collect::<Vec<_>>().join(" ");
+        if fragment.is_empty() {
+            continue;
+        }
+        let needs_space = result
+            .chars()
+            .last()
+            .zip(fragment.chars().next())
+            .is_some_and(|(prev, next)| {
+                (prev.is_alphanumeric() || matches!(prev, ',' | '.' | ';' | ':' | '!' | '?'))
+                    && next.is_alphanumeric()
+                    && !is_static_cjk_like(prev)
+                    && !is_static_cjk_like(next)
+            });
+        if needs_space {
+            result.push(' ');
+        }
+        result.push_str(&fragment);
+    }
+    result
+}
+
+fn is_static_cjk_like(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xac00..=0xd7af | 0xf900..=0xfaff
+    )
 }
 
 #[cfg(test)]
