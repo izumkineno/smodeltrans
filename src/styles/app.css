@@ -1183,7 +1183,10 @@ h1 {
 
 .result-image {
   display: block;
-  width: 100%;
+  width: auto;
+  max-width: 100%;
+  align-self: center;
+  justify-self: center;
 }
 
 .input-image {
