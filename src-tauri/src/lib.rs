@@ -7,6 +7,8 @@ mod openai_compat;
 mod output;
 mod quick_translation;
 mod selection;
+#[cfg(desktop)]
+mod tray;
 use std::sync::Arc;
 use tauri::Manager;
 
@@ -73,12 +75,17 @@ pub fn run() {
                     }
                 });
             }
-
             app.manage(state);
             app.manage(live_manager);
             app.manage(openai_handle);
             quick_translation::setup(app);
+            #[cfg(desktop)]
+            tray::setup(app);
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            #[cfg(desktop)]
+            tray::handle_close_to_tray(window, event);
         })
         .invoke_handler(tauri::generate_handler![
             logging::frontend_log,

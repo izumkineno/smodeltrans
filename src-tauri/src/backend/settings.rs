@@ -104,6 +104,8 @@ pub(crate) struct BackendSettings {
     pub(crate) catalog: ModelCatalog,
     #[allow(dead_code)]
     pub(crate) openai_compat: crate::openai_compat::config::OpenAiCompatConfig,
+    /// 轻量模式（托盘开关）：开 = 主窗口关闭时销毁前端窗口，仅托盘常驻；关 = 正常退出
+    pub(crate) lightweight_mode: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -332,6 +334,9 @@ pub(crate) struct PersistedBackendSettings {
     pub(crate) model_catalog: Option<ModelCatalog>,
     #[serde(default)]
     pub(crate) openai_compat: Option<crate::openai_compat::config::OpenAiCompatConfig>,
+    /// 旧文件缺省 = 开，保持既有“关闭隐藏到托盘”行为
+    #[serde(default)]
+    pub(crate) lightweight_mode: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -657,6 +662,10 @@ impl BackendSettings {
             .as_ref()
             .and_then(|settings| settings.openai_compat.clone())
             .unwrap_or_default();
+        let lightweight_mode = persisted
+            .as_ref()
+            .and_then(|settings| settings.lightweight_mode)
+            .unwrap_or(true);
         // 校验但不阻断启动，非法则回退默认
         let openai_compat = match openai_compat.validate() {
             Ok(()) => {
@@ -685,6 +694,7 @@ impl BackendSettings {
             model_root,
             catalog,
             openai_compat,
+            lightweight_mode,
         })
     }
 
@@ -742,6 +752,7 @@ impl BackendSettings {
             prompt: Some(PersistedPromptSettings::from(&self.prompt)),
             model_catalog: Some(self.catalog.clone()),
             openai_compat: Some(self.openai_compat.clone()),
+            lightweight_mode: Some(self.lightweight_mode),
         }
     }
     /// Replace the persisted model catalog after validating every entry.
@@ -1484,6 +1495,7 @@ mod tests {
             model_root: PathBuf::from("C:\\models"),
             catalog: ModelCatalog::default(),
             openai_compat: Default::default(),
+            lightweight_mode: true,
         }
     }
 
@@ -1554,6 +1566,24 @@ mod tests {
         assert_eq!(updated.memory.max_tokens, 1024);
         assert_eq!(updated.memory.max_turns, 4);
         assert_eq!(updated.prompt.template, "Preserve product names.");
+    }
+
+    #[test]
+    fn lightweight_mode_defaults_on_and_roundtrips() {
+        // 旧文件无 lightweightMode：缺省开，保持既有关闭隐藏到托盘行为
+        let legacy: PersistedBackendSettings = serde_json::from_value(serde_json::json!({
+            "detectorModelDir": "D:\\models\\detector"
+        }))
+        .expect("legacy persisted settings");
+        assert!(legacy.lightweight_mode.is_none());
+        // 写入侧恒为 Some，托盘开关切换后落盘不丢失
+        let mut current = settings();
+        assert!(current.persisted().lightweight_mode == Some(true));
+        current.lightweight_mode = false;
+        let back: PersistedBackendSettings =
+            serde_json::from_value(serde_json::to_value(current.persisted()).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(back.lightweight_mode, Some(false));
     }
 
     #[test]
