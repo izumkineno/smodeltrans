@@ -125,6 +125,7 @@ pub fn run() {
             backend::live::get_live_subtitle,
             backend::live::pause_live_session,
             backend::live::resume_live_session,
+            backend::live::stop_live_session,
             backend::live::interrupt_live_translation,
             openai_compat::commands::get_openai_status,
             openai_compat::commands::update_openai_config,
