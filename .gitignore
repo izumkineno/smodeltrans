@@ -32,3 +32,6 @@ tmp
 .serena
 scripts/_synth_mod_error.png
 scripts/_vision_annotated.png
+# 本机 CUDA DLL 打包引用（directory junction，未提交，打包机自建）：
+# cmd /c mklink /J src-tauri\vendor-cuda "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
+/src-tauri/vendor-cuda/

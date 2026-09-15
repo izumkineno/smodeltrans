@@ -40,6 +40,32 @@ pub fn run() {
                     "应用启动"
                 );
             }
+            // Windows 免 CUDA 安装运行：cudart/cublas/cublasLt/curand 随 bundle.resources
+            // 落到 resource_dir，启动时加入 DLL 搜索路径（PATH），candle 首次调 CUDA 前生效。
+            // 开发机 resource_dir 下无此 DLL 时跳过（走系统 CUDA），仅 std、无新依赖。
+            #[cfg(windows)]
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                if resource_dir.join("cudart64_12.dll").is_file() {
+                    let mut paths = vec![resource_dir.clone()];
+                    if let Some(path) = std::env::var_os("PATH") {
+                        paths.extend(std::env::split_paths(&path));
+                    }
+                    match std::env::join_paths(paths) {
+                        Ok(joined) => {
+                            // edition 2024 起 set_var 为 unsafe；setup 单线程期调用安全。
+                            unsafe { std::env::set_var("PATH", joined) };
+                            tracing::info!(
+                                target: "app::startup",
+                                resource_dir = %resource_dir.display(),
+                                "已将打包 CUDA DLL 目录加入 PATH"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "app::startup", error = %e, "拼接 PATH 失败，CUDA DLL 可能加载失败");
+                        }
+                    }
+                }
+            }
 
             let resource_root = app.path().resource_dir().ok();
             let config_path = app

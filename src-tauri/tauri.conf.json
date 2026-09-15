@@ -51,6 +51,12 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "vendor-cuda/cudart64_12.dll": "cudart64_12.dll",
+      "vendor-cuda/cublas64_12.dll": "cublas64_12.dll",
+      "vendor-cuda/cublasLt64_12.dll": "cublasLt64_12.dll",
+      "vendor-cuda/curand64_10.dll": "curand64_10.dll"
+    }
   }
 }
