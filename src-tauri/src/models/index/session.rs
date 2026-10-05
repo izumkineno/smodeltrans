@@ -34,13 +34,13 @@ fn rms_norm_vec(x: &[f32], w: &[f32], eps: f64) -> Vec<f32> {
 /// env 门控的前向分段计时（`SMODELTRANS_INDEX_PROFILE=1` 开启；关闭时零开销）。
 /// GPU 是异步的，分段必须先 `synchronize` 否则数字无意义。
 #[derive(Default)]
-struct StepProfile {
-    enabled: bool,
-    proj_ms: f64,
-    cpu_ms: f64,
-    ffn_ms: f64,
-    norm_ms: f64,
-    steps: u64,
+pub(crate) struct StepProfile {
+    pub enabled: bool,
+    pub proj_ms: f64,
+    pub cpu_ms: f64,
+    pub ffn_ms: f64,
+    pub norm_ms: f64,
+    pub steps: u64,
 }
 
 fn profile_enabled() -> bool {
@@ -53,7 +53,7 @@ fn profile_enabled() -> bool {
     })
 }
 
-fn prof_snap(prof: &StepProfile, device: &Device) -> Option<std::time::Instant> {
+pub(crate) fn prof_snap(prof: &StepProfile, device: &Device) -> Option<std::time::Instant> {
     if prof.enabled {
         let _ = device.synchronize();
         Some(std::time::Instant::now())
@@ -62,7 +62,7 @@ fn prof_snap(prof: &StepProfile, device: &Device) -> Option<std::time::Instant> 
     }
 }
 
-fn prof_acc(slot: &mut f64, t0: Option<std::time::Instant>) {
+pub(crate) fn prof_acc(slot: &mut f64, t0: Option<std::time::Instant>) {
     if let Some(t) = t0 {
         *slot += t.elapsed().as_secs_f64() * 1000.0;
     }
@@ -97,6 +97,8 @@ impl IndexSession {
                     st.ssm_a = w.ssm_a.to_vec1::<f32>()?;
                     st.dt_bias = w.ssm_dt_bias.to_vec1::<f32>()?;
                     st.norm_weight = w.ssm_norm_weight.to_vec1::<f32>()?;
+                    st.conv_weight = w.ssm_conv1d.to_vec2::<f32>()?;
+                    st.conv_transposed = st.conv_weight.len() != 4;
                     delta.push(Some(st));
                     full.push(FullCache::new(0, 0, Vec::new(), Vec::new()));
                 }
@@ -144,11 +146,15 @@ impl IndexSession {
             .to_vec();
         anyhow::ensure!(!ids.is_empty(), "prompt produced no tokenizer ids");
         let mut states = self.new_states()?;
+        let mut prof = StepProfile {
+            enabled: profile_enabled(),
+            ..Default::default()
+        };
         // prefill：整串一次 batch 前向（投影走 mmq 快路径；DeltaNet/GQA 在 CPU 逐 step 推进状态）。
         let emb = self.embed_ids(&ids)?;
         let seq_len = ids.len();
         let batch = emb.squeeze(0)?;
-        let batch_logits = self.forward_batch(&batch, &mut states, 0)?;
+        let batch_logits = self.forward_batch(&batch, &mut states, 0, &mut prof)?;
         let mut logits = batch_logits.narrow(0, seq_len - 1, 1)?;
         let mut out_ids: Vec<u32> = Vec::new();
         let mut text = String::new();
@@ -169,7 +175,18 @@ impl IndexSession {
             text.push_str(&piece);
             on_chunk(&piece)?;
             let hid = self.embed_ids(&[next])?.squeeze(0)?;
-            logits = self.forward_batch(&hid, &mut states, ids.len() + out_ids.len() - 1)?;
+            logits = self.forward_batch(
+                &hid,
+                &mut states,
+                ids.len() + out_ids.len() - 1,
+                &mut prof,
+            )?;
+        }
+        if prof.enabled {
+            println!(
+                "index_profile steps={} proj={:.0}ms cpu={:.0}ms ffn={:.0}ms norm={:.0}ms",
+                prof.steps, prof.proj_ms, prof.cpu_ms, prof.ffn_ms, prof.norm_ms,
+            );
         }
         Ok(text)
     }
@@ -190,7 +207,9 @@ impl IndexSession {
         hidden: &Tensor,
         states: &mut IndexStates,
         start_pos: usize,
+        prof: &mut StepProfile,
     ) -> Result<Tensor> {
+        prof.steps += hidden.dim(0)? as u64;
         let mut h = hidden.clone();
         for (index, ((layer, dst), fc)) in self
             .model
@@ -202,16 +221,22 @@ impl IndexSession {
         {
             match (layer, dst) {
                 (IndexLayer::Linear(w), Some(st)) => {
+                    let t0 = prof_snap(prof, &self.device);
                     let n = rms_norm_gpu(&h, &states.attn_norms[index], self.model.rms_norm_eps)?;
-                    let o = delta_step(w, &n, st, &self.device)?;
+                    prof_acc(&mut prof.norm_ms, t0);
+                    let o = delta_step(w, &n, st, &self.device, prof)?;
                     h = (&h + &o)?;
+                    let t0 = prof_snap(prof, &self.device);
                     let n2 =
                         rms_norm_gpu(&h, &states.post_norms[index], self.model.rms_norm_eps)?;
-                    let f = ffn_swiglu_gpu(&w.common, &n2)?;
+                    prof_acc(&mut prof.norm_ms, t0);
+                    let f = ffn_swiglu_gpu(&w.common, &n2, &self.device, prof)?;
                     h = (&h + &f)?;
                 }
                 (IndexLayer::Full(w), _) => {
+                    let t0 = prof_snap(prof, &self.device);
                     let n = rms_norm_gpu(&h, &states.attn_norms[index], self.model.rms_norm_eps)?;
+                    prof_acc(&mut prof.norm_ms, t0);
                     let o = full_step(
                         &w.attn,
                         &n,
@@ -220,44 +245,49 @@ impl IndexSession {
                         self.model.rms_norm_eps,
                         self.model.freq_base,
                         &self.device,
+                        prof,
                     )?;
                     h = (&h + &o)?;
+                    let t0 = prof_snap(prof, &self.device);
                     let n2 =
                         rms_norm_gpu(&h, &states.post_norms[index], self.model.rms_norm_eps)?;
-                    let f = ffn_swiglu_gpu(&w.common, &n2)?;
+                    prof_acc(&mut prof.norm_ms, t0);
+                    let f = ffn_swiglu_gpu(&w.common, &n2, &self.device, prof)?;
                     h = (&h + &f)?;
                 }
                 _ => anyhow::bail!("layer/state mismatch"),
             }
         }
+        let t0 = prof_snap(prof, &self.device);
         let normed = rms_norm_gpu(&h, &states.output_norm, self.model.rms_norm_eps)?;
+        prof_acc(&mut prof.norm_ms, t0);
         Ok(self.model.output_proj.forward(&normed)?)
     }
 }
 
 fn rms_norm_gpu(hidden: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
-    let f16 = candle_core::DType::F16;
-    let device = hidden.device();
-    let last_dim = hidden.dim(1)? as f32;
-    let len = Tensor::new(last_dim, device)?.to_dtype(f16)?;
-    let ms = hidden.sqr()?.sum_keepdim(1)?.broadcast_div(&len)?;
-    let root = ms
-        .broadcast_add(&Tensor::new(eps as f32, device)?.to_dtype(f16)?)?
-        .sqrt()?;
-    let inv = Tensor::ones((), f16, device)?.broadcast_div(&root)?;
-    Ok(hidden.broadcast_mul(&inv)?.broadcast_mul(weight)?)
+    // 融合单 op（launch+alloc 最少）；GGUF 权重已预 +1，直接乘即等价。
+    Ok(candle_nn::ops::rms_norm(hidden, weight, eps as f32)?)
 }
 
 fn argmax_u32(logits: &Tensor) -> Result<u32> {
     Ok(logits.flatten_all()?.argmax(0)?.to_scalar::<u32>()?)
 }
 
-fn ffn_swiglu_gpu(common: &super::model::BlockCommon, hidden: &Tensor) -> Result<Tensor> {
+fn ffn_swiglu_gpu(
+    common: &super::model::BlockCommon,
+    hidden: &Tensor,
+    device: &Device,
+    prof: &mut StepProfile,
+) -> Result<Tensor> {
     use candle_core::Module;
+    let t0 = prof_snap(prof, device);
     let gate = common.ffn_gate.forward(hidden)?;
     let up = common.ffn_up.forward(hidden)?;
     let gated = candle_nn::ops::silu(&gate)?.broadcast_mul(&up)?;
-    Ok(common.ffn_down.forward(&gated)?)
+    let out = common.ffn_down.forward(&gated)?;
+    prof_acc(&mut prof.ffn_ms, t0);
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -68,7 +68,9 @@ pub(crate) fn full_step(
     rms_eps: f64,
     freq_base: f32,
     device: &Device,
+    prof: &mut super::session::StepProfile,
 ) -> Result<Tensor> {
+    let t0 = super::session::prof_snap(prof, device);
     let q_gate = attn.query.forward(hidden)?;
     let k = attn.key.forward(hidden)?;
     let v = attn.value.forward(hidden)?;
@@ -76,10 +78,12 @@ pub(crate) fn full_step(
     let rows = Tensor::cat(&[q_gate, k, v], 1)?
         .to_dtype(DType::F32)?
         .to_vec2::<f32>()?;
+    super::session::prof_acc(&mut prof.proj_ms, t0);
     let n_steps = rows.len();
     let rep = n_head / n_kv_head;
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut outs = Vec::with_capacity(n_steps * n_head * head_dim);
+    let t0 = super::session::prof_snap(prof, device);
     for (step, row) in rows.iter().enumerate() {
         let pos = start_pos + step;
         let (q_gate, rest) = row.split_at(n_head * head_dim * 2);
@@ -113,10 +117,12 @@ pub(crate) fn full_step(
         cache.v.push(v_heads.concat());
 
         let mut out = vec![0.0f32; n_head * head_dim];
+        let mut scores = Vec::new();
         for head in 0..n_head {
             let kv_head = head / rep;
             let q = &q_heads[head];
-            let mut scores = Vec::with_capacity(cache.k.len());
+            scores.clear();
+            scores.reserve(cache.k.len());
             for key in &cache.k {
                 let key_head = &key[kv_head * head_dim..(kv_head + 1) * head_dim];
                 scores.push(q.iter().zip(key_head).map(|(a, b)| a * b).sum::<f32>() * scale);
@@ -139,10 +145,14 @@ pub(crate) fn full_step(
         }
         outs.extend_from_slice(&out);
     }
+    super::session::prof_acc(&mut prof.cpu_ms, t0);
+    let t0 = super::session::prof_snap(prof, device);
     let out_t = Tensor::new(outs, device)?
         .reshape((n_steps, n_head * head_dim))?
         .to_dtype(DType::F16)?;
-    Ok(attn.output.forward(&out_t)?)
+    let out = attn.output.forward(&out_t)?;
+    super::session::prof_acc(&mut prof.proj_ms, t0);
+    Ok(out)
 }
 
 fn sigmoid(x: f32) -> f32 {

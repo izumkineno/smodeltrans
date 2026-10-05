@@ -211,15 +211,47 @@ mod e2e {
             )
             .expect("glossary translation failed");
         stat_glossary.report("glossary", glossary.chars().count());
-        println!(
-            "index_e2e total: {:.2}s ({} tokens)",
-            t_total.elapsed().as_secs_f32(),
-            stat_plain.tokens + stat_json.tokens + stat_glossary.tokens
-        );
         println!("glossary translation: {glossary}");
         assert!(
             glossary.to_lowercase().contains("carbon fiber"),
             "glossary term missing: {glossary}"
+        );
+
+        let mut stat_long = StreamStat::new();
+        generation.max_new_tokens = 256;
+        let long = translator
+            .translate_text(
+                "北京市是中国的首都，也是一座拥有三千多年建城史的历史文化名城。\
+                故宫、天坛、颐和园和八达岭长城都是世界闻名的文化遗产。\
+                每年都有数千万游客来到北京，参观这些古迹并品尝地道的北京烤鸭。\
+                近年来，北京还大力发展高新技术产业，中关村成为了中国科技创新的重要引擎。\
+                便捷的地铁网络连接着城市的每一个角落，让市民的出行更加高效环保。",
+                "en",
+                &prompt,
+                "",
+                &generation,
+                &cancel,
+                |chunk| stat_long.on_chunk(chunk),
+            )
+            .expect("long-input translation failed");
+        stat_long.report("long", long.chars().count());
+        println!("long translation: {long}");
+        assert!(
+            !long.trim().is_empty(),
+            "long-input translation came back empty"
+        );
+        assert!(
+            long.to_lowercase().contains("beijing"),
+            "long-input translation missing key term: {long}"
+        );
+        println!(
+            "index_e2e long-input tokens: {} (prompt was long-form)",
+            stat_long.tokens
+        );
+        println!(
+            "index_e2e total: {:.2}s ({} tokens)",
+            t_total.elapsed().as_secs_f32(),
+            stat_plain.tokens + stat_json.tokens + stat_glossary.tokens + stat_long.tokens
         );
     }
 }

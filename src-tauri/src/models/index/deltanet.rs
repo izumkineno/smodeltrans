@@ -21,6 +21,11 @@ pub(crate) struct DeltaNetState {
     pub ssm_a: Vec<f32>,
     pub dt_bias: Vec<f32>,
     pub norm_weight: Vec<f32>,
+    pub conv_weight: Vec<Vec<f32>>,
+    pub conv_transposed: bool,
+    pub scratch_conv: Vec<f32>,
+    pub scratch_q: Vec<f32>,
+    pub scratch_k: Vec<f32>,
     pub num_v_heads: usize,
     pub head_v_dim: usize,
     pub head_k_dim: usize,
@@ -40,6 +45,11 @@ impl DeltaNetState {
             ssm_a: Vec::new(),
             dt_bias: Vec::new(),
             norm_weight: Vec::new(),
+            conv_weight: Vec::new(),
+            conv_transposed: false,
+            scratch_conv: vec![0.0; qkv_dim],
+            scratch_q: vec![0.0; head_k_dim],
+            scratch_k: vec![0.0; head_k_dim],
             num_v_heads,
             head_v_dim,
             head_k_dim,
@@ -48,9 +58,21 @@ impl DeltaNetState {
     }
 }
 
+#[allow(dead_code)]
 fn l2norm_row(v: &[f32]) -> Vec<f32> {
     let inv_norm = 1.0 / (v.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt();
     v.iter().map(|x| x * inv_norm).collect()
+}
+
+fn l2norm_into(dst: &mut [f32], src: &[f32]) {
+    let mut sum = 0.0f32;
+    for v in src {
+        sum += v * v;
+    }
+    let inv = 1.0 / (sum + 1e-6).sqrt();
+    for (d, v) in dst.iter_mut().zip(src.iter()) {
+        *d = v * inv;
+    }
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -72,7 +94,9 @@ pub(crate) fn delta_step(
     hidden: &Tensor,
     state: &mut DeltaNetState,
     device: &Device,
+    prof: &mut super::session::StepProfile,
 ) -> Result<Tensor> {
+    let t0 = super::session::prof_snap(prof, device);
     let qkv = layer.attn_qkv.forward(hidden)?;
     let z = layer.attn_gate.forward(hidden)?;
     let ba = layer.ssm_alpha.forward(hidden)?;
@@ -82,9 +106,11 @@ pub(crate) fn delta_step(
     let rows = Tensor::cat(&[qkv, z, ba, beta_logits], 1)?
         .to_dtype(DType::F32)?
         .to_vec2::<f32>()?;
+    super::session::prof_acc(&mut prof.proj_ms, t0);
     let n_steps = rows.len();
     let row_width = 2 * key_dim + 2 * value_dim + 2 * state.num_v_heads;
     let mut cores = Vec::with_capacity(n_steps * value_dim);
+    let t0 = super::session::prof_snap(prof, device);
     for row in &rows {
         anyhow::ensure!(
             row.len() == row_width,
@@ -100,8 +126,9 @@ pub(crate) fn delta_step(
         );
 
         // Causal depthwise Conv1d: each channel consumes its oldest-to-newest 4-tap window.
-        let weights = layer.ssm_conv1d.to_vec2::<f32>()?;
-        let transposed = weights.len() != 4;
+        // conv 权重已在 new_states 预取（逐 translate 一次），此处零同步。
+        let weights = &state.conv_weight;
+        let transposed = state.conv_transposed;
         anyhow::ensure!(
             if transposed {
                 weights.len() == qkv_raw.len() && weights.iter().all(|row| row.len() == 4)
@@ -110,8 +137,8 @@ pub(crate) fn delta_step(
             },
             "unexpected conv1d weight shape"
         );
-        let mut convolved = vec![0.0f32; qkv_raw.len()];
-        for channel in 0..qkv_raw.len() {
+        let convolved = &mut state.scratch_conv[..qkv_raw.len()];
+        for (channel, slot) in convolved.iter_mut().enumerate() {
             let taps = [
                 state.conv_hist[0][channel],
                 state.conv_hist[1][channel],
@@ -127,7 +154,7 @@ pub(crate) fn delta_step(
                 };
                 acc += taps[k] * weight;
             }
-            convolved[channel] = acc * sigmoid(acc);
+            *slot = acc * sigmoid(acc);
         }
         let (hist_0, rest) = state.conv_hist.split_at_mut(1);
         let (hist_1, hist_2) = rest.split_at_mut(1);
@@ -137,16 +164,19 @@ pub(crate) fn delta_step(
 
         let (q_raw, rest) = convolved.split_at(key_dim);
         let (k_raw, v_raw) = rest.split_at(key_dim);
-        let (ssm_a, dt_bias, norm_weight) = (&state.ssm_a, &state.dt_bias, &state.norm_weight);
-        let mut core = vec![0.0f32; value_dim];
+    let (ssm_a, dt_bias, norm_weight) = (&state.ssm_a, &state.dt_bias, &state.norm_weight);
+    let inv_sqrt_k = 1.0 / (state.head_k_dim as f32).sqrt();
+    let mut core = vec![0.0f32; value_dim];
 
-        for vh in 0..state.num_v_heads {
-            let mut q = l2norm_row(&q_raw[vh * state.head_k_dim..(vh + 1) * state.head_k_dim]);
-            let k = l2norm_row(&k_raw[vh * state.head_k_dim..(vh + 1) * state.head_k_dim]);
-            let inv_sqrt_k = 1.0 / (state.head_k_dim as f32).sqrt();
-            for value in &mut q {
-                *value *= inv_sqrt_k;
-            }
+    for vh in 0..state.num_v_heads {
+        let head = vh * state.head_k_dim..(vh + 1) * state.head_k_dim;
+        l2norm_into(&mut state.scratch_q, &q_raw[head.clone()]);
+        l2norm_into(&mut state.scratch_k, &k_raw[head]);
+        for value in state.scratch_q.iter_mut() {
+            *value *= inv_sqrt_k;
+        }
+        let q: &[f32] = &state.scratch_q;
+        let k: &[f32] = &state.scratch_k;
             let v = &v_raw[vh * state.head_v_dim..(vh + 1) * state.head_v_dim];
             let beta = sigmoid(beta_raw[vh]);
             let decay = decay_factor(ssm_a[vh], ba_raw[vh] + dt_bias[vh]);
@@ -157,7 +187,7 @@ pub(crate) fn delta_step(
                 let row_start = base + row * state.head_k_dim;
                 let prediction = state.ssm[row_start..row_start + state.head_k_dim]
                     .iter()
-                    .zip(&k)
+                    .zip(k)
                     .map(|(s, key)| s * key)
                     .sum::<f32>();
                 let delta = beta * (v[row] - prediction);
@@ -167,7 +197,7 @@ pub(crate) fn delta_step(
                 }
                 core[vh * state.head_v_dim + row] = state.ssm[row_start..row_start + state.head_k_dim]
                     .iter()
-                    .zip(&q)
+                    .zip(q)
                     .map(|(s, query)| s * query)
                     .sum();
             }
@@ -186,10 +216,14 @@ pub(crate) fn delta_step(
         }
         cores.extend_from_slice(&core);
     }
+    super::session::prof_acc(&mut prof.cpu_ms, t0);
+    let t0 = super::session::prof_snap(prof, device);
     let gated = Tensor::new(cores, device)?
         .reshape((n_steps, value_dim))?
         .to_dtype(DType::F16)?;
-    Ok(layer.ssm_out.forward(&gated)?)
+    let out = layer.ssm_out.forward(&gated)?;
+    super::session::prof_acc(&mut prof.proj_ms, t0);
+    Ok(out)
 }
 
 #[cfg(test)]
