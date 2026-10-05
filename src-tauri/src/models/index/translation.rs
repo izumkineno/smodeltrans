@@ -61,7 +61,7 @@ mod e2e {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("models")
-            .join("Index-Translate-2B.Q4_K_M.gguf")
+            .join("Index-Translate-2B.Q8_0.gguf")
     }
 
     fn fallback_gguf_path() -> std::path::PathBuf {
