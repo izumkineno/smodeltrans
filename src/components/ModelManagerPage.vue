@@ -107,6 +107,9 @@ function downloadTaskFor(modelId: string): DownloadTaskState | undefined {
 }
 
 function isModelInstalled(modelId: string): boolean {
+  if (!isDownloaded(modelId)) {
+    return false;
+  }
   if (modelId.startsWith("hy-mt2") || modelId.startsWith("index-translate")) {
     const cur = (modelHyPath.value || backendStatus.value?.hyModel || "").trim();
     if (!cur) return false;
@@ -126,14 +129,9 @@ function isModelInstalled(modelId: string): boolean {
     }
     return false;
   }
-  const ocrVariantMap: Record<string, string> = {
-    "ppocr-v5-mobile": "v5-mobile",
-    "ppocr-v5-server": "v5-server",
-    "ppocr-v6-tiny": "v6-tiny",
-    "ppocr-v6-small": "v6-small",
-    "ppocr-v6-medium": "v6-medium",
-  };
-  const variant = ocrVariantMap[modelId];
+  const variant = [...translationModels.value, ...ocrModels.value].find(
+    (m) => m.id === modelId,
+  )?.ocrVariant;
   if (variant) {
     return backendStatus.value?.detectorVariant === variant;
   }
