@@ -257,6 +257,21 @@ impl BackendEngine {
         Ok(())
     }
 
+    pub(crate) fn active_translation_label(&self) -> &'static str {
+        if self.index.is_some() {
+            "Index-Translate / Candle"
+        } else {
+            "Hy-MT2 / Candle"
+        }
+    }
+
+    pub(crate) fn ocr_translation_provider_label(&self) -> String {
+        format!(
+            "PP-OCRv5 + {}",
+            if self.index.is_some() { "Index-Translate" } else { "Hy-MT2" }
+        )
+    }
+
     pub(crate) fn reset_translator_context(&mut self) {
         tracing::debug!(target: "backend::engine", translator_loaded = self.hy.is_some(), "reset_translator_context entry");
         if let Some(translator) = self.hy.as_mut() {
@@ -297,7 +312,9 @@ impl BackendEngine {
         })?;
         tracing::debug!(target: "backend::engine", target_language = %target_language, "prepare_live_pipeline: warming up Hy translator");
         if self.index.is_some() {
-            return Err(BackendFailure::translation("Index-Translate live-session translation is not implemented"));
+            tracing::debug!(target: "backend::engine", target_language = %target_language, "prepare_live_pipeline: Index translator needs no warm-up, skipping");
+            tracing::info!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, "prepare_live_pipeline success (index)");
+            return Ok(());
         }
         self.hy
             .as_mut()
@@ -467,13 +484,14 @@ impl BackendEngine {
         sort_static_reading_order(&mut records);
         if records.is_empty() {
             tracing::debug!(target: "backend::engine", request_id = %image.file_name(), "translate: no regions, rendering empty output");
-            let output = self
+            let mut output = self
                 .output
                 .render(image, &records, image.target_language(), cancellation)
                 .inspect_err(|e| {
                     tracing::error!(target: "backend::engine", request_id = %image.file_name(), error = %e, duration_ms = __start.elapsed().as_millis() as u64, "translate: output.render failed for empty regions");
                 })?;
             tracing::debug!(target: "backend::engine", request_id = %image.file_name(), "translate: output rendering completed (empty)");
+            output.provider_label = self.ocr_translation_provider_label();
             report_progress(100, "处理完成");
             tracing::info!(target: "backend::engine", request_id = %image.file_name(), duration_ms = __start.elapsed().as_millis() as u64, region_count = 0, "translate success (empty)");
             return Ok(output);
@@ -496,13 +514,14 @@ impl BackendEngine {
             tracing::error!(target: "backend::engine", request_id = %image.file_name(), error = %e, "translate: cancelled before render");
         })?;
         report_progress(90, "翻译完成，正在生成标注图");
-        let output = self
+        let mut output = self
             .output
             .render(image, &records, image.target_language(), cancellation)
             .inspect_err(|e| {
                 tracing::error!(target: "backend::engine", request_id = %image.file_name(), error = %e, duration_ms = __start.elapsed().as_millis() as u64, "translate: output.render failed");
             })?;
         tracing::debug!(target: "backend::engine", request_id = %image.file_name(), "translate: output rendering completed");
+        output.provider_label = self.ocr_translation_provider_label();
         report_progress(100, "翻译完成");
         tracing::info!(target: "backend::engine", request_id = %image.file_name(), duration_ms = __start.elapsed().as_millis() as u64, region_count = records.len(), target_language = %image.target_language(), "translate success");
         Ok(output)
@@ -532,11 +551,48 @@ impl BackendEngine {
         self.load_translator_with_memory(target_language, memory).inspect_err(|e| {
             tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, duration_ms = __start.elapsed().as_millis() as u64, "translate_live_regions: load_translator_with_memory failed");
         })?;
-        if self.index.is_some() {
-            return Err(BackendFailure::translation("Index-Translate live-region translation is not implemented"));
-        }
         let prompt = self.settings.prompt.clone();
         let base_generation = self.settings.generation.clone();
+        if let Some(translator) = self.index.as_mut() {
+            tracing::debug!(target: "backend::engine", target_language = %target_language, region_count = records.len(), "translate_live_regions: starting per-region index translation");
+            for record in records.iter_mut() {
+                let order = record.order;
+                let source_text = record.source_text.clone();
+                let generation = live_translation_generation(&base_generation, &source_text);
+                tracing::debug!(target: "backend::engine", order, source_text_len = source_text.chars().count(), max_new_tokens = generation.max_new_tokens, "translate_live_regions: translating region (index)");
+                let mut streamed_text = String::new();
+                record.translated_text = translator.translate_text(
+                    &source_text,
+                    target_language,
+                    &prompt,
+                    supplemental_prompt,
+                    &generation,
+                    cancellation,
+                    |chunk| {
+                        streamed_text.push_str(chunk);
+                        on_chunk(order, &streamed_text);
+                        Ok(())
+                    },
+                ).map_err(|error| {
+                    if cancellation.is_cancelled() {
+                        BackendFailure::cancelled(format!("Index live translation was cancelled: {error:#}"))
+                    } else {
+                        tracing::error!(target: "backend::engine", order, target_language = %target_language, error = %error, duration_ms = __start.elapsed().as_millis() as u64, "translate_live_regions: index region translation failed");
+                        BackendFailure::translation(format!("Index live translation failed: {error:#}"))
+                    }
+                })?;
+                if record.translated_text.trim().is_empty() {
+                    return Err(BackendFailure::translation(format!("Index returned empty live translation for region {order}")));
+                }
+                tracing::debug!(target: "backend::engine", order, translated_len = record.translated_text.chars().count(), "translate_live_regions: region translated (index)");
+                on_chunk(order, &record.translated_text);
+            }
+            cancellation.check().inspect_err(|e| {
+                tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, "translate_live_regions: cancelled after loop (index)");
+            })?;
+            tracing::info!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, region_count = records.len(), "translate_live_regions success (index)");
+            return Ok(());
+        }
         let translator = self
             .hy
             .as_mut()
@@ -593,12 +649,40 @@ impl BackendEngine {
         self.load_translator_with_memory(target_language, memory).inspect_err(|e| {
             tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, duration_ms = __start.elapsed().as_millis() as u64, "translate_live_subtitle: load_translator_with_memory failed");
         })?;
-        if self.index.is_some() {
-            return Err(BackendFailure::translation("Index-Translate live-subtitle translation is not implemented"));
-        }
         let prompt = self.settings.prompt.clone();
         let generation = live_translation_generation(&self.settings.generation, source_text);
         tracing::debug!(target: "backend::engine", target_language = %target_language, max_new_tokens = generation.max_new_tokens, "translate_live_subtitle: generation config prepared");
+        if let Some(translator) = self.index.as_mut() {
+            tracing::debug!(target: "backend::engine", target_language = %target_language, "translate_live_subtitle: invoking index translation");
+            let mut streamed_text = String::new();
+            let text = translator.translate_text(
+                source_text,
+                target_language,
+                &prompt,
+                supplemental_prompt,
+                &generation,
+                cancellation,
+                |chunk| {
+                    streamed_text.push_str(chunk);
+                    on_chunk(&streamed_text);
+                    Ok(())
+                },
+            ).map_err(|error| {
+                if cancellation.is_cancelled() {
+                    tracing::warn!(target: "backend::engine", target_language = %target_language, error = %error, duration_ms = __start.elapsed().as_millis() as u64, "translate_live_subtitle: cancelled on index");
+                    BackendFailure::cancelled("Index translation was cancelled")
+                } else {
+                    tracing::error!(target: "backend::engine", target_language = %target_language, error = %error, duration_ms = __start.elapsed().as_millis() as u64, "translate_live_subtitle: index translation failed");
+                    BackendFailure::translation(format!("Index live translation failed: {error:#}"))
+                }
+            })?;
+            tracing::debug!(target: "backend::engine", target_language = %target_language, text_len = text.chars().count(), "translate_live_subtitle: index translation completed, validating");
+            let validated = validate_live_subtitle_translation_output(text).inspect_err(|e| {
+                tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, "translate_live_subtitle: validation failed (index)");
+            })?;
+            tracing::info!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, text_len = validated.chars().count(), "translate_live_subtitle success (index)");
+            return Ok(validated);
+        }
         let translator = self
             .hy
             .as_mut()
@@ -661,6 +745,7 @@ impl BackendEngine {
         if let Some(translator) = self.index.as_mut() {
             let prompt = self.settings.prompt.clone();
             let generation = self.settings.generation.clone();
+            report_progress(70, "Index-Translate 已就绪");
             let total = records.len();
             for (index, record) in records.iter_mut().enumerate() {
                 cancellation.check().map_err(|error| BackendFailure::cancelled(error.to_string()))?;

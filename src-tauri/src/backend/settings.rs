@@ -911,9 +911,9 @@ impl BackendSettings {
         } else if self.device_kind == DeviceKind::Cpu {
             "图片翻译需要 CUDA；CPU 配置不会执行 OCR-only 成功路径。"
         } else if !hy_asset_ready {
-            "Hy-MT2 模型资产未就绪，请检查 models/hy 文件夹。"
+            "翻译模型资产未就绪，请检查 models/hy 文件夹。"
         } else {
-            "PP-OCR 与 Hy-MT2 本地模型资产已就绪。"
+            "PP-OCR 与翻译模型本地模型资产已就绪。"
         };
         BackendStatus {
             ready,
@@ -1287,7 +1287,7 @@ fn validate_target_language(value: &str) -> Result<String, String> {
         .join(", ");
     tracing::warn!(target: "backend::settings", value = %value, "validate_target_language failed: unsupported language");
     Err(format!(
-        "targetLanguage '{}' 不在 Hy-MT2 支持列表内，支持：{supported}",
+        "targetLanguage '{}' 不在翻译模型支持列表内，支持：{supported}",
         value
     ))
 }

@@ -250,7 +250,7 @@ impl LiveSessionManager {
                 session_id: Some(session_id.clone()),
                 target: Some(target.clone()),
                 roi: Some(display_roi),
-                message: "正在准备 PP-OCR、Hy-MT2 模型与窗口捕获。".to_owned(),
+                message: "正在准备 PP-OCR、翻译模型与窗口捕获。".to_owned(),
                 latest_revision: 0,
                 metrics: LiveMetrics::default(),
             },

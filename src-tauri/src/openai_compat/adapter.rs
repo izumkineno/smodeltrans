@@ -47,6 +47,10 @@ pub trait TranslationPort: Send + Sync + 'static {
     fn model_states(&self) -> Result<(bool, bool), BackendFailure>;
 
     fn live_active(&self) -> bool;
+
+    fn active_model_id(&self) -> String {
+        "hy-mt2".to_owned()
+    }
 }
 
 #[derive(Clone)]
@@ -702,6 +706,22 @@ impl TranslationPort for BackendStateAdapter {
         let active = self.state.live_active.load(Ordering::SeqCst);
         tracing::trace!(target: "openai_compat::adapter", live_active = active, "live_active checked");
         active
+    }
+
+    fn active_model_id(&self) -> String {
+        let model_path = self
+            .state
+            .settings
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone().ok())
+            .map(|settings| settings.hy_model.to_string_lossy().to_lowercase());
+        let id = match model_path.as_deref() {
+            Some(path) if path.contains("index-translate") => "index-translate-2b",
+            _ => "hy-mt2",
+        };
+        tracing::debug!(target: "openai_compat::adapter", model_id = id, "active_model_id checked");
+        id.to_owned()
     }
 }
 
