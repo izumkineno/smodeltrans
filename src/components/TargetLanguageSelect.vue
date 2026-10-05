@@ -1,15 +1,22 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import { NSelect } from "naive-ui";
-import { TARGET_LANGUAGE_OPTIONS } from "../constants/targetLanguageOptions";
+import { targetLanguageOptionsFor } from "../constants/targetLanguageOptions";
 
-defineProps<{
+const props = defineProps<{
   modelValue: string;
   disabled?: boolean;
   placeholder?: string;
   ariaLabel?: string;
   filterable?: boolean;
   size?: "small" | "medium" | "large";
+  modelPath?: string | null;
 }>();
+
+const options = computed(() => targetLanguageOptionsFor(props.modelPath));
+const effectivePlaceholder = computed(
+  () => props.placeholder ?? `选择目标语言（支持 ${options.value.length} 种）`,
+);
 
 const emit = defineEmits<{
   (e: "update:modelValue", value: string): void;
@@ -24,10 +31,10 @@ function handleUpdate(value: string | null) {
 <template>
   <n-select
     :value="modelValue"
-    :options="TARGET_LANGUAGE_OPTIONS"
+    :options="options"
     :disabled="disabled"
     :filterable="filterable ?? true"
-    :placeholder="placeholder ?? '选择目标语言（Hy-MT2 支持 38 种）'"
+    :placeholder="effectivePlaceholder"
     :aria-label="ariaLabel ?? '目标语言'"
     :size="size"
     @update:value="handleUpdate"

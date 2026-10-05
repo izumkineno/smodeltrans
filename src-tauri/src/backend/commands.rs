@@ -1335,7 +1335,7 @@ fn translate_text_blocking(
         device = %settings.device_kind.as_str(),
         "translate_text_blocking settings loaded"
     );
-    let result = {
+    let (result, provider_label) = {
         let mut engine = lock_with_cancellation(&state.engine, cancellation).map_err(|err| {
             tracing::warn!(
                 target: "backend::commands",
@@ -1356,7 +1356,7 @@ fn translate_text_blocking(
         let engine = engine
             .as_mut()
             .ok_or_else(|| BackendFailure::internal("Candle 后端未初始化"))?;
-        engine.translate_text(
+        let result = engine.translate_text(
             &text,
             &target_language,
             "",
@@ -1372,7 +1372,8 @@ fn translate_text_blocking(
                 emit_translation_progress(app, run_id, progress, stage);
             },
             |_| {},
-        )
+        );
+        (result, engine.active_translation_label())
     };
     state.touch_activity();
     let duration_ms = started_at.elapsed().as_millis() as u64;
@@ -1396,7 +1397,7 @@ fn translate_text_blocking(
     let translated = result?;
     let response = TextTranslationResponse {
         text: translated,
-        provider_label: "Hy-MT2 / Candle".to_owned(),
+        provider_label: provider_label.to_owned(),
         duration_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
     };
     tracing::info!(

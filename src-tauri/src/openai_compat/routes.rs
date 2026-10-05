@@ -218,7 +218,7 @@ async fn list_models(
         return e.into_response();
     }
     let models = vec![ModelInfo {
-        id: "hy-mt2".to_owned(),
+        id: state.port.active_model_id(),
         object: "model".to_owned(),
         created: now_secs(),
         owned_by: "smodeltrans".to_owned(),
@@ -230,7 +230,7 @@ async fn list_models(
     tracing::info!(
         target: "openai_compat::routes",
         request_id = %request_id,
-        model_count = 1,
+        model_count = list.data.len(),
         duration_ms = start.elapsed().as_millis() as u64,
         "list_models success"
     );

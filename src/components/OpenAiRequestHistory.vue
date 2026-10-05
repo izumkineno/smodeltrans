@@ -68,7 +68,7 @@ defineExpose({ refresh });
   <n-card class="settings-card settings-card-wide" :bordered="false">
     <div class="settings-card-heading">
       <h3 class="settings-card-title">远程翻译历史</h3>
-      <span class="settings-card-subtitle">复用 Hy-MT2 官方模板的远程请求记录（最近 100 条）</span>
+      <span class="settings-card-subtitle">复用官方模板的远程请求记录（最近 100 条）</span>
     </div>
     <p class="settings-card-copy" style="margin-bottom: 12px">
       所有远程请求经 <code>POST /v1/chat/completions</code> 复用本地

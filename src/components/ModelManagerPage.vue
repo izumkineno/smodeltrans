@@ -48,6 +48,7 @@ import {
   listDownloadedModels,
   listenDownloadProgress,
   startModelDownload,
+  translationEngineDisplayName,
 } from "../services/model-download-provider";
 
 type TagType = "default" | "success" | "warning" | "error" | "info";
@@ -106,7 +107,10 @@ function downloadTaskFor(modelId: string): DownloadTaskState | undefined {
 }
 
 function isModelInstalled(modelId: string): boolean {
-  if (modelId.startsWith("hy-mt2")) {
+  if (!isDownloaded(modelId)) {
+    return false;
+  }
+  if (modelId.startsWith("hy-mt2") || modelId.startsWith("index-translate")) {
     const cur = (modelHyPath.value || backendStatus.value?.hyModel || "").trim();
     if (!cur) return false;
     const normalizedCur = cur.replace(/\\/g, "/").toLowerCase();
@@ -125,14 +129,9 @@ function isModelInstalled(modelId: string): boolean {
     }
     return false;
   }
-  const ocrVariantMap: Record<string, string> = {
-    "ppocr-v5-mobile": "v5-mobile",
-    "ppocr-v5-server": "v5-server",
-    "ppocr-v6-tiny": "v6-tiny",
-    "ppocr-v6-small": "v6-small",
-    "ppocr-v6-medium": "v6-medium",
-  };
-  const variant = ocrVariantMap[modelId];
+  const variant = [...translationModels.value, ...ocrModels.value].find(
+    (m) => m.id === modelId,
+  )?.ocrVariant;
   if (variant) {
     return backendStatus.value?.detectorVariant === variant;
   }
@@ -319,7 +318,7 @@ const translationDialogPath = computed(
 );
 const translationDialogOptions = computed(() =>
   translationDialogPath.value
-    ? [{ label: "Hy-MT2", value: translationDialogPath.value }]
+    ? [{ label: translationModelDisplayName(translationDialogPath.value), value: translationDialogPath.value }]
     : [],
 );
 
@@ -347,10 +346,14 @@ async function loadModelCatalog(): Promise<void> {
   }
 }
 
+function translationModelDisplayName(path: string): string {
+  return translationEngineDisplayName(path);
+}
+
 function selectTranslationModel(path: string): void {
   console.info("[ModelManagerPage] selectTranslationModel: user selected", { path });
   modelHyPath.value = path;
-  setSettingsFeedback("info", "已选择翻译模型 Hy-MT2，点击“保存设置”生效。");
+  setSettingsFeedback("info", `已选择翻译模型 ${translationModelDisplayName(path)}，点击“保存设置”生效。`);
 }
 
 function selectOcrModel(value: string): void {
@@ -385,7 +388,7 @@ function closeModelDialog(): void {
 
 async function pickDialogTranslationPath(): Promise<void> {
   const selected = await openNativeDialog({
-    title: "选择 Hy-MT2 GGUF 模型",
+    title: `选择 ${translationModelDisplayName(dialogTranslationPath.value)} GGUF 模型`,
     defaultPath: dialogTranslationPath.value || undefined,
     multiple: false,
     filters: [{ name: "GGUF 模型", extensions: ["gguf"] }],
@@ -441,8 +444,8 @@ async function saveModelDialog(): Promise<void> {
   };
   let entryName = "";
   if (mode === "translation") {
-    entryName = "Hy-MT2";
     const path = dialogTranslationPath.value.trim();
+    entryName = translationModelDisplayName(path);
     if (!path) {
       setSettingsFeedback("error", "请选择 GGUF 模型文件。");
       return;
@@ -592,7 +595,7 @@ async function saveModelSettings() {
   const recognizerModelDir = modelRecognizerPath.value.trim();
   const hyModel = modelHyPath.value.trim();
   if (!detectorModelDir || !recognizerModelDir || !hyModel) {
-    setSettingsFeedback("error", "请选择完整的 PP-OCR 与 Hy-MT2 模型路径。");
+    setSettingsFeedback("error", "请选择完整的 PP-OCR 与翻译模型路径。");
     return;
   }
   const idleSeconds = requireInteger(
@@ -920,10 +923,8 @@ onBeforeUnmount(() => {
   <section class="model-manager-page" aria-labelledby="model-manager-title">
     <header class="model-manager-header">
       <div>
-        <p class="panel-kicker">Model Management</p>
-        <h2 id="model-manager-title">模型管理</h2>
         <p class="model-manager-intro">
-          管理本地 Hy-MT2 与 PP-OCR 模型、下载模型、配置运行与生成参数。配置路径后点击“保存设置”生效。
+          管理本地翻译模型与 PP-OCR 模型、下载模型、配置运行与生成参数。配置路径后点击“保存设置”生效。
         </p>
       </div>
       <div class="model-manager-header-actions">
@@ -948,7 +949,7 @@ onBeforeUnmount(() => {
       <n-card class="settings-card" :bordered="false">
         <div class="settings-card-heading">
           <div>
-            <p class="panel-kicker">Translation · Hy-MT2</p>
+            <p class="panel-kicker">Translation</p>
             <h2>翻译模型</h2>
           </div>
           <n-button secondary size="small" @click="openModelDialog('translation')">导入本地…</n-button>

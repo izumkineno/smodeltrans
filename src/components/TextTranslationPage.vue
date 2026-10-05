@@ -24,7 +24,7 @@ import {
 import type { TranslationProgress } from "../services/translation-provider";
 import { targetLanguage } from "../services/workspace-settings";
 import { isSupportedTargetLanguage } from "../constants/targetLanguageOptions";
-import TargetLanguageSelect from "./TargetLanguageSelect.vue";
+import TargetLanguageField from "./TargetLanguageField.vue";
 import { showWorkspaceToast, type WorkspaceToastType } from "../services/workspace-toast";
 import {
   isQuickTranslationShortcutModifierCode,
@@ -75,6 +75,14 @@ function setErrorState(message: string) {
 function setActionFeedback(type: WorkspaceToastType, message: string) {
   actionFeedback.value = message;
   notify(type, message);
+}
+
+function handleTargetLanguageSaved(lang: string): void {
+  notify("success", `目标语言已切换为 ${lang}。`);
+}
+
+function handleTargetLanguageFailed(message: string): void {
+  notify("error", message);
 }
 
 const workflowStatus = computed(() => {
@@ -156,7 +164,7 @@ function validateRequest(): { text: string; language: string } | null {
 
   const language = targetLanguage.value.trim();
   if (!isSupportedTargetLanguage(language)) {
-    errorMessage.value = "目标语言不在 Hy-MT2 支持列表内，请从下拉选择（38 种）。";
+    errorMessage.value = "目标语言不在支持列表内，请从下拉选择。";
     return null;
   }
 
@@ -491,10 +499,10 @@ onBeforeUnmount(() => {
             <div>
               <p class="panel-kicker text-panel-kicker">输入 / 文本</p>
               <h2>输入待翻译内容</h2>
-              <p class="panel-copy text-panel-copy">直接调用 Hy-MT2 模型翻译文本，不经过 OCR。</p>
+              <p class="panel-copy text-panel-copy">直接调用当前翻译模型翻译文本，不经过 OCR。</p>
             </div>
           </div>
-          <n-tag round size="small" type="info">Hy-MT2</n-tag>
+          <n-tag round size="small" type="info">翻译模型</n-tag>
         </div>
 
         <n-input
@@ -510,9 +518,10 @@ onBeforeUnmount(() => {
         <div class="text-options">
           <label class="text-option-field">
             <span>目标语言</span>
-            <TargetLanguageSelect v-model="targetLanguage" aria-label="文本翻译目标语言" />
+            <TargetLanguageField immediate aria-label="文本翻译目标语言" @saved="handleTargetLanguageSaved"
+              @failed="handleTargetLanguageFailed" />
           </label>
-          <p class="text-option-help">仅支持 Hy-MT2 官方 38 语言，已自动归一化英文全称。</p>
+          <p class="text-option-help">仅支持下拉列表中的语言，已自动归一化英文全称。</p>
         </div>
 
         <n-alert v-if="!isDesktopRuntime" class="text-runtime-alert" type="info" :show-icon="false">
@@ -575,7 +584,7 @@ onBeforeUnmount(() => {
 
         <div v-else-if="workflowState === 'result' && translatedText" class="text-result-state">
           <div class="text-result-meta">
-            <span>{{ providerLabel || "Hy-MT2" }}</span>
+            <span>{{ providerLabel || "翻译模型" }}</span>
             <span v-if="durationLabel">用时 {{ durationLabel }}</span>
           </div>
           <n-input
@@ -676,7 +685,7 @@ onBeforeUnmount(() => {
     </n-card>
 
     <footer class="text-page-footer">
-      <span>Hy-MT2 直接翻译</span>
+      <span>翻译模型直接翻译</span>
       <span class="text-footer-separator" aria-hidden="true"></span>
       <span>本地 Candle 推理</span>
       <span class="text-footer-spacer"></span>

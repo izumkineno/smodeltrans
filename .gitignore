@@ -28,6 +28,8 @@ dist-ssr
 
 .omc
 .omx
+.omo
+.agents
 tmp
 .serena
 scripts/_synth_mod_error.png

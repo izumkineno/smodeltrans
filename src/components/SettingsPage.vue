@@ -27,7 +27,7 @@ import { showWorkspaceToast, type WorkspaceToastType } from "../services/workspa
 import { isSupportedTargetLanguage } from "../constants/targetLanguageOptions";
 import OpenAiCompatCard from "./OpenAiCompatCard.vue";
 import OpenAiRequestHistory from "./OpenAiRequestHistory.vue";
-import TargetLanguageSelect from "./TargetLanguageSelect.vue";
+import TargetLanguageField from "./TargetLanguageField.vue";
 const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const promptTemplate = ref("");
 const settingsMessage = ref("");
@@ -271,6 +271,14 @@ function setSettingsFeedback(
   }
 }
 
+function handleTargetLanguageSaved(lang: string): void {
+  setSettingsFeedback("success", `目标语言已切换为 ${lang}。`);
+}
+
+function handleTargetLanguageFailed(message: string): void {
+  setSettingsFeedback("error", message);
+}
+
 function handleThemeModeChange(nextMode: ThemeMode | null): void {
   console.info("[SettingsPage] handleThemeModeChange: user requested theme change", { nextMode, current: themeMode.value });
   if (!nextMode) {
@@ -339,7 +347,7 @@ async function saveSettings() {
   console.debug("[SettingsPage] saveSettings: params", { nextLanguage, promptLen: promptTemplate.value.length, fontPath: modelFontPath.value });
   if (!isSupportedTargetLanguage(nextLanguage)) {
     console.warn("[SettingsPage] saveSettings: validation failed - unsupported language", { nextLanguage });
-    setSettingsFeedback("error", "目标语言不在 Hy-MT2 支持列表内，请从下拉选择（38 种）。");
+    setSettingsFeedback("error", "目标语言不在支持列表内，请从下拉选择。");
     return;
   }
 
@@ -519,16 +527,16 @@ onMounted(() => {
           </div>
         </div>
         <p class="settings-card-copy">
-          目标语言决定 Hy-MT2 的 <code>target_lang</code>（需使用<strong>完整语言名</strong>，English prompt 用英文名，中文 prompt 用中文名）。
+          目标语言决定翻译模型的 <code>target_lang</code>（需使用<strong>完整语言名</strong>，English prompt 用英文名，中文 prompt 用中文名）。
           本地翻译默认使用官方 Default 模板：<code>Translate the following text into {target_language}. Note that you should only output the translated result without any additional explanation:\n\n{source_text}</code>。
           单模板支持 <code>{source_text}</code> / <code>{target_lang}</code> / <code>{target_language}</code> / <code>{format_type}</code> 占位符。
         </p>
         <div class="settings-field-grid">
           <label class="settings-field">
             <span>目标语言</span>
-            <TargetLanguageSelect v-model="targetLanguage" />
+            <TargetLanguageField immediate @saved="handleTargetLanguageSaved" @failed="handleTargetLanguageFailed" />
           </label>
-          <span class="settings-help" style="grid-column: 1 / -1">仅支持 Hy-MT2 官方 38 语言，已自动归一化英文全称；不支持的语言将校验失败。</span>
+          <span class="settings-help" style="grid-column: 1 / -1">仅支持下拉列表中的语言，已自动归一化英文全称；不支持的语言将校验失败。</span>
           <label class="settings-field settings-field-wide settings-textarea">
             <span>翻译提示词模板</span>
             <n-input
