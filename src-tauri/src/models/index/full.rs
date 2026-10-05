@@ -9,19 +9,28 @@ use super::model::FullLayerWeights;
 use anyhow::Result;
 use candle_core::{DType, Device, Module, Tensor};
 
-/// 单层 KV cache（f32 CPU）。
+/// 单层 KV cache（f32 CPU）+ Q/K norm 权重（GGUF 预 +1，直接乘；逐 translate 取一次）。
 pub(crate) struct FullCache {
     pub k: Vec<Vec<f32>>,
     pub v: Vec<Vec<f32>>,
+    pub qn: Vec<f32>,
+    pub kn: Vec<f32>,
     pub n_kv_head: usize,
     pub head_dim: usize,
 }
 
 impl FullCache {
-    pub(crate) fn new(n_kv_head: usize, head_dim: usize) -> Self {
+    pub(crate) fn new(
+        n_kv_head: usize,
+        head_dim: usize,
+        qn: Vec<f32>,
+        kn: Vec<f32>,
+    ) -> Self {
         Self {
             k: Vec::new(),
             v: Vec::new(),
+            qn,
+            kn,
             n_kv_head,
             head_dim,
         }
@@ -49,84 +58,91 @@ fn rope_row(x: &[f32], pos: usize, freq_base: f32, rope_dim: usize) -> Vec<f32> 
     out
 }
 
-/// 单 token full 前向；Qwen3.5 的 Q 投影同时产出 query 与 output gate。
+/// batch full 前向；hidden (S, 2048) F16 GPU in / out。
+/// 投影一次 batch 算完，CPU 逐 step 做 norm/rope/cache/softmax（pos = start_pos + s）。
 pub(crate) fn full_step(
     attn: &super::model::FullAttnWeights,
-    hidden: &[f32],
+    hidden: &Tensor,
     cache: &mut FullCache,
-    pos: usize,
+    start_pos: usize,
     rms_eps: f64,
     freq_base: f32,
     device: &Device,
-) -> Result<Vec<f32>> {
-    let h = Tensor::new(hidden, device)?
-        .reshape((1, hidden.len()))?
-        .to_dtype(DType::F32)?;
+) -> Result<Tensor> {
+    let q_gate = attn.query.forward(hidden)?;
+    let k = attn.key.forward(hidden)?;
+    let v = attn.value.forward(hidden)?;
     let (n_head, n_kv_head, head_dim, rotary_dim) = (8usize, 2usize, 256usize, 64usize);
-    let q_gate = attn.query.forward(&h)?.squeeze(0)?.to_vec1::<f32>()?;
-    let k = attn.key.forward(&h)?.squeeze(0)?.to_vec1::<f32>()?;
-    let v = attn.value.forward(&h)?.squeeze(0)?.to_vec1::<f32>()?;
-    anyhow::ensure!(
-        q_gate.len() == n_head * head_dim * 2,
-        "unexpected Q+gate projection width"
-    );
-    anyhow::ensure!(
-        k.len() == n_kv_head * head_dim && v.len() == n_kv_head * head_dim,
-        "unexpected K/V projection width"
-    );
-    let qn_w = attn.query_norm_weight.to_vec1::<f32>()?;
-    let kn_w = attn.key_norm_weight.to_vec1::<f32>()?;
-    let mut q_heads = Vec::with_capacity(n_head);
-    let mut gate = Vec::with_capacity(n_head * head_dim);
-    for head in 0..n_head {
-        let base = head * head_dim * 2;
-        let q = rms_norm_row(&q_gate[base..base + head_dim], &qn_w, rms_eps);
-        gate.extend_from_slice(&q_gate[base + head_dim..base + 2 * head_dim]);
-        q_heads.push(rope_row(&q, pos, freq_base, rotary_dim));
-    }
-    let mut k_heads = Vec::with_capacity(n_kv_head);
-    for head in 0..n_kv_head {
-        let base = head * head_dim;
-        let k = rms_norm_row(&k[base..base + head_dim], &kn_w, rms_eps);
-        k_heads.push(rope_row(&k, pos, freq_base, rotary_dim));
-    }
-    let v_heads: Vec<&[f32]> = (0..n_kv_head)
-        .map(|head| &v[head * head_dim..(head + 1) * head_dim])
-        .collect();
-    cache.k.push(k_heads.concat());
-    cache.v.push(v_heads.concat());
-
+    let rows = Tensor::cat(&[q_gate, k, v], 1)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?;
+    let n_steps = rows.len();
     let rep = n_head / n_kv_head;
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out = vec![0.0f32; n_head * head_dim];
-    for head in 0..n_head {
-        let kv_head = head / rep;
-        let q = &q_heads[head];
-        let mut scores = Vec::with_capacity(cache.k.len());
-        for key in &cache.k {
-            let key_head = &key[kv_head * head_dim..(kv_head + 1) * head_dim];
-            scores.push(q.iter().zip(key_head).map(|(a, b)| a * b).sum::<f32>() * scale);
+    let mut outs = Vec::with_capacity(n_steps * n_head * head_dim);
+    for (step, row) in rows.iter().enumerate() {
+        let pos = start_pos + step;
+        let (q_gate, rest) = row.split_at(n_head * head_dim * 2);
+        let (k, v) = rest.split_at(n_kv_head * head_dim);
+        anyhow::ensure!(
+            q_gate.len() == n_head * head_dim * 2,
+            "unexpected Q+gate projection width"
+        );
+        anyhow::ensure!(
+            k.len() == n_kv_head * head_dim && v.len() == n_kv_head * head_dim,
+            "unexpected K/V projection width"
+        );
+        let mut q_heads = Vec::with_capacity(n_head);
+        let mut gate = Vec::with_capacity(n_head * head_dim);
+        for head in 0..n_head {
+            let base = head * head_dim * 2;
+            let q = rms_norm_row(&q_gate[base..base + head_dim], &cache.qn, rms_eps);
+            gate.extend_from_slice(&q_gate[base + head_dim..base + 2 * head_dim]);
+            q_heads.push(rope_row(&q, pos, freq_base, rotary_dim));
         }
-        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let denom = scores
-            .iter_mut()
-            .map(|score| {
-                *score = (*score - max_score).exp();
-                *score
-            })
-            .sum::<f32>();
-        for dim in 0..head_dim {
-            let mut value = 0.0;
-            for (time, score) in scores.iter().enumerate() {
-                value += score / denom * cache.v[time][kv_head * head_dim + dim];
+        let mut k_heads = Vec::with_capacity(n_kv_head);
+        for head in 0..n_kv_head {
+            let base = head * head_dim;
+            let k = rms_norm_row(&k[base..base + head_dim], &cache.kn, rms_eps);
+            k_heads.push(rope_row(&k, pos, freq_base, rotary_dim));
+        }
+        let v_heads: Vec<&[f32]> = (0..n_kv_head)
+            .map(|head| &v[head * head_dim..(head + 1) * head_dim])
+            .collect();
+        cache.k.push(k_heads.concat());
+        cache.v.push(v_heads.concat());
+
+        let mut out = vec![0.0f32; n_head * head_dim];
+        for head in 0..n_head {
+            let kv_head = head / rep;
+            let q = &q_heads[head];
+            let mut scores = Vec::with_capacity(cache.k.len());
+            for key in &cache.k {
+                let key_head = &key[kv_head * head_dim..(kv_head + 1) * head_dim];
+                scores.push(q.iter().zip(key_head).map(|(a, b)| a * b).sum::<f32>() * scale);
             }
-            out[head * head_dim + dim] = value * sigmoid(gate[head * head_dim + dim]);
+            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denom = scores
+                .iter_mut()
+                .map(|score| {
+                    *score = (*score - max_score).exp();
+                    *score
+                })
+                .sum::<f32>();
+            for dim in 0..head_dim {
+                let mut value = 0.0;
+                for (time, score) in scores.iter().enumerate() {
+                    value += score / denom * cache.v[time][kv_head * head_dim + dim];
+                }
+                out[head * head_dim + dim] = value * sigmoid(gate[head * head_dim + dim]);
+            }
         }
+        outs.extend_from_slice(&out);
     }
-    let output = Tensor::new(out, device)?
-        .reshape((1, n_head * head_dim))?
-        .to_dtype(DType::F32)?;
-    Ok(attn.output.forward(&output)?.squeeze(0)?.to_vec1::<f32>()?)
+    let out_t = Tensor::new(outs, device)?
+        .reshape((n_steps, n_head * head_dim))?
+        .to_dtype(DType::F16)?;
+    Ok(attn.output.forward(&out_t)?)
 }
 
 fn sigmoid(x: f32) -> f32 {

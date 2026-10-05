@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use candle_core::{
     DType, Device, Module, Tensor,
     quantized::{
-        QMatMul,
+        GgmlDType, QMatMul,
         gguf_file::{Content, Value},
     },
 };
@@ -106,11 +106,19 @@ fn load_qmat<R: std::io::Read + std::io::Seek>(
     key: &str,
 ) -> Result<QMatMul> {
     let qtensor = content.tensor(reader, key, device)?;
-    let tensor = qtensor
-        .dequantize(device)
-        .and_then(|tensor| tensor.to_dtype(DType::F16))
-        .with_context(|| format!("failed to load F16 projection '{key}'"))?;
-    Ok(QMatMul::TensorF16(tensor))
+    match qtensor.dtype() {
+        // Float weights keep the previous behavior: dequantize + TensorF16,
+        // whose forward casts inputs (plain Tensor has no such cast).
+        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => {
+            let tensor = qtensor
+                .dequantize(device)
+                .and_then(|tensor| tensor.to_dtype(DType::F16))
+                .with_context(|| format!("failed to load F16 projection '{key}'"))?;
+            Ok(QMatMul::TensorF16(tensor))
+        }
+        // Quantized weights stay quantized: VRAM ~= file size, quantized CUDA matmul.
+        _ => Ok(QMatMul::from_qtensor(qtensor)?),
+    }
 }
 fn load_f32<R: std::io::Read + std::io::Seek>(
     content: &Content,

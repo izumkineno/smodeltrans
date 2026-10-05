@@ -64,15 +64,74 @@ mod e2e {
             .join("Index-Translate-2B.Q4_K_M.gguf")
     }
 
+    fn fallback_gguf_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("models")
+            .join("Index-Translate-2B.f16.gguf")
+    }
+
+    /// 流式统计：首 token 时间 / token 数 / 总耗时（一个 token 对应一次 on_chunk 调用）。
+    struct StreamStat {
+        t0: std::time::Instant,
+        first_ms: Option<f64>,
+        tokens: u64,
+    }
+
+    impl StreamStat {
+        fn new() -> Self {
+            Self {
+                t0: std::time::Instant::now(),
+                first_ms: None,
+                tokens: 0,
+            }
+        }
+
+        fn on_chunk(&mut self, chunk: &str) -> Result<()> {
+            use std::io::Write as _;
+            if self.first_ms.is_none() {
+                self.first_ms = Some(self.t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            self.tokens += 1;
+            print!("{chunk}");
+            let _ = std::io::stdout().flush();
+            Ok(())
+        }
+
+        fn report(&self, name: &str, out_chars: usize) {
+            let total_s = self.t0.elapsed().as_secs_f64();
+            println!(
+                "\n{name}: TTFT={:.0}ms tokens={} total={:.2}s tok/s={:.1} ({} chars)",
+                self.first_ms.unwrap_or(-1.0),
+                self.tokens,
+                total_s,
+                self.tokens as f64 / total_s.max(1e-6),
+                out_chars,
+            );
+        }
+    }
+
     #[test]
     #[cfg(feature = "cuda")]
     fn index_e2e_zh_en_smoke() {
         let path = gguf_path();
-        if !path.exists() {
-            println!("SKIP index_e2e: GGUF not found at {}", path.display());
-            return;
-        }
+        let path = if path.exists() {
+            path
+        } else {
+            let fallback = fallback_gguf_path();
+            if fallback.exists() {
+                fallback
+            } else {
+                println!(
+                    "SKIP index_e2e: GGUF not found at {} or {}",
+                    path.display(),
+                    fallback.display()
+                );
+                return;
+            }
+        };
         let device = Device::new_cuda(0).expect("index e2e requires CUDA device 0");
+        let t_load = std::time::Instant::now();
         let mut translator = load_with_config(
             &path,
             &device,
@@ -81,11 +140,14 @@ mod e2e {
             PromptConfig::default(),
         )
         .expect("index load failed");
+        println!("index_e2e load: {:.2}s", t_load.elapsed().as_secs_f32());
         let cancel = CancellationToken::new_for_test();
         let mut generation = GenerationConfig::default();
         generation.max_new_tokens = 64;
         let prompt = PromptConfig::default();
 
+        let t_total = std::time::Instant::now();
+        let mut stat_plain = StreamStat::new();
         let plain = translator
             .translate_text(
                 "你好，世界。今天天气不错，我们去公园散步吧。",
@@ -94,9 +156,10 @@ mod e2e {
                 "",
                 &generation,
                 &cancel,
-                |_| Ok(()),
+                |chunk| stat_plain.on_chunk(chunk),
             )
             .expect("plain translation failed");
+        stat_plain.report("plain", plain.chars().count());
         let plain_lower = plain.to_lowercase();
         println!("plain translation: {plain}");
         assert!(
@@ -104,6 +167,7 @@ mod e2e {
             "unexpected plain translation: {plain}"
         );
 
+        let mut stat_json = StreamStat::new();
         let json = translator
             .translate_text(
                 "{\"greeting\":\"你好\",\"city\":\"北京\"}",
@@ -112,9 +176,10 @@ mod e2e {
                 "输出严格有效的 JSON，不要加代码块。保留所有 key，只翻译 value。",
                 &generation,
                 &cancel,
-                |_| Ok(()),
+                |chunk| stat_json.on_chunk(chunk),
             )
             .expect("JSON translation failed");
+        stat_json.report("json", json.chars().count());
         println!("json translation: {json}");
         let parsed: serde_json::Value = serde_json::from_str(json.trim())
             .unwrap_or_else(|error| panic!("invalid JSON translation ({error}): {json}"));
@@ -133,6 +198,7 @@ mod e2e {
                 .contains("beijing")
         );
 
+        let mut stat_glossary = StreamStat::new();
         let glossary = translator
             .translate_text(
                 "碳纤维材料轻便而坚固。",
@@ -141,9 +207,15 @@ mod e2e {
                 "术语对照：碳纤维必须翻译为 carbon fiber。",
                 &generation,
                 &cancel,
-                |_| Ok(()),
+                |chunk| stat_glossary.on_chunk(chunk),
             )
             .expect("glossary translation failed");
+        stat_glossary.report("glossary", glossary.chars().count());
+        println!(
+            "index_e2e total: {:.2}s ({} tokens)",
+            t_total.elapsed().as_secs_f32(),
+            stat_plain.tokens + stat_json.tokens + stat_glossary.tokens
+        );
         println!("glossary translation: {glossary}");
         assert!(
             glossary.to_lowercase().contains("carbon fiber"),

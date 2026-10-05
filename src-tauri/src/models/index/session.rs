@@ -2,10 +2,10 @@
 use super::{
     deltanet::{DeltaNetState, delta_step},
     full::{FullCache, full_step},
-    model::{BlockCommon, IndexLayer, ModelWeights},
+    model::{IndexLayer, ModelWeights},
 };
 use crate::{model_config::GenerationConfig, model_support::CancellationToken};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::{Device, Module, Tensor};
 use std::path::Path;
 use tokenizers::Tokenizer;
@@ -16,19 +16,56 @@ pub(crate) struct IndexSession {
     eos_ids: [u32; 2],
 }
 /// 每 token 步进的双 states（linear recurrent + full KV）。
+/// hidden 全程驻 GPU，只在 DeltaNet 递推 / Full GQA / 最终 argmax 处过 CPU。
 struct IndexStates {
     delta: Vec<Option<DeltaNetState>>,
     full: Vec<FullCache>,
+    attn_norms: Vec<Tensor>,
+    post_norms: Vec<Tensor>,
+    output_norm: Tensor,
 }
+#[allow(dead_code)]
 fn rms_norm_vec(x: &[f32], w: &[f32], eps: f64) -> Vec<f32> {
     let ms = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
     let inv = 1.0 / (ms + eps as f32).sqrt();
-    // 与 full.rs 同理：GGUF attn/post/output_norm 已预加 +1，直接乘。
     x.iter().zip(w.iter()).map(|(a, b)| a * inv * b).collect()
 }
-fn add_vec(a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
-    anyhow::ensure!(a.len() == b.len(), "residual dim mismatch");
-    Ok(a.iter().zip(b.iter()).map(|(x, y)| x + y).collect())
+
+/// env 门控的前向分段计时（`SMODELTRANS_INDEX_PROFILE=1` 开启；关闭时零开销）。
+/// GPU 是异步的，分段必须先 `synchronize` 否则数字无意义。
+#[derive(Default)]
+struct StepProfile {
+    enabled: bool,
+    proj_ms: f64,
+    cpu_ms: f64,
+    ffn_ms: f64,
+    norm_ms: f64,
+    steps: u64,
+}
+
+fn profile_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("SMODELTRANS_INDEX_PROFILE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
+fn prof_snap(prof: &StepProfile, device: &Device) -> Option<std::time::Instant> {
+    if prof.enabled {
+        let _ = device.synchronize();
+        Some(std::time::Instant::now())
+    } else {
+        None
+    }
+}
+
+fn prof_acc(slot: &mut f64, t0: Option<std::time::Instant>) {
+    if let Some(t) = t0 {
+        *slot += t.elapsed().as_secs_f64() * 1000.0;
+    }
 }
 impl IndexSession {
     pub(crate) fn new(model_path: &Path, device: &Device) -> Result<Self> {
@@ -41,22 +78,47 @@ impl IndexSession {
             eos_ids: [248044, 248046],
         })
     }
-    fn new_states(&self) -> IndexStates {
+    fn new_states(&self) -> Result<IndexStates> {
+        let f16 = candle_core::DType::F16;
         let mut delta = Vec::with_capacity(self.model.layers.len());
         let mut full = Vec::with_capacity(self.model.layers.len());
+        let mut attn_norms = Vec::with_capacity(self.model.layers.len());
+        let mut post_norms = Vec::with_capacity(self.model.layers.len());
         for layer in &self.model.layers {
+            let common = match layer {
+                IndexLayer::Linear(w) => &w.common,
+                IndexLayer::Full(w) => &w.common,
+            };
+            attn_norms.push(common.attn_norm_weight.to_dtype(f16)?);
+            post_norms.push(common.post_norm_weight.to_dtype(f16)?);
             match layer {
-                IndexLayer::Linear(_) => {
-                    delta.push(Some(DeltaNetState::zeros(16, 128, 128, 6144)));
-                    full.push(FullCache::new(0, 0));
+                IndexLayer::Linear(w) => {
+                    let mut st = DeltaNetState::zeros(16, 128, 128, 6144);
+                    st.ssm_a = w.ssm_a.to_vec1::<f32>()?;
+                    st.dt_bias = w.ssm_dt_bias.to_vec1::<f32>()?;
+                    st.norm_weight = w.ssm_norm_weight.to_vec1::<f32>()?;
+                    delta.push(Some(st));
+                    full.push(FullCache::new(0, 0, Vec::new(), Vec::new()));
                 }
-                IndexLayer::Full(_) => {
+                IndexLayer::Full(w) => {
                     delta.push(None);
-                    full.push(FullCache::new(2, 256));
+                    full.push(FullCache::new(
+                        2,
+                        256,
+                        w.attn.query_norm_weight.to_vec1::<f32>()?,
+                        w.attn.key_norm_weight.to_vec1::<f32>()?,
+                    ));
                 }
             }
         }
-        IndexStates { delta, full }
+        let output_norm = self.model.output_norm_weight.to_dtype(f16)?;
+        Ok(IndexStates {
+            delta,
+            full,
+            attn_norms,
+            post_norms,
+            output_norm,
+        })
     }
 
     /// 单轮翻译：编码 → prefill（逐 token 步进，简化版）→ 贪心解码到 EOS/上限。
@@ -81,20 +143,16 @@ impl IndexSession {
             .get_ids()
             .to_vec();
         anyhow::ensure!(!ids.is_empty(), "prompt produced no tokenizer ids");
-        let mut states = self.new_states();
-        // prefill：逐 token 步进（朴素版；chunk-64 优化后置 P2b）
-        let mut hidden = self.embed_ids(&ids)?;
-        let mut logits = None;
-        for (pos, hid) in hidden.iter().enumerate() {
-            cancellation
-                .check()
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            logits = Some(self.forward_token(hid, &mut states, pos)?);
-        }
+        let mut states = self.new_states()?;
+        // prefill：整串一次 batch 前向（投影走 mmq 快路径；DeltaNet/GQA 在 CPU 逐 step 推进状态）。
+        let emb = self.embed_ids(&ids)?;
+        let seq_len = ids.len();
+        let batch = emb.squeeze(0)?;
+        let batch_logits = self.forward_batch(&batch, &mut states, 0)?;
+        let mut logits = batch_logits.narrow(0, seq_len - 1, 1)?;
         let mut out_ids: Vec<u32> = Vec::new();
         let mut text = String::new();
         let max_new = config.max_new_tokens.min(1024);
-        let mut logits = logits.context("prefill produced no logits")?;
         for _ in 0..max_new {
             cancellation
                 .check()
@@ -110,111 +168,96 @@ impl IndexSession {
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             text.push_str(&piece);
             on_chunk(&piece)?;
-            let hid = self.embed_ids(&[next])?.remove(0);
-            logits = self.forward_token(&hid, &mut states, ids.len() + out_ids.len() - 1)?;
+            let hid = self.embed_ids(&[next])?.squeeze(0)?;
+            logits = self.forward_batch(&hid, &mut states, ids.len() + out_ids.len() - 1)?;
         }
         Ok(text)
     }
 
-    fn embed_ids(&self, ids: &[u32]) -> Result<Vec<Vec<f32>>> {
+    fn embed_ids(&self, ids: &[u32]) -> Result<Tensor> {
         let t = Tensor::new(ids, &self.device)?.unsqueeze(0)?;
         let emb = self
             .model
             .token_embd
             .embedding(&t)?
-            .to_dtype(candle_core::DType::F32)?;
-        let v = emb.to_vec3::<f32>()?;
-        Ok(v.into_iter().next().unwrap_or_default())
+            .to_dtype(candle_core::DType::F16)?;
+        Ok(emb)
     }
 
-    fn forward_token(
+    /// batch 前向（S=seq 为 prefill，S=1 为解码步）；hidden/logits 均为 F16 GPU tensor。
+    fn forward_batch(
         &self,
-        hidden: &[f32],
+        hidden: &Tensor,
         states: &mut IndexStates,
-        pos: usize,
+        start_pos: usize,
     ) -> Result<Tensor> {
-        let mut h = hidden.to_vec();
-        for ((layer, dst), fc) in self
+        let mut h = hidden.clone();
+        for (index, ((layer, dst), fc)) in self
             .model
             .layers
             .iter()
             .zip(states.delta.iter_mut())
             .zip(states.full.iter_mut())
+            .enumerate()
         {
             match (layer, dst) {
                 (IndexLayer::Linear(w), Some(st)) => {
-                    let n = rms_norm_vec(
-                        &h,
-                        &w.common.attn_norm_weight.to_vec1::<f32>()?,
-                        self.model.rms_norm_eps,
-                    );
+                    let n = rms_norm_gpu(&h, &states.attn_norms[index], self.model.rms_norm_eps)?;
                     let o = delta_step(w, &n, st, &self.device)?;
-                    h = add_vec(&h, &o)?;
-                    let n2 = rms_norm_vec(
-                        &h,
-                        &w.common.post_norm_weight.to_vec1::<f32>()?,
-                        self.model.rms_norm_eps,
-                    );
-                    let f = ffn_swiglu(&w.common, &n2, &self.device)?;
-                    h = add_vec(&h, &f)?;
+                    h = (&h + &o)?;
+                    let n2 =
+                        rms_norm_gpu(&h, &states.post_norms[index], self.model.rms_norm_eps)?;
+                    let f = ffn_swiglu_gpu(&w.common, &n2)?;
+                    h = (&h + &f)?;
                 }
                 (IndexLayer::Full(w), _) => {
-                    let n = rms_norm_vec(
-                        &h,
-                        &w.common.attn_norm_weight.to_vec1::<f32>()?,
-                        self.model.rms_norm_eps,
-                    );
+                    let n = rms_norm_gpu(&h, &states.attn_norms[index], self.model.rms_norm_eps)?;
                     let o = full_step(
                         &w.attn,
                         &n,
                         fc,
-                        pos,
+                        start_pos,
                         self.model.rms_norm_eps,
                         self.model.freq_base,
                         &self.device,
                     )?;
-                    h = add_vec(&h, &o)?;
-                    let n2 = rms_norm_vec(
-                        &h,
-                        &w.common.post_norm_weight.to_vec1::<f32>()?,
-                        self.model.rms_norm_eps,
-                    );
-                    let f = ffn_swiglu(&w.common, &n2, &self.device)?;
-                    h = add_vec(&h, &f)?;
+                    h = (&h + &o)?;
+                    let n2 =
+                        rms_norm_gpu(&h, &states.post_norms[index], self.model.rms_norm_eps)?;
+                    let f = ffn_swiglu_gpu(&w.common, &n2)?;
+                    h = (&h + &f)?;
                 }
                 _ => anyhow::bail!("layer/state mismatch"),
             }
         }
-        let normed = rms_norm_vec(
-            &h,
-            &self.model.output_norm_weight.to_vec1::<f32>()?,
-            self.model.rms_norm_eps,
-        );
-        let t = Tensor::new(normed, &self.device)?
-            .reshape((1, h.len()))?
-            .to_dtype(candle_core::DType::F32)?;
-        Ok(self.model.output_proj.forward(&t)?)
+        let normed = rms_norm_gpu(&h, &states.output_norm, self.model.rms_norm_eps)?;
+        Ok(self.model.output_proj.forward(&normed)?)
     }
+}
+
+fn rms_norm_gpu(hidden: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    let f16 = candle_core::DType::F16;
+    let device = hidden.device();
+    let last_dim = hidden.dim(1)? as f32;
+    let len = Tensor::new(last_dim, device)?.to_dtype(f16)?;
+    let ms = hidden.sqr()?.sum_keepdim(1)?.broadcast_div(&len)?;
+    let root = ms
+        .broadcast_add(&Tensor::new(eps as f32, device)?.to_dtype(f16)?)?
+        .sqrt()?;
+    let inv = Tensor::ones((), f16, device)?.broadcast_div(&root)?;
+    Ok(hidden.broadcast_mul(&inv)?.broadcast_mul(weight)?)
 }
 
 fn argmax_u32(logits: &Tensor) -> Result<u32> {
     Ok(logits.flatten_all()?.argmax(0)?.to_scalar::<u32>()?)
 }
 
-fn ffn_swiglu(
-    common: &super::model::BlockCommon,
-    hidden: &[f32],
-    device: &Device,
-) -> Result<Vec<f32>> {
+fn ffn_swiglu_gpu(common: &super::model::BlockCommon, hidden: &Tensor) -> Result<Tensor> {
     use candle_core::Module;
-    let h = Tensor::new(hidden, device)?
-        .reshape((1, hidden.len()))?
-        .to_dtype(candle_core::DType::F32)?;
-    let gate = common.ffn_gate.forward(&h)?;
-    let up = common.ffn_up.forward(&h)?;
+    let gate = common.ffn_gate.forward(hidden)?;
+    let up = common.ffn_up.forward(hidden)?;
     let gated = candle_nn::ops::silu(&gate)?.broadcast_mul(&up)?;
-    let down = common.ffn_down.forward(&gated)?;
-    Ok(down.squeeze(0)?.to_vec1::<f32>()?)
+    Ok(common.ffn_down.forward(&gated)?)
 }
 
 #[cfg(test)]
