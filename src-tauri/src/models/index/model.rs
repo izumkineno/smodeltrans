@@ -67,6 +67,9 @@ pub(crate) struct FullLayerWeights {
     pub head_dim: usize,
 }
 
+/// Full 层参与 RoPE 的前 64 维（mRoPE 文本退化：后 192 维直通）。
+pub(crate) const INDEX_ROTARY_DIM: usize = 64;
+
 /// Qwen35 traffo block：linear（18/24）或 full（6/24 + MTP 除外）。
 pub(crate) enum IndexLayer {
     Linear(LinearLayerWeights),
@@ -86,6 +89,26 @@ pub(crate) struct ModelWeights {
     pub rms_norm_eps: f64,
     pub freq_base: f32,
     pub max_seq_len: usize,
+    pub rope_cos: Tensor,
+    pub rope_sin: Tensor,
+}
+
+pub(crate) fn precompute_freqs_cis(
+    head_dim: usize,
+    freq_base: f32,
+    max_seq_len: usize,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let theta: Vec<f32> = (0..head_dim)
+        .step_by(2)
+        .map(|i| 1f32 / freq_base.powf(i as f32 / head_dim as f32))
+        .collect();
+    let theta = Tensor::new(theta.as_slice(), device)?;
+    let idx_theta = Tensor::arange(0, max_seq_len as u32, device)?
+        .to_dtype(DType::F32)?
+        .reshape((max_seq_len, 1))?
+        .matmul(&theta.reshape((1, theta.elem_count()))?)?;
+    Ok((idx_theta.cos()?, idx_theta.sin()?))
 }
 
 fn metadata<'a>(content: &'a Content, key: &str) -> Result<&'a Value> {
@@ -251,6 +274,9 @@ impl ModelWeights {
         );
         let token_embd = load_qmat(content, reader, device, "token_embd.weight")?;
         let output_proj = token_embd.clone();
+        let max_seq_len = max_seq_len.min(context_length);
+        let (rope_cos, rope_sin) =
+            precompute_freqs_cis(INDEX_ROTARY_DIM, freq_base, max_seq_len, device)?;
         Ok(Self {
             token_embd,
             output_norm_weight: load_f32(content, reader, device, "output_norm.weight")?,
@@ -262,7 +288,9 @@ impl ModelWeights {
             head_dim,
             rms_norm_eps,
             freq_base,
-            max_seq_len: max_seq_len.min(context_length),
+            max_seq_len,
+            rope_cos,
+            rope_sin,
         })
     }
 

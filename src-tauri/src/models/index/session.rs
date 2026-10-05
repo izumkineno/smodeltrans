@@ -41,6 +41,9 @@ pub(crate) struct StepProfile {
     pub ffn_ms: f64,
     pub norm_ms: f64,
     pub steps: u64,
+    pub d2h_syncs: u64,
+    pub delta_ms: f64,
+    pub attn_ms: f64,
 }
 
 fn profile_enabled() -> bool {
@@ -93,23 +96,22 @@ impl IndexSession {
             post_norms.push(common.post_norm_weight.to_dtype(f16)?);
             match layer {
                 IndexLayer::Linear(w) => {
-                    let mut st = DeltaNetState::zeros(16, 128, 128, 6144);
-                    st.ssm_a = w.ssm_a.to_vec1::<f32>()?;
-                    st.dt_bias = w.ssm_dt_bias.to_vec1::<f32>()?;
-                    st.norm_weight = w.ssm_norm_weight.to_vec1::<f32>()?;
-                    st.conv_weight = w.ssm_conv1d.to_vec2::<f32>()?;
-                    st.conv_transposed = st.conv_weight.len() != 4;
+                    let mut st = DeltaNetState::zeros(16, 128, 128, 6144, &self.device)?;
+                    st.ssm_a = w.ssm_a.to_dtype(candle_core::DType::F32)?;
+                    st.dt_bias = w.ssm_dt_bias.to_dtype(candle_core::DType::F32)?;
+                    st.norm_weight = w.ssm_norm_weight.to_dtype(candle_core::DType::F32)?;
+                    let cw = w.ssm_conv1d.to_dtype(candle_core::DType::F32)?;
+                    st.conv_w = if cw.dim(0)? == 4 {
+                        cw.contiguous()?
+                    } else {
+                        cw.transpose(0, 1)?.contiguous()?
+                    };
                     delta.push(Some(st));
-                    full.push(FullCache::new(0, 0, Vec::new(), Vec::new()));
+                    full.push(FullCache::new());
                 }
-                IndexLayer::Full(w) => {
+                IndexLayer::Full(_) => {
                     delta.push(None);
-                    full.push(FullCache::new(
-                        2,
-                        256,
-                        w.attn.query_norm_weight.to_vec1::<f32>()?,
-                        w.attn.key_norm_weight.to_vec1::<f32>()?,
-                    ));
+                    full.push(FullCache::new());
                 }
             }
         }
@@ -164,6 +166,7 @@ impl IndexSession {
                 .check()
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             let next = argmax_u32(&logits)?;
+            prof.d2h_syncs += 1;
             if self.eos_ids.contains(&next) {
                 break;
             }
@@ -184,8 +187,15 @@ impl IndexSession {
         }
         if prof.enabled {
             println!(
-                "index_profile steps={} proj={:.0}ms cpu={:.0}ms ffn={:.0}ms norm={:.0}ms",
-                prof.steps, prof.proj_ms, prof.cpu_ms, prof.ffn_ms, prof.norm_ms,
+                "index_profile steps={} proj={:.0}ms cpu={:.0}ms ffn={:.0}ms norm={:.0}ms delta={:.0}ms attn={:.0}ms d2h_syncs={}",
+                prof.steps,
+                prof.proj_ms,
+                prof.cpu_ms,
+                prof.ffn_ms,
+                prof.norm_ms,
+                prof.delta_ms,
+                prof.attn_ms,
+                prof.d2h_syncs,
             );
         }
         Ok(text)
@@ -238,12 +248,14 @@ impl IndexSession {
                     let n = rms_norm_gpu(&h, &states.attn_norms[index], self.model.rms_norm_eps)?;
                     prof_acc(&mut prof.norm_ms, t0);
                     let o = full_step(
-                        &w.attn,
+                        w,
                         &n,
                         fc,
                         start_pos,
                         self.model.rms_norm_eps,
                         self.model.freq_base,
+                        &self.model.rope_cos,
+                        &self.model.rope_sin,
                         &self.device,
                         prof,
                     )?;

@@ -12,20 +12,15 @@
 use super::model::LinearLayerWeights;
 use anyhow::Result;
 use candle_core::{DType, Device, Module, Tensor};
+use candle_nn::ops::{sigmoid as tensor_sigmoid, silu};
 
-/// 单层 recurrent state：conv ring（(k-1) × qkv_dim）+ SSM 矩阵（num_v × head_vd × head_kd）
-/// + 静态小权重（ssm_a/dt_bias/norm，逐 translate 取一次）。
 pub(crate) struct DeltaNetState {
-    pub conv_hist: Vec<Vec<f32>>,
-    pub ssm: Vec<f32>,
-    pub ssm_a: Vec<f32>,
-    pub dt_bias: Vec<f32>,
-    pub norm_weight: Vec<f32>,
-    pub conv_weight: Vec<Vec<f32>>,
-    pub conv_transposed: bool,
-    pub scratch_conv: Vec<f32>,
-    pub scratch_q: Vec<f32>,
-    pub scratch_k: Vec<f32>,
+    pub conv_hist: Tensor,
+    pub conv_w: Tensor,
+    pub ssm: Tensor,
+    pub ssm_a: Tensor,
+    pub dt_bias: Tensor,
+    pub norm_weight: Tensor,
     pub num_v_heads: usize,
     pub head_v_dim: usize,
     pub head_k_dim: usize,
@@ -38,23 +33,24 @@ impl DeltaNetState {
         head_v_dim: usize,
         head_k_dim: usize,
         qkv_dim: usize,
-    ) -> Self {
-        Self {
-            conv_hist: vec![vec![0.0; qkv_dim]; 3],
-            ssm: vec![0.0; num_v_heads * head_v_dim * head_k_dim],
-            ssm_a: Vec::new(),
-            dt_bias: Vec::new(),
-            norm_weight: Vec::new(),
-            conv_weight: Vec::new(),
-            conv_transposed: false,
-            scratch_conv: vec![0.0; qkv_dim],
-            scratch_q: vec![0.0; head_k_dim],
-            scratch_k: vec![0.0; head_k_dim],
+        device: &Device,
+    ) -> Result<Self> {
+        Ok(Self {
+            conv_hist: Tensor::zeros((3, qkv_dim), DType::F32, device)?,
+            conv_w: Tensor::zeros((4, qkv_dim), DType::F32, device)?,
+            ssm: Tensor::zeros(
+                (num_v_heads, head_v_dim, head_k_dim),
+                DType::F32,
+                device,
+            )?,
+            ssm_a: Tensor::zeros(num_v_heads, DType::F32, device)?,
+            dt_bias: Tensor::zeros(num_v_heads, DType::F32, device)?,
+            norm_weight: Tensor::zeros(head_v_dim, DType::F32, device)?,
             num_v_heads,
             head_v_dim,
             head_k_dim,
             qkv_dim,
-        }
+        })
     }
 }
 
@@ -64,25 +60,27 @@ fn l2norm_row(v: &[f32]) -> Vec<f32> {
     v.iter().map(|x| x * inv_norm).collect()
 }
 
-fn l2norm_into(dst: &mut [f32], src: &[f32]) {
-    let mut sum = 0.0f32;
-    for v in src {
-        sum += v * v;
-    }
-    let inv = 1.0 / (sum + 1e-6).sqrt();
-    for (d, v) in dst.iter_mut().zip(src.iter()) {
-        *d = v * inv;
-    }
+fn l2norm_rows(x: &Tensor) -> Result<Tensor> {
+    let n = x.sqr()?.sum_keepdim(1)?.affine(1.0, 1e-6)?.sqrt()?;
+    Ok(x.broadcast_div(&n)?)
 }
 
+fn softplus_t(x: &Tensor) -> Result<Tensor> {
+    let stable = x.abs()?.neg()?.exp()?.affine(1.0, 1.0)?.log()?;
+    Ok(x.relu()?.broadcast_add(&stable)?)
+}
+
+#[allow(dead_code)]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+#[allow(dead_code)]
 fn softplus(x: f32) -> f32 {
     x.max(0.0) + (1.0 + (-x.abs()).exp()).ln()
 }
 
+#[allow(dead_code)]
 fn decay_factor(ssm_a: f32, alpha_plus_bias: f32) -> f32 {
     (ssm_a * softplus(alpha_plus_bias)).exp()
 }
@@ -97,130 +95,96 @@ pub(crate) fn delta_step(
     prof: &mut super::session::StepProfile,
 ) -> Result<Tensor> {
     let t0 = super::session::prof_snap(prof, device);
-    let qkv = layer.attn_qkv.forward(hidden)?;
-    let z = layer.attn_gate.forward(hidden)?;
-    let ba = layer.ssm_alpha.forward(hidden)?;
-    let beta_logits = layer.ssm_beta.forward(hidden)?;
-    let key_dim = state.num_v_heads * state.head_k_dim;
-    let value_dim = state.num_v_heads * state.head_v_dim;
-    let rows = Tensor::cat(&[qkv, z, ba, beta_logits], 1)?
-        .to_dtype(DType::F32)?
-        .to_vec2::<f32>()?;
+    let qkv = layer
+        .attn_qkv
+        .forward(hidden)?
+        .to_dtype(DType::F32)?;
+    let z = layer
+        .attn_gate
+        .forward(hidden)?
+        .to_dtype(DType::F32)?;
+    let ba = layer
+        .ssm_alpha
+        .forward(hidden)?
+        .to_dtype(DType::F32)?;
+    let beta_logits = layer
+        .ssm_beta
+        .forward(hidden)?
+        .to_dtype(DType::F32)?;
     super::session::prof_acc(&mut prof.proj_ms, t0);
-    let n_steps = rows.len();
-    let row_width = 2 * key_dim + 2 * value_dim + 2 * state.num_v_heads;
-    let mut cores = Vec::with_capacity(n_steps * value_dim);
+    let s = hidden.dim(0)?;
+    let (nh, vd, kd) = (state.num_v_heads, state.head_v_dim, state.head_k_dim);
+    let key_dim = nh * kd;
+    let value_dim = nh * vd;
+    anyhow::ensure!(
+        qkv.dim(1)? == state.qkv_dim,
+        "conv state/projection width mismatch"
+    );
+    let inv_sqrt_k = 1.0 / (kd as f32).sqrt();
+    let mut outs: Vec<Tensor> = Vec::with_capacity(s);
     let t0 = super::session::prof_snap(prof, device);
-    for row in &rows {
-        anyhow::ensure!(
-            row.len() == row_width,
-            "unexpected fused QKV/Z/A/B width {}",
-            row.len()
-        );
-        let (qkv_raw, rest) = row.split_at(2 * key_dim + value_dim);
-        let (z_raw, rest) = rest.split_at(value_dim);
-        let (ba_raw, beta_raw) = rest.split_at(state.num_v_heads);
-        anyhow::ensure!(
-            state.qkv_dim == qkv_raw.len(),
-            "conv state/projection width mismatch"
-        );
+    for i in 0..s {
 
-        // Causal depthwise Conv1d: each channel consumes its oldest-to-newest 4-tap window.
-        // conv 权重已在 new_states 预取（逐 translate 一次），此处零同步。
-        let weights = &state.conv_weight;
-        let transposed = state.conv_transposed;
-        anyhow::ensure!(
-            if transposed {
-                weights.len() == qkv_raw.len() && weights.iter().all(|row| row.len() == 4)
-            } else {
-                weights.iter().all(|row| row.len() == qkv_raw.len())
-            },
-            "unexpected conv1d weight shape"
-        );
-        let convolved = &mut state.scratch_conv[..qkv_raw.len()];
-        for (channel, slot) in convolved.iter_mut().enumerate() {
-            let taps = [
-                state.conv_hist[0][channel],
-                state.conv_hist[1][channel],
-                state.conv_hist[2][channel],
-                qkv_raw[channel],
-            ];
-            let mut acc = 0.0;
-            for k in 0..4 {
-                let weight = if transposed {
-                    weights[channel][k]
-                } else {
-                    weights[k][channel]
-                };
-                acc += taps[k] * weight;
-            }
-            *slot = acc * sigmoid(acc);
-        }
-        let (hist_0, rest) = state.conv_hist.split_at_mut(1);
-        let (hist_1, hist_2) = rest.split_at_mut(1);
-        hist_0[0].clone_from(&hist_1[0]);
-        hist_1[0].clone_from(&hist_2[0]);
-        state.conv_hist[2].copy_from_slice(qkv_raw);
-
-        let (q_raw, rest) = convolved.split_at(key_dim);
-        let (k_raw, v_raw) = rest.split_at(key_dim);
-    let (ssm_a, dt_bias, norm_weight) = (&state.ssm_a, &state.dt_bias, &state.norm_weight);
-    let inv_sqrt_k = 1.0 / (state.head_k_dim as f32).sqrt();
-    let mut core = vec![0.0f32; value_dim];
-
-    for vh in 0..state.num_v_heads {
-        let head = vh * state.head_k_dim..(vh + 1) * state.head_k_dim;
-        l2norm_into(&mut state.scratch_q, &q_raw[head.clone()]);
-        l2norm_into(&mut state.scratch_k, &k_raw[head]);
-        for value in state.scratch_q.iter_mut() {
-            *value *= inv_sqrt_k;
-        }
-        let q: &[f32] = &state.scratch_q;
-        let k: &[f32] = &state.scratch_k;
-            let v = &v_raw[vh * state.head_v_dim..(vh + 1) * state.head_v_dim];
-            let beta = sigmoid(beta_raw[vh]);
-            let decay = decay_factor(ssm_a[vh], ba_raw[vh] + dt_bias[vh]);
-            let base = vh * state.head_v_dim * state.head_k_dim;
-
-            // State is stored [value_dim, key_dim], equivalent to the reference [key_dim, value_dim].
-            for row in 0..state.head_v_dim {
-                let row_start = base + row * state.head_k_dim;
-                let prediction = state.ssm[row_start..row_start + state.head_k_dim]
-                    .iter()
-                    .zip(k)
-                    .map(|(s, key)| s * key)
-                    .sum::<f32>();
-                let delta = beta * (v[row] - prediction);
-                for col in 0..state.head_k_dim {
-                    let idx = row_start + col;
-                    state.ssm[idx] = state.ssm[idx] * decay + delta * k[col];
-                }
-                core[vh * state.head_v_dim + row] = state.ssm[row_start..row_start + state.head_k_dim]
-                    .iter()
-                    .zip(q)
-                    .map(|(s, query)| s * query)
-                    .sum();
-            }
-        }
-
-        // Qwen3.5 RMSNormGated uses its learned scale directly, then SiLU(z).
-        for (head, output) in core.chunks_exact_mut(state.head_v_dim).enumerate() {
-            let start = head * state.head_v_dim;
-            let mean_square = output.iter().map(|x| x * x).sum::<f32>() / state.head_v_dim as f32;
-            let scale = 1.0 / (mean_square + 1e-6).sqrt();
-            for idx in 0..state.head_v_dim {
-                let value_idx = start + idx;
-                let gate = z_raw[value_idx];
-                output[idx] = output[idx] * scale * norm_weight[idx] * gate * sigmoid(gate);
-            }
-        }
-        cores.extend_from_slice(&core);
+        let qkv_i = qkv.narrow(0, i, 1)?;
+        let window = Tensor::cat(&[&state.conv_hist, &qkv_i], 0)?;
+        let convolved = window.broadcast_mul(&state.conv_w)?.sum_keepdim(0)?;
+        let conv_out = silu(&convolved)?;
+        state.conv_hist = window.narrow(0, 1, 3)?.contiguous()?;
+        let q = conv_out
+            .narrow(1, 0, key_dim)?
+            .contiguous()?
+            .reshape((nh, kd))?;
+        let k = conv_out
+            .narrow(1, key_dim, key_dim)?
+            .contiguous()?
+            .reshape((nh, kd))?;
+        let v = conv_out
+            .narrow(1, 2 * key_dim, value_dim)?
+            .contiguous()?
+            .reshape((nh, vd))?;
+        let z_h = z
+            .narrow(0, i, 1)?
+            .contiguous()?
+            .reshape((nh, vd))?;
+        let ba_i = ba.narrow(0, i, 1)?.contiguous()?;
+        let beta_i = beta_logits.narrow(0, i, 1)?.contiguous()?;
+        let qn = l2norm_rows(&q)?.affine(inv_sqrt_k as f64, 0.0)?;
+        let kn = l2norm_rows(&k)?;
+        let beta = tensor_sigmoid(&beta_i)?.reshape((nh, 1, 1))?;
+        let sp = softplus_t(&ba_i.broadcast_add(&state.dt_bias)?)?;
+        let decay = state
+            .ssm_a
+            .broadcast_mul(&sp)?
+            .exp()?
+            .reshape((nh, 1, 1))?;
+        let k3 = kn.unsqueeze(1)?;
+        let q3 = qn.unsqueeze(1)?;
+        let pred = state.ssm.broadcast_mul(&k3)?.sum_keepdim(2)?;
+        let vcol = v.reshape((nh, vd, 1))?;
+        let delta = beta.broadcast_mul(&vcol.sub(&pred)?)?;
+        state.ssm = state
+            .ssm
+            .broadcast_mul(&decay)?
+            .broadcast_add(&delta.broadcast_mul(&k3)?)?;
+        let o = state
+            .ssm
+            .broadcast_mul(&q3)?
+            .sum_keepdim(2)?
+            .reshape((nh, vd))?;
+        let ms = o.sqr()?.sum_keepdim(1)?.affine(1.0 / vd as f64, 1e-6)?;
+        let scale = ms.powf(-0.5)?;
+        let gate = tensor_sigmoid(&z_h)?;
+        let out = o
+            .broadcast_mul(&scale)?
+            .broadcast_mul(&state.norm_weight)?
+            .broadcast_mul(&z_h)?
+            .broadcast_mul(&gate)?;
+        outs.push(out.reshape((1, value_dim))?.contiguous()?);
     }
-    super::session::prof_acc(&mut prof.cpu_ms, t0);
+    super::session::prof_acc(&mut prof.delta_ms, t0);
     let t0 = super::session::prof_snap(prof, device);
-    let gated = Tensor::new(cores, device)?
-        .reshape((n_steps, value_dim))?
-        .to_dtype(DType::F16)?;
+    let cores = Tensor::cat(&outs, 0)?;
+    let gated = cores.to_dtype(DType::F16)?;
     let out = layer.ssm_out.forward(&gated)?;
     super::session::prof_acc(&mut prof.proj_ms, t0);
     Ok(out)
