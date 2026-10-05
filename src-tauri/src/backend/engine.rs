@@ -7,7 +7,7 @@ use crate::{
     },
     model_config::{GenerationConfig, MAX_NEW_TOKENS, MemoryConfig, ModelConfig, PromptConfig},
     model_support::CancellationToken,
-    models::{hy, ppocr::PpOcrProvider},
+    models::{hy, index, ppocr::PpOcrProvider},
     output::ImageOutput,
 };
 use candle_core::Device as CandleDevice;
@@ -86,6 +86,7 @@ pub(crate) struct BackendEngine {
     gpu_policy: GpuExecutionPolicy,
     ocr: Option<PpOcrProvider>,
     hy: Option<hy::HyTranslator>,
+    index: Option<index::IndexTranslator>,
     translator_memory: Option<MemoryConfig>,
     output: ImageOutput,
 }
@@ -125,6 +126,7 @@ impl BackendEngine {
             ocr: None,
             hy: None,
             translator_memory: None,
+            index: None,
         };
         tracing::info!(target: "backend::engine", duration_ms = __start.elapsed().as_millis() as u64, gpu_policy = out.gpu_policy.label(), region_parallelism = out.settings.region_parallelism, font_path = ?out.settings.font_path.as_ref().map(|p| p.display().to_string()), "BackendEngine::new success");
         Ok(out)
@@ -135,7 +137,7 @@ impl BackendEngine {
     }
 
     pub(crate) fn translator_loaded(&self) -> bool {
-        self.hy.is_some()
+        self.hy.is_some() || self.index.is_some()
     }
 
     pub(crate) fn model_states(&self) -> (bool, bool) {
@@ -154,7 +156,7 @@ impl BackendEngine {
 
     /// 双模型皆空时释放设备句柄；candle 张量自带设备引用，已加载模型的 context 不受影响。
     fn release_device_if_idle(&mut self) {
-        if self.ocr.is_none() && self.hy.is_none() && self.device.is_some() {
+        if self.ocr.is_none() && self.hy.is_none() && self.index.is_none() && self.device.is_some() {
             self.device = None;
             tracing::info!(target: "backend::engine", "device released with last model, CUDA context dropped");
         }
@@ -169,6 +171,7 @@ impl BackendEngine {
             if !self.gpu_policy.keeps_models_resident() {
                 tracing::debug!(target: "backend::engine", "load_ocr: gpu policy does not keep models resident, evicting translator");
                 self.hy = None;
+                self.index = None;
                 self.translator_memory = None;
             }
             tracing::debug!(target: "backend::engine", detector = %self.settings.detector_model_dir.display(), recognizer = %self.settings.recognizer_model_dir.display(), region_parallelism = self.settings.region_parallelism, batch_pixels = self.gpu_policy.recognizer_batch_pixels(), "load_ocr: loading PpOcrProvider");
@@ -198,7 +201,7 @@ impl BackendEngine {
         let __start = std::time::Instant::now();
         let res = self.load_translator_with_memory(target_language, self.settings.memory.clone());
         match &res {
-            Ok(_) => tracing::debug!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, translator_loaded = self.hy.is_some(), "load_translator success"),
+            Ok(_) => tracing::debug!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, translator_loaded = self.translator_loaded(), "load_translator success"),
             Err(e) => tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, duration_ms = __start.elapsed().as_millis() as u64, "load_translator failed"),
         }
         res
@@ -224,36 +227,33 @@ impl BackendEngine {
             BackendFailure::arguments(format!("invalid model config: {error:#}"))
         })?;
         tracing::debug!(target: "backend::engine", target_language = %target_language, "ModelConfig built, checking memory mismatch");
-        if self.hy.is_some() && self.translator_memory.as_ref() != Some(&memory) {
-            tracing::debug!(target: "backend::engine", "load_translator_with_memory: memory config changed, evicting existing translator");
+        let is_index = index::model::is_index_gguf(&self.settings.hy_model)
+            .map_err(|error| BackendFailure::asset(format!("inspect translation GGUF architecture: {error:#}")))?;
+        let current_matches = if is_index { self.index.is_some() } else { self.hy.is_some() };
+        if self.translator_loaded()
+            && (self.translator_memory.as_ref() != Some(&memory) || !current_matches)
+        {
             self.hy = None;
+            self.index = None;
             self.translator_memory = None;
         }
-        if self.hy.is_none() {
+        if !self.translator_loaded() {
             if !self.gpu_policy.keeps_models_resident() {
-                tracing::debug!(target: "backend::engine", "load_translator_with_memory: gpu policy does not keep models resident, evicting OCR");
                 self.ocr = None;
             }
-            tracing::debug!(target: "backend::engine", hy_model = %self.settings.hy_model.display(), target_language = %target_language, "load_translator_with_memory: loading Hy translator");
             let device = self.device_handle()?;
-            let translator = hy::load_with_config(
-                &self.settings.hy_model,
-                &device,
-                config.memory,
-                config.generation,
-                config.prompt,
-            )
-            .map_err(|error| {
-                tracing::error!(target: "backend::engine", target_language = %target_language, error = %error, duration_ms = __start.elapsed().as_millis() as u64, "load_translator_with_memory: hy::load_with_config failed");
-                BackendFailure::asset(format!("load local Hy-MT2 model: {error:#}"))
-            })?;
-            self.hy = Some(translator);
+            if is_index {
+                self.index = Some(index::load_with_config(
+                    &self.settings.hy_model, &device, config.memory, config.generation, config.prompt,
+                ).map_err(|error| BackendFailure::asset(format!("load Index-Translate model: {error:#}")))?);
+            } else {
+                self.hy = Some(hy::load_with_config(
+                    &self.settings.hy_model, &device, config.memory, config.generation, config.prompt,
+                ).map_err(|error| BackendFailure::asset(format!("load local Hy-MT2 model: {error:#}")))?);
+            }
             self.translator_memory = Some(memory);
-            tracing::debug!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, "load_translator_with_memory: translator loaded");
-        } else {
-            tracing::debug!(target: "backend::engine", target_language = %target_language, "load_translator_with_memory: translator already loaded");
         }
-        tracing::debug!(target: "backend::engine", target_language = %target_language, duration_ms = __start.elapsed().as_millis() as u64, translator_loaded = self.hy.is_some(), "load_translator_with_memory success");
+        tracing::debug!(target: "backend::engine", target_language = %target_language, translator_loaded = self.translator_loaded(), is_index, "load_translator_with_memory success");
         Ok(())
     }
 
@@ -296,6 +296,9 @@ impl BackendEngine {
             tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, duration_ms = __start.elapsed().as_millis() as u64, "prepare_live_pipeline: load_translator_with_memory failed");
         })?;
         tracing::debug!(target: "backend::engine", target_language = %target_language, "prepare_live_pipeline: warming up Hy translator");
+        if self.index.is_some() {
+            return Err(BackendFailure::translation("Index-Translate live-session translation is not implemented"));
+        }
         self.hy
             .as_mut()
             .ok_or_else(|| {
@@ -356,8 +359,9 @@ impl BackendEngine {
 
     #[tracing::instrument(level = "info", skip(self))]
     pub(crate) fn unload_translator(&mut self) {
-        tracing::info!(target: "backend::engine", translator_loaded_before = self.hy.is_some(), "unload_translator entry");
+        tracing::info!(target: "backend::engine", translator_loaded_before = self.translator_loaded(), "unload_translator entry");
         self.hy = None;
+        self.index = None;
         self.translator_memory = None;
         self.release_device_if_idle();
         tracing::info!(target: "backend::engine", "unload_translator completed");
@@ -365,7 +369,7 @@ impl BackendEngine {
 
     #[tracing::instrument(level = "info", skip(self))]
     pub(crate) fn unload_models(&mut self) {
-        tracing::info!(target: "backend::engine", ocr_loaded = self.ocr.is_some(), translator_loaded = self.hy.is_some(), "unload_models entry");
+        tracing::info!(target: "backend::engine", ocr_loaded = self.ocr.is_some(), translator_loaded = self.translator_loaded(), "unload_models entry");
         self.unload_ocr();
         self.unload_translator();
         tracing::info!(target: "backend::engine", "unload_models completed");
@@ -528,6 +532,9 @@ impl BackendEngine {
         self.load_translator_with_memory(target_language, memory).inspect_err(|e| {
             tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, duration_ms = __start.elapsed().as_millis() as u64, "translate_live_regions: load_translator_with_memory failed");
         })?;
+        if self.index.is_some() {
+            return Err(BackendFailure::translation("Index-Translate live-region translation is not implemented"));
+        }
         let prompt = self.settings.prompt.clone();
         let base_generation = self.settings.generation.clone();
         let translator = self
@@ -586,6 +593,9 @@ impl BackendEngine {
         self.load_translator_with_memory(target_language, memory).inspect_err(|e| {
             tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, duration_ms = __start.elapsed().as_millis() as u64, "translate_live_subtitle: load_translator_with_memory failed");
         })?;
+        if self.index.is_some() {
+            return Err(BackendFailure::translation("Index-Translate live-subtitle translation is not implemented"));
+        }
         let prompt = self.settings.prompt.clone();
         let generation = live_translation_generation(&self.settings.generation, source_text);
         tracing::debug!(target: "backend::engine", target_language = %target_language, max_new_tokens = generation.max_new_tokens, "translate_live_subtitle: generation config prepared");
@@ -647,6 +657,24 @@ impl BackendEngine {
             return Err(BackendFailure::arguments(
                 "translation batch size must be 1..=4",
             ));
+        }
+        if let Some(translator) = self.index.as_mut() {
+            let prompt = self.settings.prompt.clone();
+            let generation = self.settings.generation.clone();
+            let total = records.len();
+            for (index, record) in records.iter_mut().enumerate() {
+                cancellation.check().map_err(|error| BackendFailure::cancelled(error.to_string()))?;
+                record.translated_text = translator.translate_text(
+                    &record.source_text, target_language, &prompt, supplemental_prompt, &generation,
+                    cancellation, |_| Ok(()),
+                ).map_err(|error| BackendFailure::translation(format!("Index region translation failed: {error:#}")))?;
+                if record.translated_text.trim().is_empty() {
+                    return Err(BackendFailure::translation(format!("Index returned empty translation for region {}", record.order)));
+                }
+                let progress = 70 + u8::try_from(((index + 1) * 20) / total).unwrap_or(20);
+                report_progress(progress, "Index-Translate 翻译中");
+            }
+            return Ok(());
         }
         let regions = records
             .iter()
@@ -744,51 +772,38 @@ impl BackendEngine {
         cancellation.check().inspect_err(|e| {
             tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, "translate_text: cancelled at entry");
         })?;
-        report_progress(20, "正在准备 Hy-MT2");
-        tracing::debug!(target: "backend::engine", target_language = %target_language, "translate_text: ensure_model_loaded -> load_translator");
+        report_progress(20, "正在准备翻译模型");
         self.load_translator(target_language).inspect_err(|e| {
             tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, duration_ms = __start.elapsed().as_millis() as u64, "translate_text: load_translator failed");
         })?;
-        report_progress(45, "Hy-MT2 已就绪");
+        report_progress(45, "翻译模型已就绪");
         let prompt = self.settings.prompt.clone();
         let generation = self.settings.generation.clone();
-        let translator = self
-            .hy
-            .as_mut()
-            .ok_or_else(|| {
-                tracing::error!(target: "backend::engine", target_language = %target_language, "translate_text: Hy provider was not initialized");
-                BackendFailure::internal("Hy provider was not initialized")
-            })?;
-        report_progress(70, "Hy-MT2 生成中");
-        tracing::debug!(target: "backend::engine", target_language = %target_language, text_len = text.chars().count(), max_new_tokens = generation.max_new_tokens, "translate_text: invoking hy translate_text");
-        let result = translator
-            .translate_text(
-                text,
-                target_language,
-                &prompt,
-                supplemental_prompt,
-                &generation,
-                cancellation,
-                |chunk| {
-                    tracing::trace!(target: "backend::engine", target_language = %target_language, chunk_len = chunk.chars().count(), "translate_text: on_chunk");
-                    on_chunk(chunk);
-                    Ok(())
-                },
+        report_progress(70, "正在生成译文");
+        let result = if let Some(translator) = self.index.as_mut() {
+            translator.translate_text(
+                text, target_language, &prompt, supplemental_prompt, &generation, cancellation,
+                |chunk| { on_chunk(chunk); Ok(()) },
             )
-            .map_err(|error| {
-                if cancellation.is_cancelled() {
-                    tracing::warn!(target: "backend::engine", target_language = %target_language, error = %error, duration_ms = __start.elapsed().as_millis() as u64, "translate_text: cancelled");
-                    BackendFailure::cancelled("Hy translation was cancelled")
-                } else {
-                    tracing::error!(target: "backend::engine", target_language = %target_language, error = %error, duration_ms = __start.elapsed().as_millis() as u64, "translate_text: Hy text translation failed");
-                    BackendFailure::translation(format!("Hy text translation failed: {error:#}"))
-                }
-            })?;
-        tracing::debug!(target: "backend::engine", target_language = %target_language, generated_len = result.text.chars().count(), "translate_text: hy generation completed, validating");
+        } else if let Some(translator) = self.hy.as_mut() {
+            translator.translate_text(
+                text, target_language, &prompt, supplemental_prompt, &generation, cancellation,
+                |chunk| { on_chunk(chunk); Ok(()) },
+            ).map(|result| result.text)
+        } else {
+            return Err(BackendFailure::internal("translation provider was not initialized"));
+        }.map_err(|error| {
+            if cancellation.is_cancelled() {
+                BackendFailure::cancelled(format!("translation cancelled: {error:#}"))
+            } else {
+                BackendFailure::translation(format!("text translation failed: {error:#}"))
+            }
+        })?;
+        tracing::debug!(target: "backend::engine", target_language = %target_language, generated_len = result.chars().count(), "translate_text: generation completed, validating");
         cancellation.check().inspect_err(|e| {
             tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, "translate_text: cancelled after generation");
         })?;
-        let text = validate_text_translation_output(result.text).inspect_err(|e| {
+        let text = validate_text_translation_output(result).inspect_err(|e| {
             tracing::error!(target: "backend::engine", target_language = %target_language, error = %e, "translate_text: validation failed");
         })?;
         report_progress(100, "翻译完成");

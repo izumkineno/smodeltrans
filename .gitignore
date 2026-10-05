@@ -28,6 +28,7 @@ dist-ssr
 
 .omc
 .omx
+.omo
 tmp
 .serena
 scripts/_synth_mod_error.png
