@@ -53,4 +53,6 @@ RTX 4070 SUPER 上 Q4 模型整卡显存约 6G→约 2.5G；调用速度完成�
 - [2026-10-05] release 复测：总量 2.26s→1.78s；TTFT 330–385ms 不随 prompt 长度放大（batch prefill 生效）；decode 约合 53 tok/s（总量口径 15–27 系 prefill 摊薄）；e2e 加第 4 例 long（长输入 prefill 扩展性读数），待跑
 - [2026-10-05] long 例首跑：TTFT 500ms（约 200 字 prompt），64 token 顶格跑满，decode 约 50 tok/s，总量 3.40s/102 tok，四例全过。decode 稳定 50–60 tok/s ≈ 上游 52.1 持平；TTFT 全 <1s。阶段二目标达成，待提交
 - [2026-10-05] long 放宽到 256 后完整输出（121 tok 自然收尾），总量 4.61s/159 tok。用户追问继续优化：方向是 profiling 定点 + op hygiene 第二轮，MTP 为备选大牌
-- [2026-10-05] release 实测定案：44s→2.26s（约 20x），debug CPU 递推循环是真凶（TTFT∝prompt 的数学已对上）。TTFT 366–598ms（<1s 达标）；decode 约 50 tok/s；总量 2.26s。100 tok/s 需继续抠 op/分配器，投入产出比待决策
+- [2026-10-05] MTP（env SMODELTRANS_INDEX_MTP=1，默认关）代码完成：model.rs MtpWeights+blk.24 加载（缺失则 None）；session.rs draft 前向 + 推测循环（快照回绕）+ 接受率打印。待用户跑 e2e 判定接受率（≥60% 立项 / <50% 撕票）与开关关闭 parity
+ - [2026-10-05] release 实测定案：44s→2.26s（约 20x），debug CPU 递推循环是真凶（TTFT∝prompt 的数学已对上）。TTFT 366–598ms（<1s 达标）；decode 约 50 tok/s；总量 2.26s。100 tok/s 需继续抠 op/分配器，投入产出比待决策
+ - [2026-10-05] MTP 撕票：接受率 86% 但总量 3.40s→4.04s 变慢（CPU-bound 下验证 batch≥单步成本，结构性无收益）；代码已全回退（loader/draft/循环/快照/env 门清除），parity 跑输出逐字一致、计时 3.46s/long 60.2 tok/s。纯 candle+CPU 递推架构即达天花板，阶段二结项
