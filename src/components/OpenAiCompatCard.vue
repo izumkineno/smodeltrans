@@ -85,7 +85,7 @@ onMounted(refresh);
     <div class="settings-card-heading">
       <div>
         <h3 class="settings-card-title">OpenAI 兼容服务</h3>
-        <p class="settings-card-subtitle">将本地 Hy-MT2 以 OpenAI API 暴露给其他应用（独立文件夹、不耦合）</p>
+        <p class="settings-card-subtitle">将本地翻译模型以 OpenAI API 暴露给其他应用（独立文件夹、不耦合）</p>
       </div>
       <n-tag :type="statusTagType" size="small">{{ status ? status.message : "加载中" }}</n-tag>
     </div>

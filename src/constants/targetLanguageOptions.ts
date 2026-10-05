@@ -46,3 +46,24 @@ export const SUPPORTED_TARGET_LANGUAGE_VALUES: Record<string, true> = Object.fro
 export function isSupportedTargetLanguage(value: string): boolean {
   return Boolean(SUPPORTED_TARGET_LANGUAGE_VALUES[value.trim()]);
 }
+
+const INDEX_TARGET_LANGUAGE_VALUES = new Set([
+  "Chinese",
+  "English",
+  "Japanese",
+  "Korean",
+  "French",
+  "German",
+  "Spanish",
+  "Russian",
+]);
+
+export const INDEX_TARGET_LANGUAGE_OPTIONS = TARGET_LANGUAGE_OPTIONS.filter((o) =>
+  INDEX_TARGET_LANGUAGE_VALUES.has(o.value),
+);
+
+export function targetLanguageOptionsFor(modelPathOrId: string | null | undefined) {
+  return modelPathOrId != null && /index-translate/i.test(modelPathOrId)
+    ? INDEX_TARGET_LANGUAGE_OPTIONS
+    : TARGET_LANGUAGE_OPTIONS;
+}

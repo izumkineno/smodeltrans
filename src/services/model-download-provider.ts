@@ -61,6 +61,13 @@ type InvokeFn = <T>(
   args?: Record<string, unknown>,
 ) => Promise<T>;
 
+/** 按模型路径/ID 判定当前翻译引擎展示名（Index 与 Hy 并存） */
+export function translationEngineDisplayName(modelPathOrId: string | null | undefined): string {
+  return modelPathOrId && /index-translate/i.test(modelPathOrId)
+    ? "Index-Translate"
+    : "Hy-MT2";
+}
+
 /** ModelScope 默认源的推荐清单 */
 export const MODELSCOPE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
   {
@@ -138,6 +145,41 @@ export const MODELSCOPE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
     ],
     sizeText: "~8.0 GB",
     kind: "translation",
+  },
+  {
+    id: "index-translate-2b-q4",
+    name: "Index-Translate 2B Q4_K_M",
+    description:
+      "中英翻译新档，ModelScope: IndexTeam/Index-Translate-2B-GGUF",
+    repoId: "IndexTeam/Index-Translate-2B-GGUF",
+    files: ["Index-Translate-2B.Q4_K_M.gguf"],
+    fileSpecs: [
+      {
+        repoId: "IndexTeam/Index-Translate-2B-GGUF",
+        file: "Index-Translate-2B.Q4_K_M.gguf",
+        dest: "Index-Translate-2B.Q4_K_M.gguf",
+      },
+    ],
+    sizeText: "~1.2 GB",
+    kind: "translation",
+  },
+  {
+    id: "index-translate-2b-q8",
+    name: "Index-Translate 2B Q8_0",
+    description:
+      "中英翻译高精度档，ModelScope: IndexTeam/Index-Translate-2B-GGUF",
+    repoId: "IndexTeam/Index-Translate-2B-GGUF",
+    files: ["Index-Translate-2B.Q8_0.gguf"],
+    fileSpecs: [
+      {
+        repoId: "IndexTeam/Index-Translate-2B-GGUF",
+        file: "Index-Translate-2B.Q8_0.gguf",
+        dest: "Index-Translate-2B.Q8_0.gguf",
+      },
+    ],
+    sizeText: "~2.1 GB",
+    kind: "translation",
+    recommended: true,
   },
   {
     id: "ppocr-v5-mobile",
@@ -476,6 +518,25 @@ export const HUGGINGFACE_DOWNLOADABLE_MODELS: DownloadableModel[] = [
     kind: "translation",
     recommended: true,
   },
+  {
+    id: "index-translate-2b-q4",
+    name: "Index-Translate 2B Q4_K_M",
+    description: "HF: IndexTeam/Index-Translate-2B-GGUF",
+    repoId: "IndexTeam/Index-Translate-2B-GGUF",
+    files: ["Index-Translate-2B.Q4_K_M.gguf"],
+    sizeText: "~1.2 GB",
+    kind: "translation",
+  },
+  {
+    id: "index-translate-2b-q8",
+    name: "Index-Translate 2B Q8_0",
+    description: "HF: IndexTeam/Index-Translate-2B-GGUF",
+    repoId: "IndexTeam/Index-Translate-2B-GGUF",
+    files: ["Index-Translate-2B.Q8_0.gguf"],
+    sizeText: "~2.1 GB",
+    kind: "translation",
+    recommended: true,
+  },
 ];
 export function listDownloadableModels(
   source: DownloadSource,
@@ -506,8 +567,8 @@ export function listDownloadFamilies(source: DownloadSource): DownloadFamily[] {
   if (translation.length) {
     families.push({
       id: "translation",
-      name: "Hy-MT2 翻译模型族",
-      description: "ModelScope Tencent-Hunyuan/Hy-MT2 全量 GGUF：1.8B (Q4/Q6/Q8/2bit/1.25bit) + 7B (Q4/Q6/Q8)",
+      name: "翻译模型族",
+      description: "Hy-MT2 全量 GGUF + Index-Translate 2B (Q4_K_M/Q8_0)，按需下载",
       kind: "translation",
       models: translation,
     });

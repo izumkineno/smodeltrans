@@ -778,7 +778,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="processing-copy">
             <p class="detail-label">正在处理图片</p>
-            <p>Candle OCR 与 Hy-MT2 正在准备结果。</p>
+            <p>Candle OCR 与翻译模型正在准备结果。</p>
           </div>
           <n-progress
             type="line"
@@ -824,7 +824,7 @@ onBeforeUnmount(() => {
           </div>
 
           <p v-if="!resultIsTranslated" class="result-mode-note">
-            当前使用 CPU，仅展示 PP-OCR 识别文本；切换 CUDA 后可启用 Hy-MT2 翻译。
+            当前使用 CPU，仅展示 PP-OCR 识别文本；切换 CUDA 后可启用模型翻译。
           </p>
           <n-input
             class="result-input"
@@ -874,7 +874,7 @@ onBeforeUnmount(() => {
     <footer class="workspace-footer">
       <span>Candle 本地推理</span>
       <span class="footer-separator" aria-hidden="true"></span>
-      <span>PP-OCR · Hy-MT2 · Tauri</span>
+      <span>PP-OCR · 翻译模型 · Tauri</span>
       <span class="footer-spacer"></span>
       <span>PNG · JPG · WEBP · GIF · BMP</span>
     </footer>
