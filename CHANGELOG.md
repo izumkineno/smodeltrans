@@ -2,6 +2,29 @@
 
 所有显著变更将记录于此，格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0] - 2026-10-06
+
+### 新增
+
+- **Index-Translate-2B 本地翻译**（`feat(index)`，PR #2）：新增 `src-tauri/src/models/index`（`model/prompt/session/full/deltanet/translation`），`Q4_K_M/Q8_0` 双档进下载清单（`model_download.rs` / `model-download-provider.ts`），与 Hy-MT2 并存，`is_index_gguf` 按 arch 分发
+- **前端清单与文案去写死**：双清单加 Index 条目 + `translationEngineDisplayName`，`TargetLanguageSelect` 按引擎切换 8/38 种语言，新建 `target-language-store.ts` + `TargetLanguageField.vue` 四页复用即时保存
+- **监控页快捷切换**：`ModelMonitorPage.vue` 卡片内嵌 OCR/翻译快捷切换下拉 + MT 卡目标语言下拉
+- **OpenAI 兼容动态化**：`openai_compat/adapter.rs` 加 `active_model_id()`，`GET /v1/models` 返回当前激活模型而非写死
+
+### 变更
+
+- **推理全链路 GPU tensor 化**（`perf(index)`）：P1 flash 路径 + P2 DeltaNet 递推 tensor 化 + P3 `d2h_syncs`/`StepProfile` 细分计时，e2e 默认权重切换为 `Q8_0`
+- **模型管理状态判定收紧**：`isModelInstalled` 先要求后端已下载态，OCR 变体改查 manifest `ocrVariant`，后加规格零改动跟随
+
+### 修复
+
+- 修复 Q/Gate 按头交织拆分、`kn` 未使用（K 重复归一化）、rope `F16 F32 F32` dtype、`rms_norm` CustomOp 输入非 contiguous
+- 修复零下载时模型行误挂“已启用”（`hyModel` 默认文件名后缀误命中）
+
+### 文档
+
+- 记录 MTP 撕票与阶段二结项（`docs/plans/work/001-index-trim.md`），新增 2B mmproj 视觉接入调研，明确 `AGENT.md` 编译禁止事项需经允许
+
 ## [0.4.1] - 2026-09-02
 
 ### 新增
